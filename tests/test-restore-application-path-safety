@@ -194,6 +194,54 @@ assert_prevalidation_rejection \
 echo "PASS: unsafe excluded path rejected before recovery validation"
 
 echo
+echo "=== symlink backup path rejected ==="
+
+rm -rf "$TMP/symlink-target" "$TMP/symlink-path"
+mkdir -p "$TMP/symlink-target"
+ln -s "$TMP/symlink-target" "$TMP/symlink-path"
+
+write_app_config <<EOF_APP
+APP_NAME="app-one"
+COMPOSE_DIR="$TMP/compose"
+DB_TYPE="none"
+DB_BACKUP_MODE="none"
+BACKUP_PATHS=(
+    "$TMP/symlink-path"
+)
+EXCLUDE_PATHS=()
+EOF_APP
+
+assert_prevalidation_rejection \
+    "BACKUP_PATHS may not be a symbolic link" \
+    "$TMP/symlink-path.log"
+
+echo "PASS: symlink backup path rejected before recovery validation"
+
+echo
+echo "=== symlinked parent rejected ==="
+
+rm -rf "$TMP/real-parent" "$TMP/linked-parent"
+mkdir -p "$TMP/real-parent/config"
+ln -s "$TMP/real-parent" "$TMP/linked-parent"
+
+write_app_config <<EOF_APP
+APP_NAME="app-one"
+COMPOSE_DIR="$TMP/compose"
+DB_TYPE="none"
+DB_BACKUP_MODE="none"
+BACKUP_PATHS=(
+    "$TMP/linked-parent/config"
+)
+EXCLUDE_PATHS=()
+EOF_APP
+
+assert_prevalidation_rejection \
+    "BACKUP_PATHS traverses symbolic link" \
+    "$TMP/symlink-parent.log"
+
+echo "PASS: symlinked backup parent rejected before recovery validation"
+
+echo
 echo "=== fallback inside production path rejected ==="
 
 write_app_config <<EOF_APP

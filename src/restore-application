@@ -280,6 +280,26 @@ backup_paths = [
     for path in backup_paths
 ]
 
+for path in backup_paths:
+    if os.path.islink(path):
+        fail(f"BACKUP_PATHS may not be a symbolic link: {path}")
+
+    current = os.path.dirname(path)
+
+    while current != os.path.sep:
+        if os.path.islink(current):
+            fail(
+                "BACKUP_PATHS traverses symbolic link: "
+                f"{current} -> {path}"
+            )
+
+        parent = os.path.dirname(current)
+
+        if parent == current:
+            break
+
+        current = parent
+
 if len(set(backup_paths)) != len(backup_paths):
     fail("BACKUP_PATHS contains duplicate paths")
 

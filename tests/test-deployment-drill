@@ -155,7 +155,8 @@ for engine in \
     portable-backup \
     portable-retention \
     backup-group \
-    validate-application-recovery
+    validate-application-recovery \
+    validate-group-recovery
 do
     cp "$SOURCE_ROOT/src/$engine" "$RUNTIME_ROOT/$engine"
     chmod 0750 "$RUNTIME_ROOT/$engine"
@@ -185,6 +186,7 @@ STUB
         "$source/scripts/validate-group-manifest" \
         "$source/src/backup-group" \
         "$source/src/validate-application-recovery" \
+        "$source/src/validate-group-recovery" \
         "$source/src/maintain-repository"
 
     # Create a real disposable Git repository so clean/dirty and exact commit

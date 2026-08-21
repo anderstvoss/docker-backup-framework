@@ -372,7 +372,8 @@ for engine in \
     portable-backup \
     portable-retention \
     backup-group \
-    validate-application-recovery
+    validate-application-recovery \
+    validate-group-recovery
 do
     cmp \
         "$SOURCE_ROOT/src/$engine" \

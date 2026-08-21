@@ -79,6 +79,7 @@ for file in \
     "$SOURCE_ROOT/src/portable-retention" \
     "$SOURCE_ROOT/src/backup-group" \
     "$SOURCE_ROOT/src/validate-application-recovery" \
+    "$SOURCE_ROOT/src/validate-group-recovery" \
     "$SOURCE_ROOT/scripts/acceptance-test" \
     "$SOURCE_ROOT/scripts/resolve-snapshot" \
     "$SOURCE_ROOT/scripts/validate-group" \
@@ -97,6 +98,7 @@ bash -n "$SOURCE_ROOT/src/portable-backup"
 bash -n "$SOURCE_ROOT/src/portable-retention"
 bash -n "$SOURCE_ROOT/src/backup-group"
 bash -n "$SOURCE_ROOT/src/validate-application-recovery"
+bash -n "$SOURCE_ROOT/src/validate-group-recovery"
 bash -n "$SOURCE_ROOT/scripts/acceptance-test"
 bash -n "$SOURCE_ROOT/scripts/resolve-snapshot"
 bash -n "$SOURCE_ROOT/scripts/validate-group"
@@ -185,6 +187,10 @@ install -o root -g root -m 0750 \
 install -o root -g root -m 0750 \
     "$SOURCE_ROOT/src/validate-application-recovery" \
     "$ENGINE_DEST/validate-application-recovery"
+
+install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/src/validate-group-recovery" \
+    "$ENGINE_DEST/validate-group-recovery"
 
 install -o root -g root -m 0750 \
     "$SOURCE_ROOT/scripts/acceptance-test" \
@@ -288,6 +294,9 @@ cmp "$SOURCE_ROOT/src/backup-group" \
 
 cmp "$SOURCE_ROOT/src/validate-application-recovery" \
     "$ENGINE_DEST/validate-application-recovery"
+
+cmp "$SOURCE_ROOT/src/validate-group-recovery" \
+    "$ENGINE_DEST/validate-group-recovery"
 
 cmp "$SOURCE_ROOT/scripts/acceptance-test" \
     "$ENGINE_DEST/acceptance-test"

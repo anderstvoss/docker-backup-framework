@@ -566,6 +566,37 @@ APP_RESTART_LINE="$(
 
 echo "PASS: DB rollback -> filesystem rollback -> application restart ordering"
 
+IMPORT_FAIL_RECORD="$(
+    find "$RECORD_ROOT/app-one" \
+        -type f \
+        -name '*.json' |
+    sort |
+    tail -1
+)"
+
+sudo cat "$IMPORT_FAIL_RECORD" |
+python3 -c '
+import json
+import sys
+
+d = json.load(sys.stdin)
+
+assert d["result"] == "FAIL"
+assert d["failure"]["stage"] == "database-restore"
+assert d["database_rollback"] == "PASS"
+assert d["filesystem_rollback"] == "PASS"
+assert d["application_state_restored"] == "PASS"
+assert d["timer_state_restored"] is True
+
+r = d["failure"]["recovery"]
+assert r["database_rollback"] == "PASS"
+assert r["filesystem_rollback"] == "PASS"
+assert r["application"] == "PASS"
+assert r["timers"] == "PASS"
+'
+
+echo "PASS: successful recovery from DB import failure recorded durably"
+
 echo
 echo "=== DB rollback failure suppresses application restart ==="
 reset_fixture
@@ -583,7 +614,7 @@ grep -F \
     "$TMP/db-rollback-fail.log"
 
 grep -F \
-    'application restart suppressed because database rollback failed' \
+    'application restart suppressed because rollback did not complete safely' \
     "$TMP/db-rollback-fail.log"
 
 if grep -F \
@@ -597,6 +628,37 @@ fi
 grep -Fx stopped "$TMP/app-state" >/dev/null
 
 echo "PASS: failed DB rollback leaves application stopped"
+
+ROLLBACK_FAIL_RECORD="$(
+    find "$RECORD_ROOT/app-one" \
+        -type f \
+        -name '*.json' |
+    sort |
+    tail -1
+)"
+
+sudo cat "$ROLLBACK_FAIL_RECORD" |
+python3 -c '
+import json
+import sys
+
+d = json.load(sys.stdin)
+
+assert d["result"] == "RECOVERY_FAILED"
+assert d["failure"]["stage"] == "database-restore"
+assert d["database_rollback"] == "FAIL"
+assert d["filesystem_rollback"] == "PASS"
+assert d["application_state_restored"] == "SUPPRESSED"
+assert d["timer_state_restored"] is True
+
+r = d["failure"]["recovery"]
+assert r["database_rollback"] == "FAIL"
+assert r["filesystem_rollback"] == "PASS"
+assert r["application"] == "SUPPRESSED"
+assert r["timers"] == "PASS"
+'
+
+echo "PASS: failed DB rollback recorded as terminal recovery failure"
 
 echo
 echo "PASS: restore-application MariaDB execute regression suite"

@@ -602,6 +602,32 @@ fi
 
 echo "PASS: repository checkpoint failure occurs before timer suspension"
 
+REPO_FAIL_RECORD="$(
+    find "$RECORD_ROOT/app-one" \
+        -type f \
+        -name '*.json' |
+    sort |
+    tail -1
+)"
+
+sudo cat "$REPO_FAIL_RECORD" |
+python3 -c '
+import json
+import sys
+
+d = json.load(sys.stdin)
+
+assert d["result"] == "FAIL"
+assert d["failure"]["stage"] == "pre-restore-repository-checkpoint"
+assert d["production_mutation_started"] is False
+assert d["failure"]["recovery"]["database_rollback"] == "NOT_NEEDED"
+assert d["failure"]["recovery"]["filesystem_rollback"] == "NOT_NEEDED"
+assert d["failure"]["recovery"]["application"] == "NOT_NEEDED"
+assert d["failure"]["recovery"]["timers"] == "NOT_NEEDED"
+'
+
+echo "PASS: repository checkpoint failure recorded durably"
+
 echo
 echo "=== portable checkpoint failure ==="
 : > "$LOG"

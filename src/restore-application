@@ -480,21 +480,202 @@ WORK_ROOT="$(mktemp -d /tmp/docker-restore-execute.XXXXXX)"
 REPO_CHECKPOINT_RESULT="${WORK_ROOT}/repository.result"
 PORTABLE_CHECKPOINT_RESULT="${WORK_ROOT}/portable.result"
 
+RESTORE_RECORD_ROOT="${DOCKER_BACKUP_RESTORE_RECORD_ROOT:-/var/lib/docker-backup/restore-records}"
+mkdir -p "${RESTORE_RECORD_ROOT}/${APP_ID}"
+RESTORE_RECORD="${RESTORE_RECORD_ROOT}/${APP_ID}/${RESTORE_ID}.json"
+
+umask 077
+
+python3 - \
+    "$RESTORE_RECORD" \
+    "$APP_ID" \
+    "$REPO_ID" \
+    "$PORTABLE_ID" \
+    "$GENERATION" \
+    "$FILES_SNAPSHOT" \
+    "$DB_SNAPSHOT" \
+    "$PORTABLE_SET" <<'RECORDPY'
+import json
+import os
+import sys
+import tempfile
+
+(
+    output,
+    application,
+    repository,
+    portable_target,
+    generation,
+    files_snapshot,
+    db_snapshot,
+    portable_set,
+) = sys.argv[1:]
+
+document = {
+    "schema_version": 1,
+    "result": "IN_PROGRESS",
+    "last_completed_stage": "selected-recovery-validation",
+    "production_mutation_started": False,
+    "application": application,
+    "repository": repository,
+    "portable_target": portable_target,
+    "selected_recovery": {
+        "restic_generation": generation,
+        "files_snapshot": files_snapshot,
+        "db_snapshot": db_snapshot or None,
+        "portable_set": portable_set,
+    },
+    "pre_restore_checkpoint": {
+        "restic_generation": None,
+        "files_snapshot": None,
+        "db_snapshot": None,
+        "portable_set": None,
+    },
+    "timer_state_before": [],
+    "failure": None,
+}
+
+directory = os.path.dirname(output)
+fd, temporary = tempfile.mkstemp(
+    prefix=".restore-record.",
+    dir=directory,
+    text=True,
+)
+
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, output)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+RECORDPY
+
+echo "Restore record:     $RESTORE_RECORD"
+
 TIMERS_NEED_RESTORE=0
 APPLICATION_NEEDS_RESTART=0
 FILESYSTEM_NEEDS_ROLLBACK=0
+FILESYSTEM_ROLLBACK_SAFE=1
 declare -a FILESYSTEM_PRESERVED=()
 
 DATABASE_NEEDS_ROLLBACK=0
 DATABASE_ROLLBACK_SAFE=1
 
+EXECUTION_STAGE="pre-restore-repository-checkpoint"
+
+finalize_failure_record() {
+    local rc="$1"
+    local database_rollback="$2"
+    local filesystem_rollback="$3"
+    local application_recovery="$4"
+    local timer_recovery="$5"
+
+    [[ -f "$RESTORE_RECORD" ]] || return 0
+
+    if ! python3 - \
+        "$RESTORE_RECORD" \
+        "$rc" \
+        "$EXECUTION_STAGE" \
+        "$database_rollback" \
+        "$filesystem_rollback" \
+        "$application_recovery" \
+        "$timer_recovery" <<'FAILPY'
+import json
+import os
+import sys
+import tempfile
+
+(
+    output,
+    exit_code,
+    failed_stage,
+    database_rollback,
+    filesystem_rollback,
+    application_recovery,
+    timer_recovery,
+) = sys.argv[1:]
+
+with open(output, encoding="utf-8") as f:
+    document = json.load(f)
+
+recovery_failed = any(
+    value in {"FAIL", "SUPPRESSED"}
+    for value in (
+        database_rollback,
+        filesystem_rollback,
+        application_recovery,
+        timer_recovery,
+    )
+)
+
+document["result"] = "RECOVERY_FAILED" if recovery_failed else "FAIL"
+document["database_rollback"] = database_rollback
+document["filesystem_rollback"] = filesystem_rollback
+document["application_state_restored"] = application_recovery
+document["timer_state_restored"] = (
+    True if timer_recovery == "PASS"
+    else False if timer_recovery in {"FAIL", "SUPPRESSED"}
+    else None
+)
+document["failure"] = {
+    "stage": failed_stage,
+    "exit_code": int(exit_code),
+    "recovery": {
+        "database_rollback": database_rollback,
+        "filesystem_rollback": filesystem_rollback,
+        "application": application_recovery,
+        "timers": timer_recovery,
+    },
+}
+
+directory = os.path.dirname(output)
+fd, temporary = tempfile.mkstemp(
+    prefix=".restore-record.",
+    dir=directory,
+    text=True,
+)
+
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, output)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+FAILPY
+    then
+        echo "ERROR: failed to finalize durable restore failure record" >&2
+    fi
+
+    return 0
+}
+
 cleanup_execute() {
     rc=$?
+
+    local database_rollback="NOT_NEEDED"
+    local filesystem_rollback="NOT_NEEDED"
+    local application_recovery="NOT_NEEDED"
+    local timer_recovery="NOT_NEEDED"
 
     if [[ "$DATABASE_NEEDS_ROLLBACK" -eq 1 ]] &&
        declare -F rollback_database_state >/dev/null 2>&1
     then
-        if ! rollback_database_state; then
+        if rollback_database_state; then
+            database_rollback="PASS"
+        else
+            database_rollback="FAIL"
             DATABASE_ROLLBACK_SAFE=0
         fi
     fi
@@ -502,16 +683,27 @@ cleanup_execute() {
     if [[ "$FILESYSTEM_NEEDS_ROLLBACK" -eq 1 ]] &&
        declare -F rollback_filesystem_state >/dev/null 2>&1
     then
-        rollback_filesystem_state || true
+        if rollback_filesystem_state; then
+            filesystem_rollback="PASS"
+        else
+            filesystem_rollback="FAIL"
+            FILESYSTEM_ROLLBACK_SAFE=0
+        fi
     fi
 
     if [[ "$APPLICATION_NEEDS_RESTART" -eq 1 ]] &&
        [[ "$DATABASE_ROLLBACK_SAFE" -eq 1 ]] &&
+       [[ "$FILESYSTEM_ROLLBACK_SAFE" -eq 1 ]] &&
        declare -F restore_application_state >/dev/null 2>&1
     then
-        restore_application_state || true
+        if restore_application_state; then
+            application_recovery="PASS"
+        else
+            application_recovery="FAIL"
+        fi
     elif [[ "$APPLICATION_NEEDS_RESTART" -eq 1 ]]; then
-        echo "ERROR: application restart suppressed because database rollback failed" >&2
+        application_recovery="SUPPRESSED"
+        echo "ERROR: application restart suppressed because rollback did not complete safely" >&2
         cd "$COMPOSE_DIR"
         docker compose down >/dev/null 2>&1 || true
     fi
@@ -519,7 +711,20 @@ cleanup_execute() {
     if [[ "$TIMERS_NEED_RESTORE" -eq 1 ]] &&
        declare -F restore_timer_state >/dev/null 2>&1
     then
-        restore_timer_state || true
+        if restore_timer_state; then
+            timer_recovery="PASS"
+        else
+            timer_recovery="FAIL"
+        fi
+    fi
+
+    if [[ "$rc" -ne 0 ]]; then
+        finalize_failure_record \
+            "$rc" \
+            "$database_rollback" \
+            "$filesystem_rollback" \
+            "$application_recovery" \
+            "$timer_recovery"
     fi
 
     rm -f "$VALIDATION_RESULT" 2>/dev/null || true
@@ -550,6 +755,7 @@ result_value() {
 }
 
 echo
+EXECUTION_STAGE="pre-restore-repository-checkpoint"
 echo "===== CREATE PRE-RESTORE REPOSITORY CHECKPOINT ====="
 
 "$BACKUP_REPOSITORY" \
@@ -602,6 +808,7 @@ if [[ -n "$REPO_CP_DB" ]]; then
 fi
 
 echo
+EXECUTION_STAGE="pre-restore-portable-checkpoint"
 echo "===== CREATE PRE-RESTORE PORTABLE CHECKPOINT ====="
 
 "$PORTABLE_BACKUP" \
@@ -640,6 +847,7 @@ echo "PASS: portable checkpoint created"
 echo "Portable set:       $PORTABLE_CP_SET"
 
 echo
+EXECUTION_STAGE="capture-scheduling-state"
 echo "===== CAPTURE SCHEDULING STATE ====="
 
 declare -a TIMER_ACTIVE_BEFORE=()
@@ -659,26 +867,25 @@ for timer in "${TIMER_UNITS[@]}"; do
     echo "  enabled=$enabled"
 done
 
-RESTORE_RECORD_ROOT="${DOCKER_BACKUP_RESTORE_RECORD_ROOT:-/var/lib/docker-backup/restore-records}"
+TIMER_STATE_DATA=""
 
-mkdir -p "${RESTORE_RECORD_ROOT}/${APP_ID}"
-RESTORE_RECORD="${RESTORE_RECORD_ROOT}/${APP_ID}/${RESTORE_ID}.json"
-
-umask 077
+for i in "${!TIMER_UNITS[@]}"; do
+    TIMER_STATE_DATA+="$(
+        printf '%s\t%s\t%s\n' \
+            "${TIMER_UNITS[$i]}" \
+            "${TIMER_ACTIVE_BEFORE[$i]}" \
+            "${TIMER_ENABLED_BEFORE[$i]}"
+    )"
+    TIMER_STATE_DATA+=$'\n'
+done
 
 python3 - \
     "$RESTORE_RECORD" \
-    "$APP_ID" \
-    "$REPO_ID" \
-    "$PORTABLE_ID" \
-    "$GENERATION" \
-    "$FILES_SNAPSHOT" \
-    "$DB_SNAPSHOT" \
-    "$PORTABLE_SET" \
     "$REPO_CP_GENERATION" \
     "$REPO_CP_FILES" \
     "$REPO_CP_DB" \
-    "$PORTABLE_CP_SET" <<'RECORDPY'
+    "$PORTABLE_CP_SET" \
+    "$TIMER_STATE_DATA" <<'CHECKPOINTPY'
 import json
 import os
 import sys
@@ -686,40 +893,39 @@ import tempfile
 
 (
     output,
-    application,
-    repository,
-    portable_target,
-    generation,
-    files_snapshot,
-    db_snapshot,
-    portable_set,
     checkpoint_generation,
     checkpoint_files,
     checkpoint_db,
     checkpoint_portable,
+    timer_state,
 ) = sys.argv[1:]
 
-document = {
-    "schema_version": 1,
-    "result": "IN_PROGRESS",
-    "last_completed_stage": "pre-restore-checkpoint",
-    "production_mutation_started": False,
-    "application": application,
-    "repository": repository,
-    "portable_target": portable_target,
-    "selected_recovery": {
-        "restic_generation": generation,
-        "files_snapshot": files_snapshot,
-        "db_snapshot": db_snapshot or None,
-        "portable_set": portable_set,
-    },
-    "pre_restore_checkpoint": {
-        "restic_generation": checkpoint_generation,
-        "files_snapshot": checkpoint_files,
-        "db_snapshot": checkpoint_db or None,
-        "portable_set": checkpoint_portable,
-    },
+with open(output, encoding="utf-8") as f:
+    document = json.load(f)
+
+document["pre_restore_checkpoint"] = {
+    "restic_generation": checkpoint_generation,
+    "files_snapshot": checkpoint_files,
+    "db_snapshot": checkpoint_db or None,
+    "portable_set": checkpoint_portable,
 }
+
+timers = []
+
+for line in timer_state.splitlines():
+    if not line:
+        continue
+
+    unit, active, enabled = line.split("\t", 2)
+
+    timers.append({
+        "unit": unit,
+        "active": active,
+        "enabled": enabled,
+    })
+
+document["timer_state_before"] = timers
+document["last_completed_stage"] = "pre-restore-checkpoint"
 
 directory = os.path.dirname(output)
 fd, temporary = tempfile.mkstemp(
@@ -740,9 +946,8 @@ try:
 finally:
     if os.path.exists(temporary):
         os.unlink(temporary)
-RECORDPY
+CHECKPOINTPY
 
-echo "Restore record:     $RESTORE_RECORD"
 
 restore_timer_state() {
     local restore_failed=0
@@ -773,6 +978,7 @@ restore_timer_state() {
 }
 
 echo
+EXECUTION_STAGE="suspend-active-timers"
 echo "===== SUSPEND ACTIVE TIMERS ====="
 
 for i in "${!TIMER_UNITS[@]}"; do
@@ -789,6 +995,7 @@ for i in "${!TIMER_UNITS[@]}"; do
 done
 
 echo
+EXECUTION_STAGE="acquire-restore-locks"
 echo "===== ACQUIRE RESTORE LOCKS ====="
 
 LOCK_ROOT="${DOCKER_BACKUP_LOCK_ROOT:-/run/lock}"
@@ -934,6 +1141,7 @@ update_restore_record \
     "false"
 
 echo
+EXECUTION_STAGE="application-shutdown"
 echo "===== STOP APPLICATION STACK ====="
 
 cd "$COMPOSE_DIR"
@@ -980,6 +1188,7 @@ update_restore_record \
     "false"
 
 echo
+EXECUTION_STAGE="filesystem-staging"
 echo "===== STAGE IMMUTABLE FILESYSTEM SNAPSHOT ====="
 
 STAGING_ROOT="${WORK_ROOT}/filesystem"
@@ -1033,6 +1242,7 @@ CHECKPOINT_DB_SQL=""
 
 if [[ "$DB_TYPE" == "mariadb" ]]; then
     echo
+    EXECUTION_STAGE="database-staging"
     echo "===== STAGE DATABASE SNAPSHOTS ====="
 
     SELECTED_DB_ROOT="${WORK_ROOT}/database-selected"
@@ -1219,6 +1429,7 @@ rollback_database_state() {
 }
 
 echo
+EXECUTION_STAGE="filesystem-preservation"
 echo "===== PRESERVE PRODUCTION FILESYSTEM ====="
 
 mkdir -p "$FALLBACK_ROOT"
@@ -1289,6 +1500,7 @@ update_restore_record \
     "false"
 
 echo
+EXECUTION_STAGE="filesystem-placement"
 echo "===== PLACE RESTORED FILESYSTEM ====="
 
 for path in "${BACKUP_PATHS[@]}"; do
@@ -1324,6 +1536,7 @@ echo "Production filesystem has been replaced."
 
 if [[ "$DB_TYPE" == "mariadb" ]]; then
     echo
+    EXECUTION_STAGE="database-restore"
     echo "===== RESTORE MARIADB DATABASE ====="
 
     cd "$COMPOSE_DIR"
@@ -1357,6 +1570,7 @@ if [[ "$DB_TYPE" == "mariadb" ]]; then
     # durable recovery anchors, but automatic rollback is no longer needed.
     FILESYSTEM_NEEDS_ROLLBACK=0
 
+    EXECUTION_STAGE="application-restart"
     restore_application_state
 
     RESTORED_SERVICES="$(
@@ -1370,6 +1584,7 @@ if [[ "$DB_TYPE" == "mariadb" ]]; then
 
     echo "PASS: application has running services after database restore"
 
+    EXECUTION_STAGE="timer-state-restoration"
     restore_timer_state
 
     update_restore_record \
@@ -1391,6 +1606,7 @@ else
 
     FILESYSTEM_NEEDS_ROLLBACK=0
 
+    EXECUTION_STAGE="application-restart"
     restore_application_state
 
     RESTORED_SERVICES="$(
@@ -1404,6 +1620,7 @@ else
 
     echo "PASS: application has running services after restart"
 
+    EXECUTION_STAGE="timer-state-restoration"
     restore_timer_state
 
     update_restore_record \

@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+MODE="dry-run"
+
+if [ "${1:-}" = "--apply" ]; then
+    MODE="apply"
+    shift
+fi
+
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 [--apply] <repository-config>" >&2
+    exit 2
+fi
+
+REPO_CONFIG="$1"
+
+if [ ! -f "$REPO_CONFIG" ]; then
+    echo "ERROR: repository config not found: $REPO_CONFIG" >&2
+    exit 2
+fi
+
+# shellcheck source=/dev/null
+source "$REPO_CONFIG"
+
+: "${REPO_NAME:?Missing REPO_NAME}"
+: "${APP_NAME:?Missing APP_NAME}"
+: "${REPOSITORY:?Missing REPOSITORY}"
+: "${PASSWORD_FILE:?Missing PASSWORD_FILE}"
+
+: "${KEEP_LAST:=0}"
+: "${KEEP_DAILY:=0}"
+: "${KEEP_WEEKLY:=0}"
+: "${KEEP_MONTHLY:=0}"
+: "${KEEP_YEARLY:=0}"
+
+APP_CONFIG="/etc/docker-backup/apps/${APP_NAME}.conf"
+
+if [ ! -f "$APP_CONFIG" ]; then
+    echo "ERROR: application config not found: $APP_CONFIG" >&2
+    exit 2
+fi
+
+# shellcheck source=/dev/null
+source "$APP_CONFIG"
+
+export RESTIC_REPOSITORY="$REPOSITORY"
+export RESTIC_PASSWORD_FILE="$PASSWORD_FILE"
+
+REPO_TAG="${REPO_NAME#"${APP_NAME}"-}"
+LOCK_FILE="/run/lock/docker-backup-${REPO_NAME}.lock"
+PLAN_FILE="$(mktemp)"
+trap 'rm -f "$PLAN_FILE"' EXIT
+
+exec 9>"$LOCK_FILE"
+
+if ! flock -n 9; then
+    echo "ERROR: repository operation already running for $REPO_NAME" >&2
+    exit 1
+fi
+
+echo "===== RETENTION ${MODE^^} ====="
+echo "Application: $APP_NAME"
+echo "Repository:  $REPO_NAME"
+echo
+echo "Policy:"
+echo "  keep_last:    $KEEP_LAST"
+echo "  keep_daily:   $KEEP_DAILY"
+echo "  keep_weekly:  $KEEP_WEEKLY"
+echo "  keep_monthly: $KEEP_MONTHLY"
+echo "  keep_yearly:  $KEEP_YEARLY"
+echo
+
+restic snapshots --json \
+| python3 -c '
+import datetime as dt
+import json
+import sys
+
+app = sys.argv[1]
+repo = sys.argv[2]
+db_type = sys.argv[3]
+
+keep_last = int(sys.argv[4])
+keep_daily = int(sys.argv[5])
+keep_weekly = int(sys.argv[6])
+keep_monthly = int(sys.argv[7])
+keep_yearly = int(sys.argv[8])
+plan_file = sys.argv[9]
+
+if db_type == "none":
+    required_components = ["files"]
+else:
+    required_components = ["db", "files"]
+
+snapshots = json.load(sys.stdin)
+
+def tag_values(tags, prefix):
+    return [
+        tag[len(prefix):]
+        for tag in tags
+        if tag.startswith(prefix)
+    ]
+
+managed = []
+legacy = []
+
+for snapshot in snapshots:
+    tags = set(snapshot.get("tags") or [])
+
+    if f"app:{app}" not in tags or f"repo:{repo}" not in tags:
+        continue
+
+    if "state:complete" not in tags:
+        legacy.append(snapshot)
+        continue
+
+    generations = tag_values(tags, "generation:")
+    components = tag_values(tags, "component:")
+
+    if len(generations) != 1 or len(components) != 1:
+        print(
+            "ERROR: malformed managed snapshot "
+            + snapshot["id"],
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    managed.append({
+        "id": snapshot["id"],
+        "time": snapshot["time"],
+        "generation": generations[0],
+        "component": components[0],
+        "tags": tags,
+    })
+
+groups = {}
+
+for snapshot in managed:
+    groups.setdefault(snapshot["generation"], []).append(snapshot)
+
+valid = []
+invalid = []
+
+for generation, members in groups.items():
+    components = sorted(m["component"] for m in members)
+
+    if components != required_components:
+        invalid.append((generation, members))
+        continue
+
+    times = [
+        dt.datetime.fromisoformat(m["time"].replace("Z", "+00:00"))
+        for m in members
+    ]
+
+    valid.append({
+        "generation": generation,
+        "members": members,
+        "time": max(times),
+    })
+
+valid.sort(key=lambda g: g["time"], reverse=True)
+
+keep = set()
+reasons = {}
+
+def retain(generation, reason):
+    gid = generation["generation"]
+    keep.add(gid)
+    reasons.setdefault(gid, []).append(reason)
+
+for generation in valid[:keep_last]:
+    retain(generation, "last")
+
+def retain_buckets(count, key_func, label):
+    if count <= 0:
+        return
+
+    seen = set()
+
+    for generation in valid:
+        key = key_func(generation["time"])
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        if len(seen) > count:
+            break
+
+        retain(generation, label)
+
+retain_buckets(
+    keep_daily,
+    lambda t: (t.year, t.month, t.day),
+    "daily",
+)
+
+retain_buckets(
+    keep_weekly,
+    lambda t: t.isocalendar()[:2],
+    "weekly",
+)
+
+retain_buckets(
+    keep_monthly,
+    lambda t: (t.year, t.month),
+    "monthly",
+)
+
+retain_buckets(
+    keep_yearly,
+    lambda t: t.year,
+    "yearly",
+)
+
+print("===== COMPLETE GENERATIONS =====")
+
+if not valid:
+    print("(none)")
+
+for generation in valid:
+    gid = generation["generation"]
+    action = "KEEP" if gid in keep else "EXPIRE"
+    reason = ",".join(reasons.get(gid, [])) or "-"
+    generation_time = generation["time"].isoformat()
+
+    print(
+        f"{action:6}  "
+        f"{generation_time}  "
+        f"{gid}  "
+        f"reason={reason}"
+    )
+
+    for member in sorted(
+        generation["members"],
+        key=lambda x: x["component"],
+    ):
+        component = member["component"]
+        snapshot_id = member["id"]
+
+        print(
+            f"        {component:5} "
+            f"{snapshot_id}"
+        )
+
+print()
+print("===== INCOMPLETE / MALFORMED GENERATIONS =====")
+
+if not invalid:
+    print("(none)")
+
+for generation, members in invalid:
+    print(f"INVALID {generation}")
+    for member in members:
+        component = member["component"]
+        snapshot_id = member["id"]
+
+        print(
+            f"        {component:5} "
+            f"{snapshot_id}"
+        )
+
+print()
+print("===== UNMANAGED / LEGACY SNAPSHOTS =====")
+
+if not legacy:
+    print("(none)")
+
+for snapshot in legacy:
+    print(
+        snapshot["id"],
+        ",".join(snapshot.get("tags") or []),
+    )
+
+expired = [
+    generation
+    for generation in valid
+    if generation["generation"] not in keep
+]
+
+print()
+print("===== SUMMARY =====")
+print(f"Valid complete generations: {len(valid)}")
+print(f"Would retain:              {len(keep)}")
+print(f"Would expire:              {len(expired)}")
+print(f"Invalid generations:       {len(invalid)}")
+print(f"Unmanaged snapshots:       {len(legacy)}")
+
+if invalid:
+    print(
+        "ERROR: refusing apply because malformed/incomplete "
+        "managed generations exist",
+        file=sys.stderr,
+    )
+    sys.exit(20)
+
+with open(plan_file, "w", encoding="utf-8") as plan:
+    for generation in expired:
+        gid = generation["generation"]
+
+        for member in generation["members"]:
+            tags = member["tags"]
+            component = member["component"]
+            snapshot_id = member["id"]
+
+            required = {
+                f"app:{app}",
+                f"repo:{repo}",
+                "state:complete",
+                f"generation:{gid}",
+                f"component:{component}",
+            }
+
+            if not required.issubset(tags):
+                print(
+                    "ERROR: snapshot failed final safety validation: "
+                    + snapshot_id,
+                    file=sys.stderr,
+                )
+                sys.exit(21)
+
+            plan.write(
+                gid
+                + "\t"
+                + component
+                + "\t"
+                + snapshot_id
+                + "\n"
+            )
+' \
+  "$APP_NAME" \
+  "$REPO_TAG" \
+  "$DB_TYPE" \
+  "$KEEP_LAST" \
+  "$KEEP_DAILY" \
+  "$KEEP_WEEKLY" \
+  "$KEEP_MONTHLY" \
+  "$KEEP_YEARLY" \
+  "$PLAN_FILE"
+
+if [ "$MODE" = "dry-run" ]; then
+    echo
+    echo "DRY RUN ONLY: no snapshots were modified."
+    exit 0
+fi
+
+echo
+echo "===== APPLY PLAN ====="
+
+if [ ! -s "$PLAN_FILE" ]; then
+    echo "Nothing to expire."
+    exit 0
+fi
+
+cat "$PLAN_FILE"
+
+mapfile -t SNAPSHOT_IDS < <(
+    cut -f3 "$PLAN_FILE"
+)
+
+echo
+echo "Snapshot count selected: ${#SNAPSHOT_IDS[@]}"
+
+if [ "${#SNAPSHOT_IDS[@]}" -eq 0 ]; then
+    echo "Nothing to expire."
+    exit 0
+fi
+
+restic forget "${SNAPSHOT_IDS[@]}"
+
+echo
+echo "PASS: expired snapshots forgotten"
+echo "NOTE: repository data was not pruned."

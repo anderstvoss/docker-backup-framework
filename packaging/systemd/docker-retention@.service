@@ -1,0 +1,12 @@
+[Unit]
+Description=Docker backup retention for repository %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/docker-backup/retention-repository --apply /etc/docker-backup/repos/%i.conf
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=1h

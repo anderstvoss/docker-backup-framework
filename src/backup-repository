@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 <repository-config>" >&2
+    exit 2
+fi
+
+REPO_CONFIG="$1"
+
+if [ ! -f "$REPO_CONFIG" ]; then
+    echo "ERROR: repository config not found: $REPO_CONFIG" >&2
+    exit 2
+fi
+
+# Repository configuration.
+# shellcheck source=/dev/null
+source "$REPO_CONFIG"
+
+: "${REPO_NAME:?Missing REPO_NAME}"
+: "${APP_NAME:?Missing APP_NAME}"
+: "${REPOSITORY:?Missing REPOSITORY}"
+: "${PASSWORD_FILE:?Missing PASSWORD_FILE}"
+: "${STORAGE_TYPE:?Missing STORAGE_TYPE}"
+
+APP_CONFIG="/etc/docker-backup/apps/${APP_NAME}.conf"
+
+if [ ! -f "$APP_CONFIG" ]; then
+    echo "ERROR: application config not found: $APP_CONFIG" >&2
+    exit 2
+fi
+
+# Application configuration.
+# shellcheck source=/dev/null
+source "$APP_CONFIG"
+
+: "${COMPOSE_DIR:?Missing COMPOSE_DIR}"
+: "${DB_TYPE:?Missing DB_TYPE}"
+: "${DB_BACKUP_MODE:?Missing DB_BACKUP_MODE}"
+
+if [ ! -r "$PASSWORD_FILE" ]; then
+    echo "ERROR: Restic password file is not readable: $PASSWORD_FILE" >&2
+    exit 1
+fi
+
+if [ ! -d "$REPOSITORY" ]; then
+    echo "ERROR: Restic repository does not exist: $REPOSITORY" >&2
+    exit 1
+fi
+
+HOST="$(hostname -s)"
+GENERATION="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+APP_LOCK_FILE="/run/lock/docker-backup-app-${APP_NAME}.lock"
+LOCK_FILE="/run/lock/docker-backup-${REPO_NAME}.lock"
+
+export RESTIC_REPOSITORY="$REPOSITORY"
+export RESTIC_PASSWORD_FILE="$PASSWORD_FILE"
+
+# Serialize application capture across all backup mechanisms before
+# acquiring the repository-specific operation lock.
+exec 8>"$APP_LOCK_FILE"
+
+if ! flock -n 8; then
+    echo "ERROR: another capture is already running for application $APP_NAME" >&2
+    exit 1
+fi
+
+exec 9>"$LOCK_FILE"
+
+if ! flock -n 9; then
+    echo "ERROR: repository operation already running for $REPO_NAME" >&2
+    exit 1
+fi
+
+snapshot_ids_matching_tags() {
+    restic snapshots --json \
+    | python3 -c '
+import json
+import sys
+
+required = set(sys.argv[1:])
+snapshots = json.load(sys.stdin)
+
+for snapshot in snapshots:
+    tags = set(snapshot.get("tags") or [])
+    if required.issubset(tags):
+        print(snapshot["id"])
+' "$@"
+}
+
+generation_snapshot_ids() {
+    snapshot_ids_matching_tags \
+        "app:${APP_NAME}" \
+        "repo:${REPO_NAME#"${APP_NAME}"-}" \
+        "generation:${GENERATION}"
+}
+
+cleanup_failed_generation() {
+    rc=$?
+
+    if [ "$rc" -ne 0 ]; then
+        echo
+        echo "ERROR: generation $GENERATION failed (exit $rc)" >&2
+
+        mapfile -t ids < <(generation_snapshot_ids 2>/dev/null || true)
+
+        if [ "${#ids[@]}" -gt 0 ]; then
+            echo "Removing ${#ids[@]} incomplete snapshot(s)..." >&2
+            restic forget "${ids[@]}" || true
+        fi
+    fi
+
+    exit "$rc"
+}
+
+trap cleanup_failed_generation EXIT
+
+verify_storage() {
+    case "$STORAGE_TYPE" in
+        nfs)
+            : "${STORAGE_MOUNT:?Missing STORAGE_MOUNT}"
+            : "${EXPECTED_SOURCE:?Missing EXPECTED_SOURCE}"
+
+            # Trigger automount.
+            ls "$STORAGE_MOUNT" >/dev/null
+
+            fstype=""
+            source=""
+
+            while read -r candidate_fstype candidate_source; do
+                case "$candidate_fstype" in
+                    nfs|nfs4)
+                        fstype="$candidate_fstype"
+                        source="$candidate_source"
+                        break
+                        ;;
+                esac
+            done < <(
+                findmnt -T "$STORAGE_MOUNT" \
+                    --noheadings \
+                    --raw \
+                    --output FSTYPE,SOURCE
+            )
+
+            if [ -z "$fstype" ] || [ -z "$source" ]; then
+                echo "ERROR: no underlying NFS mount found for $STORAGE_MOUNT" >&2
+                exit 1
+            fi
+
+            if [ "$source" != "$EXPECTED_SOURCE" ]; then
+                echo "ERROR: unexpected NFS source" >&2
+                echo "Expected: $EXPECTED_SOURCE" >&2
+                echo "Detected: $source" >&2
+                exit 1
+            fi
+            ;;
+
+        local)
+            ;;
+
+        *)
+            echo "ERROR: unsupported STORAGE_TYPE: $STORAGE_TYPE" >&2
+            exit 1
+            ;;
+    esac
+}
+
+snapshot_id_for_component() {
+    component="$1"
+
+    mapfile -t ids < <(
+        snapshot_ids_matching_tags \
+            "app:${APP_NAME}" \
+            "repo:${REPO_NAME#"${APP_NAME}"-}" \
+            "generation:${GENERATION}" \
+            "component:${component}" \
+            "state:building"
+    )
+
+    if [ "${#ids[@]}" -ne 1 ]; then
+        echo \
+            "ERROR: expected exactly one ${component} snapshot for generation ${GENERATION}; found ${#ids[@]}" \
+            >&2
+        return 1
+    fi
+
+    printf '%s\n' "${ids[0]}"
+}
+
+complete_component() {
+    component="$1"
+    snapshot_id="$(snapshot_id_for_component "$component")"
+
+    restic tag \
+        --remove "state:building" \
+        --add "state:complete" \
+        "$snapshot_id" >/dev/null
+
+    echo "PASS: $component component complete ($snapshot_id)"
+}
+
+echo "===== APPLICATION BACKUP ====="
+echo "Application: $APP_NAME"
+echo "Repository: $REPO_NAME"
+echo "Generation: $GENERATION"
+
+echo
+echo "===== VERIFY STORAGE ====="
+verify_storage
+echo "PASS: repository storage verified"
+
+echo
+echo "===== VERIFY RESTIC REPOSITORY ====="
+restic snapshots >/dev/null
+echo "PASS: repository opened"
+
+cd "$COMPOSE_DIR"
+
+echo
+echo "===== VERIFY BACKUP PATHS ====="
+
+if [ "${#BACKUP_PATHS[@]}" -eq 0 ]; then
+    echo "ERROR: BACKUP_PATHS is empty" >&2
+    exit 1
+fi
+
+for backup_path in "${BACKUP_PATHS[@]}"; do
+    if [ ! -e "$backup_path" ]; then
+        echo "ERROR: configured backup path does not exist: $backup_path" >&2
+        exit 1
+    fi
+done
+
+echo "PASS: all configured backup paths exist"
+
+if [ "$DB_TYPE" != "none" ]; then
+    echo
+    echo "===== DATABASE COMPONENT ====="
+
+    case "${DB_TYPE}:${DB_BACKUP_MODE}" in
+        mariadb:logical)
+            : "${DB_CONTAINER:?Missing DB_CONTAINER}"
+
+            if ! docker compose ps \
+                --status running \
+                --services \
+                | grep -Fxq "$DB_CONTAINER"; then
+                echo "ERROR: database service is not running: $DB_CONTAINER" >&2
+                exit 1
+            fi
+
+            docker compose exec -T "$DB_CONTAINER" \
+                sh -c 'exec mariadb-dump \
+                    --user="$MARIADB_USER" \
+                    --password="$MARIADB_PASSWORD" \
+                    --single-transaction \
+                    --quick \
+                    --routines \
+                    --triggers \
+                    "$MARIADB_DATABASE"' \
+            | restic backup \
+                --stdin \
+                --stdin-filename database.sql \
+                --host "$HOST" \
+                --tag "app:${APP_NAME}" \
+                --tag "repo:${REPO_NAME#"${APP_NAME}"-}" \
+                --tag "component:db" \
+                --tag "generation:${GENERATION}" \
+                --tag "state:building"
+
+            echo "PASS: database snapshot created"
+
+            ;;
+
+        *)
+            echo "ERROR: unsupported database backup mode: ${DB_TYPE}:${DB_BACKUP_MODE}" >&2
+            exit 1
+            ;;
+    esac
+fi
+
+echo
+echo "===== FILE COMPONENT ====="
+
+if [ "${#BACKUP_PATHS[@]}" -eq 0 ]; then
+    echo "ERROR: BACKUP_PATHS is empty" >&2
+    exit 1
+fi
+
+restic backup \
+    "${BACKUP_PATHS[@]}" \
+    --host "$HOST" \
+    --tag "app:${APP_NAME}" \
+    --tag "repo:${REPO_NAME#"${APP_NAME}"-}" \
+    --tag "component:files" \
+    --tag "generation:${GENERATION}" \
+    --tag "state:building"
+
+echo "PASS: file snapshot created"
+
+echo
+echo "===== VERIFY GENERATION COMPONENTS ====="
+
+if [ "$DB_TYPE" != "none" ]; then
+    DB_ID="$(snapshot_id_for_component db)"
+    echo "DB:    $DB_ID"
+fi
+
+FILES_ID="$(snapshot_id_for_component files)"
+echo "Files: $FILES_ID"
+
+echo
+echo "===== FINALIZE GENERATION ====="
+
+if [ "$DB_TYPE" != "none" ]; then
+    complete_component db
+fi
+
+complete_component files
+
+trap - EXIT
+
+echo
+echo "PASS: generation completed"
+echo "Generation: $GENERATION"

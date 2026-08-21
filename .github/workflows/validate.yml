@@ -1,0 +1,75 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: ShellCheck
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find scripts src \
+            -type f \
+            -print0 |
+          xargs -0 shellcheck
+
+      - name: Shell syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r -d '' file; do
+            bash -n "$file"
+          done < <(
+            find scripts src \
+              -type f \
+              -print0
+          )
+
+          while IFS= read -r -d '' file; do
+            bash -n "$file"
+          done < <(
+            find config tests/fixtures \
+              -type f \
+              -name '*.conf' \
+              -print0
+          )
+
+      - name: Check disclosure patterns
+        run: scripts/ci/check-disclosures
+
+      - name: Validate install manifest sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          awk '
+            /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+            {
+              split($0,a," -> ");
+              print a[1]
+            }
+          ' packaging/install-manifest.txt |
+          while read -r path; do
+            if [ ! -e "$path" ]; then
+              echo "Missing manifest source: $path" >&2
+              exit 1
+            fi
+          done

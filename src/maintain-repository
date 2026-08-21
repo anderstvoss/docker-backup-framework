@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APPLY=0
+
+if [ "${1:-}" = "prune" ]; then
+    ACTION="prune"
+    shift
+
+    if [ "${1:-}" != "--apply" ]; then
+        echo "ERROR: prune requires explicit --apply" >&2
+        echo "Usage: $0 prune --apply <repository-config>" >&2
+        exit 2
+    fi
+
+    APPLY=1
+    shift
+else
+    if [ "$#" -ne 2 ]; then
+        echo "Usage: $0 <check|read-data|prune-dry-run> <repository-config>" >&2
+        echo "       $0 prune --apply <repository-config>" >&2
+        exit 2
+    fi
+
+    ACTION="$1"
+    shift
+fi
+
+if [ "$#" -ne 1 ]; then
+    echo "ERROR: repository config argument required" >&2
+    exit 2
+fi
+
+REPO_CONFIG="$1"
+
+case "$ACTION" in
+    check|read-data|prune-dry-run|prune)
+        ;;
+    *)
+        echo "ERROR: unsupported maintenance action: $ACTION" >&2
+        exit 2
+        ;;
+esac
+
+if [ ! -f "$REPO_CONFIG" ]; then
+    echo "ERROR: repository config not found: $REPO_CONFIG" >&2
+    exit 2
+fi
+
+# shellcheck source=/dev/null
+source "$REPO_CONFIG"
+
+: "${REPO_NAME:?Missing REPO_NAME}"
+: "${APP_NAME:?Missing APP_NAME}"
+: "${REPOSITORY:?Missing REPOSITORY}"
+: "${PASSWORD_FILE:?Missing PASSWORD_FILE}"
+
+export RESTIC_REPOSITORY="$REPOSITORY"
+export RESTIC_PASSWORD_FILE="$PASSWORD_FILE"
+
+LOCK_FILE="/run/lock/docker-backup-${REPO_NAME}.lock"
+
+exec 9>"$LOCK_FILE"
+
+if ! flock -n 9; then
+    echo "ERROR: repository operation already running for $REPO_NAME" >&2
+    exit 1
+fi
+
+echo "===== REPOSITORY MAINTENANCE ====="
+echo "Application: $APP_NAME"
+echo "Repository:  $REPO_NAME"
+echo "Action:      $ACTION"
+
+echo
+echo "===== PREFLIGHT ====="
+
+if [ ! -f "$PASSWORD_FILE" ]; then
+    echo "ERROR: password file not found: $PASSWORD_FILE" >&2
+    exit 1
+fi
+
+if [ "${STORAGE_TYPE:-}" = "nfs" ]; then
+    : "${STORAGE_MOUNT:?Missing STORAGE_MOUNT for NFS repository}"
+    : "${EXPECTED_SOURCE:?Missing EXPECTED_SOURCE for NFS repository}"
+
+    FOUND_SOURCE=""
+
+    while read -r fstype source; do
+        case "$fstype" in
+            nfs|nfs4)
+                FOUND_SOURCE="$source"
+                break
+                ;;
+        esac
+    done < <(
+        findmnt -T "$STORAGE_MOUNT" \
+            -n \
+            -o FSTYPE,SOURCE
+    )
+
+    if [ -z "$FOUND_SOURCE" ]; then
+        echo "ERROR: no NFS filesystem found for $STORAGE_MOUNT" >&2
+        exit 1
+    fi
+
+    if [ "$FOUND_SOURCE" != "$EXPECTED_SOURCE" ]; then
+        echo "ERROR: unexpected NFS source" >&2
+        echo "Expected: $EXPECTED_SOURCE" >&2
+        echo "Found:    $FOUND_SOURCE" >&2
+        exit 1
+    fi
+
+    echo "PASS: NFS source verified"
+fi
+
+restic snapshots >/dev/null
+
+echo "PASS: repository opened"
+
+echo
+case "$ACTION" in
+    check)
+        echo "===== RESTIC CHECK ====="
+        restic check
+        ;;
+
+    read-data)
+        echo "===== RESTIC FULL DATA CHECK ====="
+        restic check --read-data
+        ;;
+
+    prune-dry-run)
+        echo "===== RESTIC PRUNE DRY RUN ====="
+        restic prune --dry-run
+        echo
+        echo "DRY RUN ONLY: repository data was not modified."
+        ;;
+
+    prune)
+        if [ "$APPLY" -ne 1 ]; then
+            echo "ERROR: internal safety check failed: prune without apply" >&2
+            exit 1
+        fi
+
+        echo "===== RESTIC PRUNE APPLY ====="
+        restic prune
+        ;;
+esac
+
+echo
+echo "PASS: maintenance action completed: $ACTION"

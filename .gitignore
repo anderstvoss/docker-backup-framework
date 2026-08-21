@@ -1,0 +1,23 @@
+# Secrets
+secrets/
+*.password
+*.secret
+*.key
+.env
+.env.*
+
+# Restic credentials
+restic-password*
+repository-password*
+
+# Runtime/generated
+*.tmp
+*.lock
+*.log
+__pycache__/
+*.pyc
+
+# Editor/OS
+*~
+*.swp
+.DS_Store

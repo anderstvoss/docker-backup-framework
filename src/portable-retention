@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APPLY=false
+
+if [ "${1:-}" = "--apply" ]; then
+    APPLY=true
+    shift
+fi
+
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 [--apply] <portable-config>" >&2
+    exit 2
+fi
+
+PORTABLE_CONFIG="$1"
+
+if [ ! -f "$PORTABLE_CONFIG" ]; then
+    echo "ERROR: portable config not found: $PORTABLE_CONFIG" >&2
+    exit 2
+fi
+
+# shellcheck source=/dev/null
+source "$PORTABLE_CONFIG"
+
+: "${PORTABLE_NAME:?Missing PORTABLE_NAME}"
+: "${APP_NAME:?Missing APP_NAME}"
+: "${BACKUP_ROOT:?Missing BACKUP_ROOT}"
+: "${KEEP_LAST:?Missing KEEP_LAST}"
+: "${KEEP_DAILY:?Missing KEEP_DAILY}"
+: "${KEEP_WEEKLY:?Missing KEEP_WEEKLY}"
+: "${KEEP_MONTHLY:?Missing KEEP_MONTHLY}"
+: "${KEEP_YEARLY:?Missing KEEP_YEARLY}"
+
+APP_CONFIG="/etc/docker-backup/apps/${APP_NAME}.conf"
+
+if [ ! -f "$APP_CONFIG" ]; then
+    echo "ERROR: application config not found: $APP_CONFIG" >&2
+    exit 2
+fi
+
+# shellcheck source=/dev/null
+source "$APP_CONFIG"
+
+: "${DB_TYPE:?Missing DB_TYPE}"
+
+for value in \
+    "$KEEP_LAST" \
+    "$KEEP_DAILY" \
+    "$KEEP_WEEKLY" \
+    "$KEEP_MONTHLY" \
+    "$KEEP_YEARLY"
+do
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: retention values must be non-negative integers" >&2
+        exit 2
+    fi
+done
+
+if [ ! -d "$BACKUP_ROOT" ]; then
+    echo "ERROR: backup root does not exist: $BACKUP_ROOT" >&2
+    exit 1
+fi
+
+LOCK_FILE="/run/lock/docker-portable-${PORTABLE_NAME}.lock"
+
+exec 9>"$LOCK_FILE"
+
+if ! flock -n 9; then
+    echo "ERROR: portable backup/retention already running for $PORTABLE_NAME" >&2
+    exit 1
+fi
+
+echo "===== PORTABLE RETENTION ====="
+echo "Application: $APP_NAME"
+echo "Target:      $PORTABLE_NAME"
+echo "Mode:        $([ "$APPLY" = true ] && echo APPLY || echo DRY-RUN)"
+
+python3 - "$BACKUP_ROOT" "$DB_TYPE" \
+    "$KEEP_LAST" "$KEEP_DAILY" "$KEEP_WEEKLY" "$KEEP_MONTHLY" "$KEEP_YEARLY" \
+    "$APPLY" <<'PY'
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+import shutil
+import sys
+
+root = Path(sys.argv[1])
+db_type = sys.argv[2]
+
+keep_last = int(sys.argv[3])
+keep_daily = int(sys.argv[4])
+keep_weekly = int(sys.argv[5])
+keep_monthly = int(sys.argv[6])
+keep_yearly = int(sys.argv[7])
+apply = sys.argv[8].lower() == "true"
+
+fmt = "%Y-%m-%d_%H%M%SZ"
+
+sets = []
+invalid = []
+
+for path in root.iterdir():
+    if not path.is_dir():
+        continue
+
+    if path.name.startswith(".incomplete-"):
+        continue
+
+    try:
+        stamp = datetime.strptime(path.name, fmt).replace(tzinfo=timezone.utc)
+    except ValueError:
+        continue
+
+    required = {
+        "app-state.tar.gz",
+        "SHA256SUMS",
+    }
+
+    if db_type != "none":
+        required.add("database.sql.gz")
+
+    missing = sorted(
+        name for name in required
+        if not (path / name).is_file()
+    )
+
+    if missing:
+        invalid.append((path, missing))
+        continue
+
+    sets.append((stamp, path))
+
+if invalid:
+    print()
+    print("ERROR: malformed managed recovery sets found:", file=sys.stderr)
+
+    for path, missing in invalid:
+        print(
+            f"  {path.name}: missing {', '.join(missing)}",
+            file=sys.stderr,
+        )
+
+    sys.exit(1)
+
+sets.sort(key=lambda item: item[0], reverse=True)
+
+keep: set[Path] = set()
+reasons: dict[Path, set[str]] = {}
+
+def preserve(path: Path, reason: str) -> None:
+    keep.add(path)
+    reasons.setdefault(path, set()).add(reason)
+
+for _, path in sets[:keep_last]:
+    preserve(path, "last")
+
+def keep_buckets(limit: int, key_fn, reason: str) -> None:
+    if limit <= 0:
+        return
+
+    buckets = set()
+
+    for stamp, path in sets:
+        key = key_fn(stamp)
+
+        if key in buckets:
+            continue
+
+        buckets.add(key)
+        preserve(path, reason)
+
+        if len(buckets) >= limit:
+            break
+
+keep_buckets(
+    keep_daily,
+    lambda dt: (dt.year, dt.month, dt.day),
+    "daily",
+)
+
+keep_buckets(
+    keep_weekly,
+    lambda dt: dt.isocalendar()[:2],
+    "weekly",
+)
+
+keep_buckets(
+    keep_monthly,
+    lambda dt: (dt.year, dt.month),
+    "monthly",
+)
+
+keep_buckets(
+    keep_yearly,
+    lambda dt: dt.year,
+    "yearly",
+)
+
+expire = [
+    (stamp, path)
+    for stamp, path in sets
+    if path not in keep
+]
+
+print()
+print(f"Managed recovery sets: {len(sets)}")
+print(f"Keep:                  {len(keep)}")
+print(f"Expire:                {len(expire)}")
+
+print()
+print("===== KEEP =====")
+
+for _, path in sets:
+    if path not in keep:
+        continue
+
+    why = ",".join(sorted(reasons[path]))
+    print(f"{path.name}  [{why}]")
+
+print()
+print("===== EXPIRE =====")
+
+if not expire:
+    print("(none)")
+else:
+    for _, path in expire:
+        print(path.name)
+
+if not apply:
+    print()
+    print("DRY-RUN: no recovery sets removed")
+    sys.exit(0)
+
+print()
+print("===== APPLY =====")
+
+for _, path in expire:
+    print(f"Removing: {path}")
+    shutil.rmtree(path)
+
+print()
+print(f"PASS: removed {len(expire)} expired recovery set(s)")
+PY

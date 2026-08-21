@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [ "$EUID" -ne 0 ]; then
+    echo "ERROR: installer must run as root" >&2
+    exit 1
+fi
+
+SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+ENGINE_DEST="/usr/local/lib/docker-backup"
+APP_DEST="/etc/docker-backup/apps"
+REPO_DEST="/etc/docker-backup/repos"
+PORTABLE_DEST="/etc/docker-backup/portable"
+VERSION_DEST="/etc/docker-backup/DEPLOYED_VERSION"
+
+echo "===== INSTALL DOCKER BACKUP FRAMEWORK ====="
+
+if git -C "$SOURCE_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    VERSION="$(git -C "$SOURCE_ROOT" rev-parse HEAD)"
+else
+    VERSION="unknown"
+fi
+
+echo "Source:  $SOURCE_ROOT"
+echo "Version: $VERSION"
+
+echo
+echo "===== PREFLIGHT ====="
+
+for file in \
+    "$SOURCE_ROOT/src/backup-repository" \
+    "$SOURCE_ROOT/src/retention-repository" \
+    "$SOURCE_ROOT/src/maintain-repository" \
+    "$SOURCE_ROOT/src/portable-backup" \
+    "$SOURCE_ROOT/src/portable-retention"
+do
+    if [ ! -f "$file" ]; then
+        echo "ERROR: missing source file: $file" >&2
+        exit 1
+    fi
+done
+
+bash -n "$SOURCE_ROOT/src/backup-repository"
+bash -n "$SOURCE_ROOT/src/retention-repository"
+bash -n "$SOURCE_ROOT/src/maintain-repository"
+bash -n "$SOURCE_ROOT/src/portable-backup"
+bash -n "$SOURCE_ROOT/src/portable-retention"
+
+for config_dir in \
+    "$SOURCE_ROOT/config/apps" \
+    "$SOURCE_ROOT/config/repos" \
+    "$SOURCE_ROOT/config/portable"
+do
+    if [ ! -d "$config_dir" ]; then
+        echo "ERROR: missing configuration directory: $config_dir" >&2
+        exit 1
+    fi
+
+    if ! compgen -G "$config_dir/*.conf" >/dev/null; then
+        echo "ERROR: no configuration files found in: $config_dir" >&2
+        exit 1
+    fi
+done
+
+echo "PASS: source validation"
+
+echo
+echo "===== INSTALL DIRECTORIES ====="
+
+install -d -o root -g root -m 0750 \
+    "$ENGINE_DEST" \
+    "$APP_DEST" \
+    "$REPO_DEST" \
+    "$PORTABLE_DEST"
+
+# Do not recreate or modify existing secrets.
+if [ ! -d /etc/docker-backup/secrets ]; then
+    install -d -o root -g root -m 0700 \
+        /etc/docker-backup/secrets
+fi
+
+echo
+echo "===== INSTALL ENGINES ====="
+
+install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/src/backup-repository" \
+    "$ENGINE_DEST/backup-repository"
+
+install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/src/retention-repository" \
+    "$ENGINE_DEST/retention-repository"
+
+install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/src/maintain-repository" \
+    "$ENGINE_DEST/maintain-repository"
+
+install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/src/portable-backup" \
+    "$ENGINE_DEST/portable-backup"
+
+install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/src/portable-retention" \
+    "$ENGINE_DEST/portable-retention"
+
+echo
+echo "===== INSTALL CONFIGURATION ====="
+
+for config in "$SOURCE_ROOT"/config/apps/*.conf; do
+    install -o root -g root -m 0640 \
+        "$config" \
+        "$APP_DEST/$(basename "$config")"
+done
+
+for config in "$SOURCE_ROOT"/config/repos/*.conf; do
+    install -o root -g root -m 0640 \
+        "$config" \
+        "$REPO_DEST/$(basename "$config")"
+done
+
+for config in "$SOURCE_ROOT"/config/portable/*.conf; do
+    install -o root -g root -m 0640 \
+        "$config" \
+        "$PORTABLE_DEST/$(basename "$config")"
+done
+
+printf '%s\n' "$VERSION" > "$VERSION_DEST"
+chown root:root "$VERSION_DEST"
+chmod 0644 "$VERSION_DEST"
+
+echo
+echo "===== INSTALL SYSTEMD TEMPLATES ====="
+
+for unit in "$SOURCE_ROOT"/packaging/systemd/*.service; do
+    install -o root -g root -m 0644         "$unit"         "/etc/systemd/system/$(basename "$unit")"
+done
+
+systemctl daemon-reload
+
+echo
+echo "===== RENDER REPOSITORY TIMERS ====="
+
+for config in "$REPO_DEST"/*.conf; do
+    "$SOURCE_ROOT/scripts/render-timers" "$config"
+done
+
+echo
+echo "===== RENDER PORTABLE TIMERS ====="
+
+for config in "$PORTABLE_DEST"/*.conf; do
+    "$SOURCE_ROOT/scripts/render-portable-timers" "$config"
+done
+
+echo
+echo "===== VERIFY INSTALLED COPIES ====="
+
+cmp "$SOURCE_ROOT/src/backup-repository" \
+    "$ENGINE_DEST/backup-repository"
+
+cmp "$SOURCE_ROOT/src/retention-repository" \
+    "$ENGINE_DEST/retention-repository"
+
+cmp "$SOURCE_ROOT/src/maintain-repository" \
+    "$ENGINE_DEST/maintain-repository"
+
+cmp "$SOURCE_ROOT/src/portable-backup" \
+    "$ENGINE_DEST/portable-backup"
+
+cmp "$SOURCE_ROOT/src/portable-retention" \
+    "$ENGINE_DEST/portable-retention"
+
+for config in "$SOURCE_ROOT"/config/apps/*.conf; do
+    cmp "$config" "$APP_DEST/$(basename "$config")"
+done
+
+for config in "$SOURCE_ROOT"/config/repos/*.conf; do
+    cmp "$config" "$REPO_DEST/$(basename "$config")"
+done
+
+for config in "$SOURCE_ROOT"/config/portable/*.conf; do
+    cmp "$config" "$PORTABLE_DEST/$(basename "$config")"
+done
+
+echo "PASS: installed files match source"
+
+echo
+echo "===== RUNTIME INDEPENDENCE ====="
+
+if grep -RqsF "$SOURCE_ROOT" \
+    "$ENGINE_DEST" \
+    "$APP_DEST" \
+    "$REPO_DEST" \
+    "$PORTABLE_DEST"; then
+    echo "ERROR: installed runtime references source checkout" >&2
+    exit 1
+fi
+
+echo "PASS: runtime has no references to source checkout"
+
+echo
+echo "PASS: framework installation complete"

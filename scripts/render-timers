@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [ "$EUID" -ne 0 ]; then
+    echo "ERROR: timer renderer must run as root" >&2
+    exit 1
+fi
+
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 <repository-config>" >&2
+    exit 2
+fi
+
+REPO_CONFIG="$1"
+
+if [ ! -f "$REPO_CONFIG" ]; then
+    echo "ERROR: repository config not found: $REPO_CONFIG" >&2
+    exit 2
+fi
+
+# shellcheck source=/dev/null
+source "$REPO_CONFIG"
+
+: "${REPO_NAME:?Missing REPO_NAME}"
+: "${BACKUP_SCHEDULE:?Missing BACKUP_SCHEDULE}"
+: "${RETENTION_SCHEDULE:?Missing RETENTION_SCHEDULE}"
+: "${CHECK_SCHEDULE:?Missing CHECK_SCHEDULE}"
+: "${READ_DATA_CHECK_SCHEDULE:?Missing READ_DATA_CHECK_SCHEDULE}"
+: "${PRUNE_SCHEDULE:?Missing PRUNE_SCHEDULE}"
+: "${TIMERS_ENABLED:?Missing TIMERS_ENABLED}"
+
+case "$TIMERS_ENABLED" in
+    true|false)
+        ;;
+    *)
+        echo "ERROR: TIMERS_ENABLED must be true or false" >&2
+        exit 2
+        ;;
+esac
+
+DEST="${TIMER_DEST:-/etc/systemd/system}"
+
+write_timer() {
+    local action="$1"
+    local schedule="$2"
+    local description="$3"
+
+    local calendar
+    local timer
+
+    calendar="$schedule"
+    timer="$DEST/docker-${action}@${REPO_NAME}.timer"
+
+    cat > "$timer" <<EOF_TIMER
+[Unit]
+Description=${description} for ${REPO_NAME}
+
+[Timer]
+OnCalendar=${calendar}
+Persistent=true
+AccuracySec=5m
+Unit=docker-${action}@${REPO_NAME}.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+
+    chown root:root "$timer"
+    chmod 0644 "$timer"
+
+    echo "RENDERED: $(basename "$timer")"
+    echo "  OnCalendar=$calendar"
+}
+
+echo "===== RENDER TIMERS FOR $REPO_NAME ====="
+
+write_timer \
+    "backup" \
+    "$BACKUP_SCHEDULE" \
+    "Scheduled Docker application backup"
+
+write_timer \
+    "retention" \
+    "$RETENTION_SCHEDULE" \
+    "Scheduled Docker backup retention"
+
+write_timer \
+    "check" \
+    "$CHECK_SCHEDULE" \
+    "Scheduled Docker backup repository check"
+
+write_timer \
+    "read-data" \
+    "$READ_DATA_CHECK_SCHEDULE" \
+    "Scheduled Docker backup full data check"
+
+write_timer \
+    "prune" \
+    "$PRUNE_SCHEDULE" \
+    "Scheduled Docker backup repository prune"
+
+if [ "$DEST" != "/etc/systemd/system" ]; then
+    echo
+    echo "TEST DESTINATION: timer enablement state not modified."
+    exit 0
+fi
+
+systemctl daemon-reload
+
+TIMERS=(
+    "docker-backup@${REPO_NAME}.timer"
+    "docker-retention@${REPO_NAME}.timer"
+    "docker-check@${REPO_NAME}.timer"
+    "docker-read-data@${REPO_NAME}.timer"
+    "docker-prune@${REPO_NAME}.timer"
+)
+
+echo
+echo "===== APPLY TIMER ENABLEMENT POLICY ====="
+
+if [ "$TIMERS_ENABLED" = "true" ]; then
+    systemctl enable --now "${TIMERS[@]}"
+    echo "PASS: timers enabled and started"
+else
+    systemctl disable --now "${TIMERS[@]}" 2>/dev/null || true
+    echo "PASS: timers disabled and stopped"
+fi

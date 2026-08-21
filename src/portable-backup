@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 <portable-config>" >&2
+    exit 2
+fi
+
+PORTABLE_CONFIG="$1"
+
+if [ ! -f "$PORTABLE_CONFIG" ]; then
+    echo "ERROR: portable config not found: $PORTABLE_CONFIG" >&2
+    exit 2
+fi
+
+# Portable-target configuration.
+# shellcheck source=/dev/null
+source "$PORTABLE_CONFIG"
+
+: "${PORTABLE_NAME:?Missing PORTABLE_NAME}"
+: "${APP_NAME:?Missing APP_NAME}"
+: "${BACKUP_ROOT:?Missing BACKUP_ROOT}"
+: "${STORAGE_TYPE:?Missing STORAGE_TYPE}"
+
+APP_CONFIG="/etc/docker-backup/apps/${APP_NAME}.conf"
+
+if [ ! -f "$APP_CONFIG" ]; then
+    echo "ERROR: application config not found: $APP_CONFIG" >&2
+    exit 2
+fi
+
+# Application configuration.
+# shellcheck source=/dev/null
+source "$APP_CONFIG"
+
+: "${COMPOSE_DIR:?Missing COMPOSE_DIR}"
+: "${DB_TYPE:?Missing DB_TYPE}"
+: "${DB_BACKUP_MODE:?Missing DB_BACKUP_MODE}"
+
+# Use UTC in recovery-set names so directory timestamps remain unambiguous
+# across timezone and DST changes.
+STAMP="$(date -u +%Y-%m-%d_%H%M%SZ)"
+FINAL_DIR="${BACKUP_ROOT}/${STAMP}"
+TEMP_DIR="${BACKUP_ROOT}/.incomplete-${STAMP}-$$"
+
+APP_LOCK_FILE="/run/lock/docker-backup-app-${APP_NAME}.lock"
+LOCK_FILE="/run/lock/docker-portable-${PORTABLE_NAME}.lock"
+
+# Serialize application capture across all backup mechanisms before
+# acquiring the portable-target lock.
+exec 8>"$APP_LOCK_FILE"
+
+if ! flock -n 8; then
+    echo "ERROR: another capture is already running for application $APP_NAME" >&2
+    exit 1
+fi
+
+exec 9>"$LOCK_FILE"
+
+if ! flock -n 9; then
+    echo "ERROR: portable backup/retention already running for $PORTABLE_NAME" >&2
+    exit 1
+fi
+
+cleanup() {
+    rc=$?
+
+    if [ "$rc" -ne 0 ]; then
+        echo
+        echo "ERROR: portable backup failed with exit code $rc" >&2
+
+        if [ -d "$TEMP_DIR" ]; then
+            rm -rf --one-file-system "$TEMP_DIR" || true
+            echo "Removed incomplete recovery set: $TEMP_DIR" >&2
+        fi
+    fi
+
+    exit "$rc"
+}
+
+trap cleanup EXIT
+
+verify_storage() {
+    case "$STORAGE_TYPE" in
+        nfs)
+            : "${STORAGE_MOUNT:?Missing STORAGE_MOUNT}"
+            : "${EXPECTED_SOURCE:?Missing EXPECTED_SOURCE}"
+
+            # Trigger systemd automount before inspecting the filesystem.
+            ls "$STORAGE_MOUNT" >/dev/null
+
+            fstype=""
+            source=""
+
+            while read -r candidate_fstype candidate_source; do
+                case "$candidate_fstype" in
+                    nfs|nfs4)
+                        fstype="$candidate_fstype"
+                        source="$candidate_source"
+                        break
+                        ;;
+                esac
+            done < <(
+                findmnt -T "$STORAGE_MOUNT" \
+                    --noheadings \
+                    --raw \
+                    --output FSTYPE,SOURCE
+            )
+
+            if [ -z "$fstype" ] || [ -z "$source" ]; then
+                echo "ERROR: no underlying NFS mount found for $STORAGE_MOUNT" >&2
+                exit 1
+            fi
+
+            if [ "$source" != "$EXPECTED_SOURCE" ]; then
+                echo "ERROR: unexpected NFS source" >&2
+                echo "Expected: $EXPECTED_SOURCE" >&2
+                echo "Detected: $source" >&2
+                exit 1
+            fi
+            ;;
+
+        local)
+            ;;
+
+        *)
+            echo "ERROR: unsupported STORAGE_TYPE: $STORAGE_TYPE" >&2
+            exit 1
+            ;;
+    esac
+}
+
+echo "===== PORTABLE APPLICATION BACKUP ====="
+echo "Application: $APP_NAME"
+echo "Target:      $PORTABLE_NAME"
+echo "Recovery set: $STAMP"
+
+echo
+echo "===== VERIFY STORAGE ====="
+
+verify_storage
+echo "PASS: backup storage verified"
+
+if [ ! -d "$BACKUP_ROOT" ]; then
+    echo "ERROR: backup root does not exist: $BACKUP_ROOT" >&2
+    exit 1
+fi
+
+echo
+echo "===== VERIFY BACKUP PATHS ====="
+
+if [ "${#BACKUP_PATHS[@]}" -eq 0 ]; then
+    echo "ERROR: BACKUP_PATHS is empty" >&2
+    exit 1
+fi
+
+for backup_path in "${BACKUP_PATHS[@]}"; do
+    if [ ! -e "$backup_path" ]; then
+        echo "ERROR: configured backup path does not exist: $backup_path" >&2
+        exit 1
+    fi
+done
+
+echo "PASS: all configured backup paths exist"
+
+echo
+echo "===== CREATE RECOVERY SET ====="
+
+if [ -e "$FINAL_DIR" ] || [ -e "$TEMP_DIR" ]; then
+    echo "ERROR: recovery-set path already exists" >&2
+    exit 1
+fi
+
+mkdir "$TEMP_DIR"
+chmod 0700 "$TEMP_DIR"
+
+cd "$COMPOSE_DIR"
+
+if [ "$DB_TYPE" != "none" ]; then
+    echo
+    echo "===== DATABASE DUMP ====="
+
+    case "${DB_TYPE}:${DB_BACKUP_MODE}" in
+        mariadb:logical)
+            : "${DB_CONTAINER:?Missing DB_CONTAINER}"
+
+            if ! docker compose ps \
+                --status running \
+                --services \
+                | grep -Fxq "$DB_CONTAINER"; then
+                echo "ERROR: database service is not running: $DB_CONTAINER" >&2
+                exit 1
+            fi
+
+            docker compose exec -T "$DB_CONTAINER" \
+                sh -c 'exec mariadb-dump \
+                    --user="$MARIADB_USER" \
+                    --password="$MARIADB_PASSWORD" \
+                    --single-transaction \
+                    --quick \
+                    --routines \
+                    --triggers \
+                    "$MARIADB_DATABASE"' \
+                | gzip -1 > "$TEMP_DIR/database.sql.gz"
+
+            chmod 0600 "$TEMP_DIR/database.sql.gz"
+
+            if [ ! -s "$TEMP_DIR/database.sql.gz" ]; then
+                echo "ERROR: database dump is empty" >&2
+                exit 1
+            fi
+
+            gzip -t "$TEMP_DIR/database.sql.gz"
+
+            echo "PASS: database dump created and validated"
+            ;;
+
+        *)
+            echo "ERROR: unsupported database backup mode: ${DB_TYPE}:${DB_BACKUP_MODE}" >&2
+            exit 1
+            ;;
+    esac
+fi
+
+echo
+echo "===== APPLICATION STATE ====="
+
+tar_paths=()
+
+for backup_path in "${BACKUP_PATHS[@]}"; do
+    tar_paths+=("${backup_path#/}")
+done
+
+tar \
+    -C / \
+    -czf "$TEMP_DIR/app-state.tar.gz" \
+    "${tar_paths[@]}"
+
+chmod 0600 "$TEMP_DIR/app-state.tar.gz"
+
+if [ ! -s "$TEMP_DIR/app-state.tar.gz" ]; then
+    echo "ERROR: application archive is empty" >&2
+    exit 1
+fi
+
+gzip -t "$TEMP_DIR/app-state.tar.gz"
+tar -tzf "$TEMP_DIR/app-state.tar.gz" >/dev/null
+
+echo "PASS: application archive created and validated"
+
+echo
+echo "===== CREATE CHECKSUM MANIFEST ====="
+
+(
+    cd "$TEMP_DIR"
+
+    files=(app-state.tar.gz)
+
+    if [ "$DB_TYPE" != "none" ]; then
+        files=(database.sql.gz "${files[@]}")
+    fi
+
+    sha256sum "${files[@]}" > SHA256SUMS
+    chmod 0600 SHA256SUMS
+
+    sha256sum -c SHA256SUMS
+)
+
+echo
+echo "===== FINALIZE RECOVERY SET ====="
+
+mv "$TEMP_DIR" "$FINAL_DIR"
+
+trap - EXIT
+
+echo "PASS: portable recovery set completed"
+echo "Recovery set: $FINAL_DIR"
+
+echo
+echo "===== RECOVERY SET CONTENTS ====="
+
+ls -lhn "$FINAL_DIR"

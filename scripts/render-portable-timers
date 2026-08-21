@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [ "$EUID" -ne 0 ]; then
+    echo "ERROR: portable timer renderer must run as root" >&2
+    exit 1
+fi
+
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 <portable-config>" >&2
+    exit 2
+fi
+
+PORTABLE_CONFIG="$1"
+
+if [ ! -f "$PORTABLE_CONFIG" ]; then
+    echo "ERROR: portable config not found: $PORTABLE_CONFIG" >&2
+    exit 2
+fi
+
+# shellcheck source=/dev/null
+source "$PORTABLE_CONFIG"
+
+: "${PORTABLE_NAME:?Missing PORTABLE_NAME}"
+: "${PORTABLE_SCHEDULE:?Missing PORTABLE_SCHEDULE}"
+: "${PORTABLE_RETENTION_SCHEDULE:?Missing PORTABLE_RETENTION_SCHEDULE}"
+: "${TIMERS_ENABLED:?Missing TIMERS_ENABLED}"
+
+case "$TIMERS_ENABLED" in
+    true|false)
+        ;;
+    *)
+        echo "ERROR: TIMERS_ENABLED must be true or false" >&2
+        exit 2
+        ;;
+esac
+
+DEST="${TIMER_DEST:-/etc/systemd/system}"
+
+write_timer() {
+    local action="$1"
+    local schedule="$2"
+    local description="$3"
+
+    local calendar
+    local timer
+
+    calendar="$schedule"
+    timer="$DEST/docker-portable-${action}@${PORTABLE_NAME}.timer"
+
+    cat > "$timer" <<EOF_TIMER
+[Unit]
+Description=${description} for ${PORTABLE_NAME}
+
+[Timer]
+OnCalendar=${calendar}
+Persistent=true
+AccuracySec=5m
+Unit=docker-portable-${action}@${PORTABLE_NAME}.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+
+    chown root:root "$timer"
+    chmod 0644 "$timer"
+
+    echo "RENDERED: $(basename "$timer")"
+    echo "  OnCalendar=$calendar"
+}
+
+echo "===== RENDER PORTABLE TIMERS FOR $PORTABLE_NAME ====="
+
+write_timer \
+    "backup" \
+    "$PORTABLE_SCHEDULE" \
+    "Scheduled portable Docker application backup"
+
+write_timer \
+    "retention" \
+    "$PORTABLE_RETENTION_SCHEDULE" \
+    "Scheduled portable Docker backup retention"
+
+if [ "$DEST" != "/etc/systemd/system" ]; then
+    echo
+    echo "TEST DESTINATION: timer enablement state not modified."
+    exit 0
+fi
+
+systemctl daemon-reload
+
+TIMERS=(
+    "docker-portable-backup@${PORTABLE_NAME}.timer"
+    "docker-portable-retention@${PORTABLE_NAME}.timer"
+)
+
+echo
+echo "===== APPLY PORTABLE TIMER ENABLEMENT POLICY ====="
+
+if [ "$TIMERS_ENABLED" = "true" ]; then
+    systemctl enable --now "${TIMERS[@]}"
+    echo "PASS: portable timers enabled and started"
+else
+    systemctl disable --now "${TIMERS[@]}" 2>/dev/null || true
+    echo "PASS: portable timers disabled and stopped"
+fi

@@ -1,0 +1,14 @@
+[Unit]
+Description=Portable Docker application backup for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/docker-backup/portable-backup /etc/docker-backup/portable/%i.conf
+User=root
+Group=root
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=1h

@@ -28,15 +28,28 @@ mkdir -p \
     "$TMP/compose" \
     "$TMP/repository" \
     "$TMP/portable/original-set" \
-    "$TMP/app/config"
+    "$TMP/app/config" \
+    "$TMP/app/assets"
 
 FILES="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 GEN="20260821T230000Z-12345"
 CP_FILES="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 
 PRODUCTION_FILE="$TMP/app/config/state.txt"
+PRODUCTION_FILE_TWO="$TMP/app/assets/state.txt"
+
 printf '%s\n' "production-current-state" > "$PRODUCTION_FILE"
-PRODUCTION_HASH_BEFORE="$(sha256sum "$PRODUCTION_FILE" | awk '{print $1}')"
+printf '%s\n' "production-second-state" > "$PRODUCTION_FILE_TWO"
+
+PRODUCTION_HASH_BEFORE="$(
+    sha256sum "$PRODUCTION_FILE" |
+    awk '{print $1}'
+)"
+
+PRODUCTION_HASH_TWO_BEFORE="$(
+    sha256sum "$PRODUCTION_FILE_TWO" |
+    awk '{print $1}'
+)"
 
 cat > "$CONFIG/app.conf" <<EOF_APP
 APP_NAME="app-one"
@@ -45,6 +58,7 @@ DB_TYPE="none"
 DB_BACKUP_MODE="none"
 BACKUP_PATHS=(
     "$TMP/app/config"
+    "$TMP/app/assets"
 )
 EXCLUDE_PATHS=(
     "$TMP/app/excluded"
@@ -298,12 +312,17 @@ esac
 }
 
 relative="${TEST_BACKUP_PATH#/}"
+relative_two="${TEST_BACKUP_PATH_TWO#/}"
 
 if [[ "${OMIT_STAGED_PATH:-0}" != "1" ]]; then
     mkdir -p "$target/$relative"
     printf '%s\n' "restored-backup-state" \
         > "$target/$relative/state.txt"
 fi
+
+mkdir -p "$target/$relative_two"
+printf '%s\n' "restored-second-state" \
+    > "$target/$relative_two/state.txt"
 
 if [[ "${INCLUDE_EXCLUDED_PATH:-0}" == "1" ]]; then
     excluded_relative="${TEST_EXCLUDED_PATH#/}"
@@ -313,6 +332,46 @@ if [[ "${INCLUDE_EXCLUDED_PATH:-0}" == "1" ]]; then
 fi
 EOF_RESTIC
 chmod +x "$BIN/restic"
+
+cat > "$BIN/mv" <<'EOF_MV'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'mv|%s\n' "$*" >> "$TEST_COMMAND_LOG"
+
+args=("$@")
+
+# Strip the "--" used by the restore engine.
+if [[ "${args[0]:-}" == "--" ]]; then
+    args=("${args[@]:1}")
+fi
+
+[[ ${#args[@]} -eq 2 ]] || {
+    echo "unexpected mv invocation: $*" >&2
+    exit 1
+}
+
+src="${args[0]}"
+dst="${args[1]}"
+
+if [[ "${FAIL_PRESERVE_SECOND:-0}" == "1" ]] &&
+   [[ "$src" == "$TEST_BACKUP_PATH_TWO" ]]
+then
+    echo "injected second-path preservation failure" >&2
+    exit 61
+fi
+
+if [[ "${FAIL_PLACE_SECOND:-0}" == "1" ]] &&
+   [[ "$src" == */filesystem/"${TEST_BACKUP_PATH_TWO#/}" ]] &&
+   [[ "$dst" == "$TEST_BACKUP_PATH_TWO" ]]
+then
+    echo "injected second-path placement failure" >&2
+    exit 62
+fi
+
+exec /usr/bin/mv -- "$src" "$dst"
+EOF_MV
+chmod +x "$BIN/mv"
 
 cat > "$BIN/systemctl" <<'EOF_SYSTEMCTL'
 #!/usr/bin/env bash
@@ -352,11 +411,13 @@ run_execute() {
         "DOCKER_BACKUP_ENGINE_ROOT=$RUNTIME" \
         "DOCKER_BACKUP_LOCK_ROOT=$LOCK_ROOT" \
         "DOCKER_BACKUP_RESTORE_RECORD_ROOT=$RECORD_ROOT" \
+        "DOCKER_BACKUP_RESTORE_FALLBACK_ROOT=$TMP/fallback" \
         "TEST_COMMAND_LOG=$LOG" \
         "TEST_APP_STATE_FILE=$TMP/app-state" \
         "TEST_EXPECTED_FILES_SNAPSHOT=$FILES" \
         "TEST_PRODUCTION_ROOT=$TMP/app" \
         "TEST_BACKUP_PATH=$TMP/app/config" \
+        "TEST_BACKUP_PATH_TWO=$TMP/app/assets" \
         "TEST_EXCLUDED_PATH=$TMP/app/excluded" \
         "FAIL_REPOSITORY_CHECKPOINT=${FAIL_REPOSITORY_CHECKPOINT:-0}" \
         "FAIL_PORTABLE_CHECKPOINT=${FAIL_PORTABLE_CHECKPOINT:-0}" \
@@ -366,6 +427,8 @@ run_execute() {
         "FAIL_RESTIC_RESTORE=${FAIL_RESTIC_RESTORE:-0}" \
         "OMIT_STAGED_PATH=${OMIT_STAGED_PATH:-0}" \
         "INCLUDE_EXCLUDED_PATH=${INCLUDE_EXCLUDED_PATH:-0}" \
+        "FAIL_PRESERVE_SECOND=${FAIL_PRESERVE_SECOND:-0}" \
+        "FAIL_PLACE_SECOND=${FAIL_PLACE_SECOND:-0}" \
         "$ENGINE" \
         "$CONFIG/app.conf" \
         "$CONFIG/repo.conf" \
@@ -377,18 +440,22 @@ run_execute() {
         --confirm app-one
 }
 
-echo "=== successful shutdown/staging/restart ==="
+echo "=== successful filesystem restore ==="
 : > "$LOG"
 printf '%s\n' running > "$TMP/app-state"
 
 run_execute > "$TMP/success.log"
 
 grep -F \
-    'PASS: application shutdown and immutable staging completed' \
+    'PASS: production filesystem restored from immutable snapshot' \
     "$TMP/success.log"
 
 grep -F \
-    'PASS: production filesystem and database were not modified' \
+    'PASS: fallback copy preserved' \
+    "$TMP/success.log"
+
+grep -F \
+    'PASS: database state was not modified' \
     "$TMP/success.log"
 
 grep -F 'backup-repository|' "$LOG" >/dev/null
@@ -404,29 +471,52 @@ grep -F "restic|restore $FILES --target " "$LOG" >/dev/null
     exit 1
 }
 
-PRODUCTION_HASH_AFTER="$(
-    sha256sum "$PRODUCTION_FILE" |
-    awk '{print $1}'
+sudo grep -Fx \
+    'restored-backup-state' \
+    "$PRODUCTION_FILE" >/dev/null
+
+sudo grep -Fx \
+    'restored-second-state' \
+    "$PRODUCTION_FILE_TWO" >/dev/null
+
+echo "PASS: both production paths contain restored state"
+
+FALLBACK_FILE="$(
+    sudo find "$TMP/fallback/app-one" \
+        -type f \
+        -path "*/${TMP#/}/app/config/state.txt" |
+    head -1
 )"
 
-[[ "$PRODUCTION_HASH_AFTER" == "$PRODUCTION_HASH_BEFORE" ]] || {
-    echo "ERROR: production backup path changed during staging phase" >&2
+FALLBACK_FILE_TWO="$(
+    sudo find "$TMP/fallback/app-one" \
+        -type f \
+        -path "*/${TMP#/}/app/assets/state.txt" |
+    head -1
+)"
+
+[[ -n "$FALLBACK_FILE" && -n "$FALLBACK_FILE_TWO" ]] || {
+    echo "ERROR: fallback files not found" >&2
     exit 1
 }
 
-grep -Fx \
+sudo grep -Fx \
     'production-current-state' \
-    "$PRODUCTION_FILE" >/dev/null
+    "$FALLBACK_FILE" >/dev/null
 
-echo "PASS: production file remained byte-for-byte unchanged"
+sudo grep -Fx \
+    'production-second-state' \
+    "$FALLBACK_FILE_TWO" >/dev/null
+
+echo "PASS: both original paths preserved in fallback tree"
 
 RECORD="$(
     find "$RECORD_ROOT/app-one" \
         -maxdepth 1 \
         -type f \
-        -name '*.json' \
-        | sort \
-        | tail -1
+        -name '*.json' |
+    sort |
+    tail -1
 )"
 
 sudo cat "$RECORD" |
@@ -436,16 +526,19 @@ import sys
 
 d = json.load(sys.stdin)
 
-assert d["result"] == "STAGING_VALIDATED"
+assert d["result"] == "FILESYSTEM_RESTORED"
 assert d["production_mutation_started"] is True
 assert d["application_shutdown"] == "PASS"
 assert d["filesystem_staging"] == "PASS"
+assert d["filesystem_placement"] == "PASS"
+assert d["filesystem_rollback"] == "NOT_NEEDED"
 assert d["application_state_restored"] == "PASS"
 assert d["timer_state_restored"] is True
+assert d["fallback_root"]
 assert d["pre_restore_checkpoint"]["files_snapshot"] == "c" * 64
 '
 
-echo "PASS: restore record captures shutdown/staging/restart state"
+echo "PASS: restore record captures completed filesystem restore"
 
 # Verify operation ordering.
 python3 - "$LOG" <<'ORDERPY'
@@ -465,6 +558,14 @@ portable = first("portable-backup|")
 timer_stop = first("systemctl|stop ")
 down = first("docker|compose down")
 restore = first("restic|restore ")
+
+mv_indices = [
+    i for i, line in enumerate(lines)
+    if line.startswith("mv|")
+]
+
+assert len(mv_indices) >= 4
+
 up = first("docker|compose up -d")
 timer_start = first("systemctl|start ")
 
@@ -472,7 +573,8 @@ assert repo < portable
 assert portable < timer_stop
 assert timer_stop < down
 assert down < restore
-assert restore < up
+assert restore < mv_indices[0]
+assert mv_indices[-1] < up
 assert up < timer_start
 ORDERPY
 
@@ -717,17 +819,139 @@ fi
 echo "PASS: failed shutdown prevents staging"
 
 echo
-echo "=== production-data mutation audit ==="
+echo "=== partial preservation failure rolls back ==="
 
-PRODUCTION_HASH_FINAL="$(
-    sha256sum "$PRODUCTION_FILE" |
+sudo rm -rf "$TMP/fallback"
+sudo rm -rf "$TMP/app/config" "$TMP/app/assets"
+mkdir -p "$TMP/app/config" "$TMP/app/assets"
+
+printf '%s\n' "production-current-state" > "$PRODUCTION_FILE"
+printf '%s\n' "production-second-state" > "$PRODUCTION_FILE_TWO"
+
+: > "$LOG"
+printf '%s\n' running > "$TMP/app-state"
+
+if FAIL_PRESERVE_SECOND=1 \
+   run_execute > "$TMP/preserve-fail.log" 2>&1
+then
+    echo "ERROR: partial preservation failure was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'injected second-path preservation failure' \
+    "$TMP/preserve-fail.log"
+
+sudo grep -Fx \
+    'production-current-state' \
+    "$PRODUCTION_FILE" >/dev/null
+
+sudo grep -Fx \
+    'production-second-state' \
+    "$PRODUCTION_FILE_TWO" >/dev/null
+
+[[ "$(cat "$TMP/app-state")" == "running" ]] || {
+    echo "ERROR: application remained stopped after preservation rollback" >&2
+    exit 1
+}
+
+echo "PASS: partial preservation failure restored original filesystem"
+
+echo
+echo "=== second-path placement failure rolls back all paths ==="
+
+sudo rm -rf "$TMP/fallback"
+sudo rm -rf "$TMP/app/config" "$TMP/app/assets"
+mkdir -p "$TMP/app/config" "$TMP/app/assets"
+
+printf '%s\n' "production-current-state" > "$PRODUCTION_FILE"
+printf '%s\n' "production-second-state" > "$PRODUCTION_FILE_TWO"
+
+: > "$LOG"
+printf '%s\n' running > "$TMP/app-state"
+
+if FAIL_PLACE_SECOND=1 \
+   run_execute > "$TMP/place-fail.log" 2>&1
+then
+    echo "ERROR: partial filesystem placement failure was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'injected second-path placement failure' \
+    "$TMP/place-fail.log"
+
+sudo grep -Fx \
+    'production-current-state' \
+    "$PRODUCTION_FILE" >/dev/null
+
+sudo grep -Fx \
+    'production-second-state' \
+    "$PRODUCTION_FILE_TWO" >/dev/null
+
+HASH_ONE="$(
+    sudo sha256sum "$PRODUCTION_FILE" |
     awk '{print $1}'
 )"
 
-[[ "$PRODUCTION_HASH_FINAL" == "$PRODUCTION_HASH_BEFORE" ]] || {
-    echo "ERROR: production filesystem changed during execute tests" >&2
+HASH_TWO="$(
+    sudo sha256sum "$PRODUCTION_FILE_TWO" |
+    awk '{print $1}'
+)"
+
+[[ "$HASH_ONE" == "$PRODUCTION_HASH_BEFORE" ]] || {
+    echo "ERROR: first path was not restored exactly after placement failure" >&2
     exit 1
 }
+
+[[ "$HASH_TWO" == "$PRODUCTION_HASH_TWO_BEFORE" ]] || {
+    echo "ERROR: second path was not restored exactly after placement failure" >&2
+    exit 1
+}
+
+[[ "$(cat "$TMP/app-state")" == "running" ]] || {
+    echo "ERROR: application remained stopped after placement rollback" >&2
+    exit 1
+}
+
+ROLLBACK_ONE_LINE="$(
+    grep -nF "PASS: rolled back $TMP/app/config" \
+        "$TMP/place-fail.log" |
+    tail -1 |
+    cut -d: -f1
+)"
+
+ROLLBACK_TWO_LINE="$(
+    grep -nF "PASS: rolled back $TMP/app/assets" \
+        "$TMP/place-fail.log" |
+    tail -1 |
+    cut -d: -f1
+)"
+
+RESTART_LINE="$(
+    grep -nF 'PASS: application stack restarted' \
+        "$TMP/place-fail.log" |
+    tail -1 |
+    cut -d: -f1
+)"
+
+[[ -n "$ROLLBACK_ONE_LINE" &&
+   -n "$ROLLBACK_TWO_LINE" &&
+   -n "$RESTART_LINE" ]] || {
+    echo "ERROR: rollback/restart evidence incomplete" >&2
+    exit 1
+}
+
+[[ "$ROLLBACK_ONE_LINE" -lt "$RESTART_LINE" &&
+   "$ROLLBACK_TWO_LINE" -lt "$RESTART_LINE" ]] || {
+    echo "ERROR: application restarted before rollback completed" >&2
+    exit 1
+}
+
+echo "PASS: partial placement rolled back both paths before restart"
+
+echo
+echo "=== production-data mutation audit ==="
 
 if grep -E \
     'docker\|compose (stop|start|restart)' \
@@ -738,7 +962,6 @@ then
 fi
 
 echo "PASS: only controlled compose down/up mutations are used"
-echo "PASS: configured production data remains unchanged"
 
 echo
-echo "PASS: restore-application shutdown/staging regression suite"
+echo "PASS: restore-application filesystem restore regression suite"

@@ -328,10 +328,11 @@ echo
 echo "===== FALLBACK PLAN ====="
 
 RESTORE_ID="$(
-    date -u +%Y%m%dT%H%M%SZ
+    printf '%s-%s\n'         "$(date -u +%Y%m%dT%H%M%SZ)"         "$$"
 )"
 
-FALLBACK_ROOT="/var/lib/docker-backup/restore-fallback/${APP_ID}/${RESTORE_ID}"
+FALLBACK_BASE="${DOCKER_BACKUP_RESTORE_FALLBACK_ROOT:-/var/lib/docker-backup/restore-fallback}"
+FALLBACK_ROOT="${FALLBACK_BASE}/${APP_ID}/${RESTORE_ID}"
 
 echo "Fallback root: $FALLBACK_ROOT"
 
@@ -473,9 +474,17 @@ PORTABLE_CHECKPOINT_RESULT="${WORK_ROOT}/portable.result"
 
 TIMERS_NEED_RESTORE=0
 APPLICATION_NEEDS_RESTART=0
+FILESYSTEM_NEEDS_ROLLBACK=0
+declare -a FILESYSTEM_PRESERVED=()
 
 cleanup_execute() {
     rc=$?
+
+    if [[ "$FILESYSTEM_NEEDS_ROLLBACK" -eq 1 ]] &&
+       declare -F rollback_filesystem_state >/dev/null 2>&1
+    then
+        rollback_filesystem_state || true
+    fi
 
     if [[ "$APPLICATION_NEEDS_RESTART" -eq 1 ]] &&
        declare -F restore_application_state >/dev/null 2>&1
@@ -803,8 +812,10 @@ update_restore_record() {
     local mutation="$3"
     local shutdown="$4"
     local staging="$5"
-    local app_restored="$6"
-    local timers_restored="$7"
+    local placement="$6"
+    local rollback="$7"
+    local app_restored="$8"
+    local timers_restored="$9"
 
     python3 - \
         "$RESTORE_RECORD" \
@@ -813,6 +824,8 @@ update_restore_record() {
         "$mutation" \
         "$shutdown" \
         "$staging" \
+        "$placement" \
+        "$rollback" \
         "$app_restored" \
         "$timers_restored" <<'UPDATEPY'
 import json
@@ -827,6 +840,8 @@ import tempfile
     mutation,
     shutdown,
     staging,
+    placement,
+    rollback,
     app_restored,
     timers_restored,
 ) = sys.argv[1:]
@@ -839,8 +854,11 @@ document["last_completed_stage"] = stage
 document["production_mutation_started"] = mutation == "true"
 document["application_shutdown"] = shutdown
 document["filesystem_staging"] = staging
+document["filesystem_placement"] = placement
+document["filesystem_rollback"] = rollback
 document["application_state_restored"] = app_restored
 document["timer_state_restored"] = timers_restored == "true"
+document["fallback_root"] = document.get("fallback_root")
 
 directory = os.path.dirname(output)
 fd, temporary = tempfile.mkstemp(
@@ -886,6 +904,8 @@ update_restore_record \
     "false" \
     "NOT_STARTED" \
     "NOT_STARTED" \
+    "NOT_STARTED" \
+    "NOT_NEEDED" \
     "NOT_NEEDED" \
     "false"
 
@@ -901,6 +921,8 @@ update_restore_record \
     "true" \
     "IN_PROGRESS" \
     "NOT_STARTED" \
+    "NOT_STARTED" \
+    "NOT_NEEDED" \
     "PENDING" \
     "false"
 
@@ -928,6 +950,8 @@ update_restore_record \
     "true" \
     "PASS" \
     "NOT_STARTED" \
+    "NOT_STARTED" \
+    "NOT_NEEDED" \
     "PENDING" \
     "false"
 
@@ -975,13 +999,164 @@ update_restore_record \
     "true" \
     "PASS" \
     "PASS" \
+    "NOT_STARTED" \
+    "NOT_NEEDED" \
+    "PENDING" \
+    "false"
+
+rollback_filesystem_state() {
+    local rollback_failed=0
+
+    echo
+    echo "===== ROLLBACK PRODUCTION FILESYSTEM ====="
+
+    for (( i=${#FILESYSTEM_PRESERVED[@]}-1; i>=0; i-- )); do
+        path="${FILESYSTEM_PRESERVED[$i]}"
+        relative="${path#/}"
+        fallback="${FALLBACK_ROOT}/${relative}"
+
+        if [[ -e "$path" ]]; then
+            rm -rf -- "$path" || {
+                echo "ERROR: failed to remove current path during rollback: $path" >&2
+                rollback_failed=1
+                continue
+            }
+        fi
+
+        if [[ -e "$fallback" ]]; then
+            mkdir -p "$(dirname "$path")"
+
+            mv -- "$fallback" "$path" || {
+                echo "ERROR: failed to restore fallback path: $path" >&2
+                rollback_failed=1
+                continue
+            }
+
+            echo "PASS: rolled back $path"
+        else
+            echo "ERROR: fallback path missing during rollback: $fallback" >&2
+            rollback_failed=1
+        fi
+    done
+
+    if [[ "$rollback_failed" -eq 0 ]]; then
+        FILESYSTEM_NEEDS_ROLLBACK=0
+        FILESYSTEM_PRESERVED=()
+        return 0
+    fi
+
+    return 1
+}
+
+echo
+echo "===== PRESERVE PRODUCTION FILESYSTEM ====="
+
+mkdir -p "$FALLBACK_ROOT"
+
+# From the first production-path move onward, any failure must restore every
+# path that has already been preserved before the application can restart.
+FILESYSTEM_NEEDS_ROLLBACK=1
+
+python3 - "$RESTORE_RECORD" "$FALLBACK_ROOT" <<'FALLBACKPY'
+import json
+import os
+import sys
+import tempfile
+
+output, fallback = sys.argv[1:]
+
+with open(output, encoding="utf-8") as f:
+    document = json.load(f)
+
+document["fallback_root"] = fallback
+
+directory = os.path.dirname(output)
+fd, temporary = tempfile.mkstemp(
+    prefix=".restore-record.",
+    dir=directory,
+    text=True,
+)
+
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, output)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+FALLBACKPY
+
+for path in "${BACKUP_PATHS[@]}"; do
+    relative="${path#/}"
+    fallback="${FALLBACK_ROOT}/${relative}"
+
+    [[ -e "$path" ]] ||
+        die "production backup path missing before preservation: $path"
+
+    mkdir -p "$(dirname "$fallback")"
+
+    mv -- "$path" "$fallback"
+
+    FILESYSTEM_PRESERVED+=("$path")
+
+    echo "PASS: preserved $path -> $fallback"
+done
+
+update_restore_record \
+    "IN_PROGRESS" \
+    "production-filesystem-preserved" \
+    "true" \
+    "PASS" \
+    "PASS" \
+    "IN_PROGRESS" \
+    "NOT_NEEDED" \
     "PENDING" \
     "false"
 
 echo
-echo "===== PRODUCTION FILESYSTEM BOUNDARY ====="
-echo "Production application paths have NOT been replaced."
+echo "===== PLACE RESTORED FILESYSTEM ====="
+
+for path in "${BACKUP_PATHS[@]}"; do
+    relative="${path#/}"
+    staged="${STAGING_ROOT}/${relative}"
+
+    [[ -e "$staged" ]] ||
+        die "validated staged path disappeared before placement: $path"
+
+    mkdir -p "$(dirname "$path")"
+
+    mv -- "$staged" "$path"
+
+    echo "PASS: restored $path"
+done
+
+echo "PASS: validated filesystem state placed into production"
+
+update_restore_record \
+    "IN_PROGRESS" \
+    "production-filesystem-placed" \
+    "true" \
+    "PASS" \
+    "PASS" \
+    "PASS" \
+    "NOT_NEEDED" \
+    "PENDING" \
+    "false"
+
+echo
+echo "===== DATABASE BOUNDARY ====="
+echo "Production filesystem has been replaced."
 echo "Database state has NOT been modified."
+
+# At this checkpoint, a successful filesystem placement is accepted.
+# Preserve the fallback tree for operator recovery, but disable automatic
+# rollback before intentionally restarting into the restored filesystem.
+FILESYSTEM_NEEDS_ROLLBACK=0
 
 restore_application_state
 
@@ -999,11 +1174,13 @@ echo "PASS: application has running services after restart"
 restore_timer_state
 
 update_restore_record \
-    "STAGING_VALIDATED" \
-    "application-shutdown-filesystem-staging" \
+    "FILESYSTEM_RESTORED" \
+    "production-filesystem-restored" \
     "true" \
     "PASS" \
     "PASS" \
+    "PASS" \
+    "NOT_NEEDED" \
     "PASS" \
     "true"
 
@@ -1012,8 +1189,10 @@ rm -rf "$WORK_ROOT"
 trap - EXIT
 
 echo
-echo "PASS: application shutdown and immutable staging completed"
-echo "PASS: production filesystem and database were not modified"
+echo "PASS: production filesystem restored from immutable snapshot"
+echo "PASS: fallback copy preserved"
+echo "PASS: database state was not modified"
 echo "PASS: application state restored"
 echo "PASS: timer state restored"
+echo "Fallback root: $FALLBACK_ROOT"
 echo "Restore record: $RESTORE_RECORD"

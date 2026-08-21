@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENGINE="${ROOT}/src/restore-application"
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+CONFIG_ROOT="$TMP/config"
+RUNTIME_ROOT="$TMP/runtime"
+BIN="$TMP/bin"
+LOG="$TMP/commands.log"
+PLAN_FILE="$TMP/plan.json"
+
+mkdir -p \
+    "$CONFIG_ROOT" \
+    "$RUNTIME_ROOT" \
+    "$BIN" \
+    "$TMP/compose" \
+    "$TMP/repository" \
+    "$TMP/portable/set-one" \
+    "$TMP/app/config" \
+    "$TMP/app/assets"
+
+FILES_SNAPSHOT="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+DB_SNAPSHOT="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+GENERATION="20260821T220000Z-12345"
+
+cat > "$CONFIG_ROOT/app-none.conf" <<EOF_APP
+APP_NAME="app-one"
+COMPOSE_DIR="$TMP/compose"
+DB_TYPE="none"
+DB_BACKUP_MODE="none"
+BACKUP_PATHS=(
+    "$TMP/app/config"
+    "$TMP/app/assets"
+)
+EXCLUDE_PATHS=(
+    "$TMP/app/excluded"
+)
+EOF_APP
+
+cat > "$CONFIG_ROOT/app-db.conf" <<EOF_APP
+APP_NAME="app-one"
+COMPOSE_DIR="$TMP/compose"
+DB_TYPE="mariadb"
+DB_BACKUP_MODE="logical"
+DB_CONTAINER="db"
+BACKUP_PATHS=(
+    "$TMP/app/config"
+)
+EXCLUDE_PATHS=(
+    "$TMP/app/excluded"
+)
+EOF_APP
+
+cat > "$CONFIG_ROOT/repo.conf" <<EOF_REPO
+REPO_NAME="app-one-operational"
+APP_NAME="app-one"
+REPOSITORY="$TMP/repository"
+PASSWORD_FILE="$TMP/restic.password"
+STORAGE_TYPE="local"
+EOF_REPO
+
+cat > "$CONFIG_ROOT/portable.conf" <<EOF_PORTABLE
+PORTABLE_NAME="app-one"
+APP_NAME="app-one"
+BACKUP_ROOT="$TMP/portable"
+STORAGE_TYPE="local"
+EOF_PORTABLE
+
+printf '%s\n' 'password' > "$TMP/restic.password"
+
+cat > "$RUNTIME_ROOT/validate-application-recovery" <<'EOF_VALIDATOR'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_CONFIG="$1"
+REPO_CONFIG="$2"
+PORTABLE_CONFIG="$3"
+shift 3
+
+GENERATION=""
+FILES_SNAPSHOT=""
+DB_SNAPSHOT=""
+PORTABLE_SET=""
+RESULT_FILE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --generation)
+            shift
+            GENERATION="$1"
+            ;;
+        --files-snapshot)
+            shift
+            FILES_SNAPSHOT="$1"
+            ;;
+        --db-snapshot)
+            shift
+            DB_SNAPSHOT="$1"
+            ;;
+        --portable-set)
+            shift
+            PORTABLE_SET="$1"
+            ;;
+        --result-file)
+            shift
+            RESULT_FILE="$1"
+            ;;
+        *)
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+if [[ "${FAIL_VALIDATION:-0}" == "1" ]]; then
+    echo "ERROR: injected recovery validation failure" >&2
+    exit 44
+fi
+
+# shellcheck disable=SC1090
+source "$APP_CONFIG"
+APP_ID="$APP_NAME"
+
+# shellcheck disable=SC1090
+source "$REPO_CONFIG"
+REPO_ID="$REPO_NAME"
+
+# shellcheck disable=SC1090
+source "$PORTABLE_CONFIG"
+PORTABLE_ID="$PORTABLE_NAME"
+
+{
+    echo "RESULT=PASS"
+    echo "APPLICATION=$APP_ID"
+    echo "REPOSITORY=$REPO_ID"
+    echo "PORTABLE_TARGET=$PORTABLE_ID"
+    echo "RESTIC_GENERATION=$GENERATION"
+    echo "FILES_SNAPSHOT=$FILES_SNAPSHOT"
+
+    if [[ -n "$DB_SNAPSHOT" ]]; then
+        echo "DB_SNAPSHOT=$DB_SNAPSHOT"
+    fi
+
+    echo "PORTABLE_SET=$PORTABLE_SET"
+} > "$RESULT_FILE"
+
+chmod 0600 "$RESULT_FILE"
+
+echo "PASS: mock recovery validation"
+EOF_VALIDATOR
+
+chmod +x "$RUNTIME_ROOT/validate-application-recovery"
+
+cat > "$BIN/systemctl" <<'EOF_SYSTEMCTL'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'systemctl|%s\n' "$*" >> "$TEST_COMMAND_LOG"
+
+case "$1" in
+    is-active)
+        echo "active"
+        ;;
+    is-enabled)
+        echo "enabled"
+        ;;
+    stop|start|disable|enable)
+        echo "ERROR: destructive systemctl action invoked" >&2
+        exit 90
+        ;;
+    *)
+        echo "unexpected systemctl command: $*" >&2
+        exit 1
+        ;;
+esac
+EOF_SYSTEMCTL
+
+chmod +x "$BIN/systemctl"
+
+cat > "$BIN/docker" <<'EOF_DOCKER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'docker|%s\n' "$*" >> "$TEST_COMMAND_LOG"
+
+if [[ "$1" != "compose" ]]; then
+    echo "unexpected docker command: $*" >&2
+    exit 1
+fi
+
+case "${2:-}" in
+    config)
+        [[ "${3:-}" == "--quiet" ]] || exit 1
+        exit 0
+        ;;
+
+    ps)
+        if [[ "$*" == *"--services"* ]]; then
+            printf '%s\n' "web" "db"
+            exit 0
+        fi
+        ;;
+
+    down|up|stop|start|restart)
+        echo "ERROR: destructive docker compose action invoked" >&2
+        exit 91
+        ;;
+esac
+
+echo "unexpected docker compose command: $*" >&2
+exit 1
+EOF_DOCKER
+
+chmod +x "$BIN/docker"
+
+run_plan() {
+    sudo env \
+        "PATH=$BIN:$PATH" \
+        "DOCKER_BACKUP_ENGINE_ROOT=$RUNTIME_ROOT" \
+        "TEST_COMMAND_LOG=$LOG" \
+        "FAIL_VALIDATION=${FAIL_VALIDATION:-0}" \
+        "$ENGINE" "$@"
+}
+
+echo "=== DB_TYPE=none plan ==="
+
+: > "$LOG"
+
+run_plan \
+    "$CONFIG_ROOT/app-none.conf" \
+    "$CONFIG_ROOT/repo.conf" \
+    "$CONFIG_ROOT/portable.conf" \
+    --generation "$GENERATION" \
+    --files-snapshot "$FILES_SNAPSHOT" \
+    --portable-set "$TMP/portable/set-one" \
+    --plan-file "$PLAN_FILE"
+
+sudo cat "$PLAN_FILE" |
+python3 -c '
+import json
+import sys
+
+d = json.load(sys.stdin)
+
+assert d["schema_version"] == 1
+assert d["mode"] == "plan"
+assert d["destructive"] is False
+assert d["application"] == "app-one"
+assert d["repository"] == "app-one-operational"
+assert d["portable_target"] == "app-one"
+assert d["restic_generation"] == "20260821T220000Z-12345"
+assert d["files_snapshot"] == "a" * 64
+assert d["db_snapshot"] is None
+assert d["recovery_validation"] == "PASS"
+assert len(d["backup_paths"]) == 2
+'
+
+MODE="$(sudo stat -c '%a' "$PLAN_FILE")"
+
+[[ "$MODE" == "600" ]] || {
+    echo "ERROR: plan file mode is $MODE, expected 600" >&2
+    exit 1
+}
+
+echo "PASS: non-database restore plan valid"
+
+echo
+echo "=== MariaDB plan ==="
+
+DB_PLAN="$TMP/db-plan.json"
+: > "$LOG"
+
+run_plan \
+    "$CONFIG_ROOT/app-db.conf" \
+    "$CONFIG_ROOT/repo.conf" \
+    "$CONFIG_ROOT/portable.conf" \
+    --generation "$GENERATION" \
+    --files-snapshot "$FILES_SNAPSHOT" \
+    --db-snapshot "$DB_SNAPSHOT" \
+    --portable-set "$TMP/portable/set-one" \
+    --plan-file "$DB_PLAN"
+
+sudo cat "$DB_PLAN" |
+python3 -c '
+import json
+import sys
+
+d = json.load(sys.stdin)
+
+assert d["db_snapshot"] == "b" * 64
+assert d["destructive"] is False
+assert d["mode"] == "plan"
+'
+
+echo "PASS: MariaDB restore plan contains immutable DB coordinate"
+
+echo
+echo "=== destructive execution rejected ==="
+
+if run_plan \
+       "$CONFIG_ROOT/app-none.conf" \
+       "$CONFIG_ROOT/repo.conf" \
+       "$CONFIG_ROOT/portable.conf" \
+       --generation "$GENERATION" \
+       --files-snapshot "$FILES_SNAPSHOT" \
+       --portable-set "$TMP/portable/set-one" \
+       --execute \
+       > "$TMP/execute.log" 2>&1
+then
+    echo "ERROR: --execute was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'destructive execution is not implemented' \
+    "$TMP/execute.log"
+
+echo "PASS: --execute rejected"
+
+echo
+echo "=== recovery-validation failure blocks planning ==="
+
+if FAIL_VALIDATION=1 \
+   run_plan \
+       "$CONFIG_ROOT/app-none.conf" \
+       "$CONFIG_ROOT/repo.conf" \
+       "$CONFIG_ROOT/portable.conf" \
+       --generation "$GENERATION" \
+       --files-snapshot "$FILES_SNAPSHOT" \
+       --portable-set "$TMP/portable/set-one" \
+       > "$TMP/validation-failure.log" 2>&1
+then
+    echo "ERROR: failed recovery validation was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'injected recovery validation failure' \
+    "$TMP/validation-failure.log"
+
+echo "PASS: recovery validation failure blocks restore planning"
+
+echo
+echo "=== mutation audit ==="
+
+if grep -E \
+    'systemctl\|(stop|start|disable|enable)|docker\|compose (down|up|stop|start|restart)' \
+    "$LOG"
+then
+    echo "ERROR: destructive command observed during plan mode" >&2
+    exit 1
+fi
+
+grep -F 'systemctl|is-active' "$LOG" >/dev/null
+grep -F 'systemctl|is-enabled' "$LOG" >/dev/null
+grep -F 'docker|compose config --quiet' "$LOG" >/dev/null
+grep -F 'docker|compose ps --services --filter status=running' "$LOG" >/dev/null
+
+echo "PASS: plan mode performed inspection only"
+
+echo
+echo "PASS: restore-application plan regression suite"

@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+    cat >&2 <<'HELP'
+Usage:
+  restore-application \
+    <application-config> \
+    <repository-config> \
+    <portable-config> \
+    --generation <generation> \
+    --files-snapshot <immutable-id> \
+    [--db-snapshot <immutable-id>] \
+    --portable-set <absolute-path> \
+    [--plan-file <path>]
+
+Current implementation:
+  plan/preflight only
+
+This version cannot modify production state.
+HELP
+    exit 2
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+[[ "$EUID" -eq 0 ]] ||
+    die "restore planning must run as root"
+
+[[ $# -ge 3 ]] || usage
+
+APP_CONFIG="$1"
+REPO_CONFIG="$2"
+PORTABLE_CONFIG="$3"
+shift 3
+
+GENERATION=""
+FILES_SNAPSHOT=""
+DB_SNAPSHOT=""
+PORTABLE_SET=""
+PLAN_FILE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --generation)
+            shift
+            [[ $# -gt 0 ]] || usage
+            GENERATION="$1"
+            ;;
+        --files-snapshot)
+            shift
+            [[ $# -gt 0 ]] || usage
+            FILES_SNAPSHOT="$1"
+            ;;
+        --db-snapshot)
+            shift
+            [[ $# -gt 0 ]] || usage
+            DB_SNAPSHOT="$1"
+            ;;
+        --portable-set)
+            shift
+            [[ $# -gt 0 ]] || usage
+            PORTABLE_SET="$1"
+            ;;
+        --plan-file)
+            shift
+            [[ $# -gt 0 ]] || usage
+            PLAN_FILE="$1"
+            ;;
+        --execute|--confirm)
+            die "destructive execution is not implemented"
+            ;;
+        *)
+            usage
+            ;;
+    esac
+
+    shift
+done
+
+for file in \
+    "$APP_CONFIG" \
+    "$REPO_CONFIG" \
+    "$PORTABLE_CONFIG"
+do
+    [[ -f "$file" ]] ||
+        die "configuration file not found: $file"
+done
+
+[[ -n "$GENERATION" ]] ||
+    die "--generation is required"
+
+[[ "$FILES_SNAPSHOT" =~ ^[0-9a-f]{64}$ ]] ||
+    die "invalid or missing files snapshot ID"
+
+[[ -n "$PORTABLE_SET" && "$PORTABLE_SET" = /* ]] ||
+    die "--portable-set must be an absolute path"
+
+# Repository config.
+# shellcheck disable=SC1090
+source "$REPO_CONFIG"
+
+REPO_APP_NAME="${APP_NAME:-}"
+REPO_ID="${REPO_NAME:-}"
+REPO_PATH="${REPOSITORY:-}"
+PASSWORD_PATH="${PASSWORD_FILE:-}"
+
+[[ -n "$REPO_APP_NAME" ]] ||
+    die "repository config missing APP_NAME"
+
+[[ -n "$REPO_ID" ]] ||
+    die "repository config missing REPO_NAME"
+
+[[ -n "$REPO_PATH" ]] ||
+    die "repository config missing REPOSITORY"
+
+[[ -n "$PASSWORD_PATH" ]] ||
+    die "repository config missing PASSWORD_FILE"
+
+# Portable config.
+# shellcheck disable=SC1090
+source "$PORTABLE_CONFIG"
+
+PORTABLE_APP_NAME="${APP_NAME:-}"
+PORTABLE_ID="${PORTABLE_NAME:-}"
+PORTABLE_ROOT="${BACKUP_ROOT:-}"
+
+[[ -n "$PORTABLE_APP_NAME" ]] ||
+    die "portable config missing APP_NAME"
+
+[[ -n "$PORTABLE_ID" ]] ||
+    die "portable config missing PORTABLE_NAME"
+
+[[ -n "$PORTABLE_ROOT" ]] ||
+    die "portable config missing BACKUP_ROOT"
+
+# Application config.
+# shellcheck disable=SC1090
+source "$APP_CONFIG"
+
+APP_ID="${APP_NAME:-}"
+
+[[ -n "$APP_ID" ]] ||
+    die "application config missing APP_NAME"
+
+[[ "$REPO_APP_NAME" == "$APP_ID" ]] ||
+    die "repository/application identity mismatch"
+
+[[ "$PORTABLE_APP_NAME" == "$APP_ID" ]] ||
+    die "portable/application identity mismatch"
+
+: "${COMPOSE_DIR:?Missing COMPOSE_DIR}"
+: "${DB_TYPE:?Missing DB_TYPE}"
+: "${DB_BACKUP_MODE:?Missing DB_BACKUP_MODE}"
+
+declare -p BACKUP_PATHS >/dev/null 2>&1 ||
+    die "BACKUP_PATHS is not defined"
+
+[[ ${#BACKUP_PATHS[@]} -gt 0 ]] ||
+    die "BACKUP_PATHS is empty"
+
+case "${DB_TYPE}:${DB_BACKUP_MODE}" in
+    none:none)
+        [[ -z "$DB_SNAPSHOT" ]] ||
+            die "database snapshot supplied for DB_TYPE=none"
+        ;;
+    mariadb:logical)
+        [[ "$DB_SNAPSHOT" =~ ^[0-9a-f]{64}$ ]] ||
+            die "--db-snapshot is required for mariadb:logical"
+        : "${DB_CONTAINER:?Missing DB_CONTAINER}"
+        ;;
+    *)
+        die "unsupported database mode: ${DB_TYPE}:${DB_BACKUP_MODE}"
+        ;;
+esac
+
+[[ -d "$COMPOSE_DIR" ]] ||
+    die "Compose directory not found: $COMPOSE_DIR"
+
+for path in "${BACKUP_PATHS[@]}"; do
+    [[ "$path" = /* ]] ||
+        die "BACKUP_PATHS entry is not absolute: $path"
+done
+
+RUNTIME_ROOT="${DOCKER_BACKUP_ENGINE_ROOT:-/usr/local/lib/docker-backup}"
+RECOVERY_VALIDATOR="${RUNTIME_ROOT}/validate-application-recovery"
+
+[[ -x "$RECOVERY_VALIDATOR" ]] ||
+    die "required executable missing: $RECOVERY_VALIDATOR"
+
+echo "===== PRODUCTION RESTORE PLAN ====="
+echo "Mode:              PLAN ONLY"
+echo "Application:       $APP_ID"
+echo "Repository:        $REPO_ID"
+echo "Portable target:   $PORTABLE_ID"
+echo "Restic generation: $GENERATION"
+echo "Files snapshot:    $FILES_SNAPSHOT"
+
+if [[ -n "$DB_SNAPSHOT" ]]; then
+    echo "DB snapshot:       $DB_SNAPSHOT"
+fi
+
+echo "Portable set:      $PORTABLE_SET"
+
+echo
+echo "===== VERIFY RECOVERY POINT ====="
+
+VALIDATION_RESULT="$(mktemp /tmp/docker-restore-plan-validation.XXXXXX)"
+trap 'rm -f "$VALIDATION_RESULT"' EXIT
+
+args=(
+    "$APP_CONFIG"
+    "$REPO_CONFIG"
+    "$PORTABLE_CONFIG"
+    --generation "$GENERATION"
+    --files-snapshot "$FILES_SNAPSHOT"
+    --portable-set "$PORTABLE_SET"
+    --result-file "$VALIDATION_RESULT"
+)
+
+if [[ -n "$DB_SNAPSHOT" ]]; then
+    args+=(--db-snapshot "$DB_SNAPSHOT")
+fi
+
+"$RECOVERY_VALIDATOR" "${args[@]}"
+
+[[ -s "$VALIDATION_RESULT" ]] ||
+    die "recovery validator did not produce a result"
+
+# shellcheck disable=SC1090
+source "$VALIDATION_RESULT"
+
+[[ "${RESULT:-}" == "PASS" ]] ||
+    die "selected recovery point did not validate"
+
+echo "PASS: selected recovery point validated"
+
+echo
+echo "===== PRODUCTION PATHS ====="
+
+for path in "${BACKUP_PATHS[@]}"; do
+    echo "Would replace: $path"
+done
+
+if declare -p EXCLUDE_PATHS >/dev/null 2>&1; then
+    for path in "${EXCLUDE_PATHS[@]}"; do
+        echo "Would preserve excluded path: $path"
+    done
+fi
+
+echo
+echo "===== SCHEDULING ====="
+
+TIMER_UNITS=(
+    "docker-backup@${REPO_ID}.timer"
+    "docker-retention@${REPO_ID}.timer"
+    "docker-maintenance@${REPO_ID}.timer"
+    "docker-portable-backup@${PORTABLE_ID}.timer"
+    "docker-portable-retention@${PORTABLE_ID}.timer"
+)
+
+for timer in "${TIMER_UNITS[@]}"; do
+    state="$(systemctl is-active "$timer" 2>/dev/null || true)"
+    enabled="$(systemctl is-enabled "$timer" 2>/dev/null || true)"
+
+    echo "Timer: $timer"
+    echo "  active=$state"
+    echo "  enabled=$enabled"
+done
+
+echo
+echo "===== APPLICATION STATE ====="
+
+cd "$COMPOSE_DIR"
+
+docker compose config --quiet
+
+RUNNING_SERVICES="$(
+    docker compose ps \
+        --services \
+        --filter status=running
+)"
+
+if [[ -n "$RUNNING_SERVICES" ]]; then
+    echo "Currently running services:"
+    printf '%s\n' "$RUNNING_SERVICES"
+else
+    echo "Currently running services: none"
+fi
+
+echo
+echo "===== FALLBACK PLAN ====="
+
+RESTORE_ID="$(
+    date -u +%Y%m%dT%H%M%SZ
+)"
+
+FALLBACK_ROOT="/var/lib/docker-backup/restore-fallback/${APP_ID}/${RESTORE_ID}"
+
+echo "Fallback root: $FALLBACK_ROOT"
+
+for path in "${BACKUP_PATHS[@]}"; do
+    relative="${path#/}"
+    echo "Would preserve:"
+    echo "  $path"
+    echo "  -> ${FALLBACK_ROOT}/${relative}"
+done
+
+echo
+echo "===== PRE-RESTORE CHECKPOINT ====="
+echo "Would create fresh repository and portable backups before mutation."
+echo "No checkpoint is created in plan mode."
+
+echo
+echo "===== EXECUTION SEQUENCE ====="
+echo "1. Create fresh pre-restore recovery checkpoint"
+echo "2. Stop relevant scheduling"
+echo "3. Verify conflicting locks are clear"
+echo "4. Stop application stack"
+echo "5. Restore selected filesystem snapshot to staging"
+echo "6. Validate staged filesystem"
+echo "7. Preserve existing production paths to fallback storage"
+echo "8. Place restored application filesystem state"
+if [[ "$DB_TYPE" == "mariadb" ]]; then
+    echo "9. Start database service and import selected logical DB snapshot"
+    echo "10. Start complete application stack"
+    echo "11. Validate application health"
+    echo "12. Restore scheduling state"
+else
+    echo "9. Start application stack"
+    echo "10. Validate application health"
+    echo "11. Restore scheduling state"
+fi
+
+if [[ -n "$PLAN_FILE" ]]; then
+    umask 077
+    mkdir -p "$(dirname "$PLAN_FILE")"
+
+    python3 - \
+        "$APP_ID" \
+        "$REPO_ID" \
+        "$PORTABLE_ID" \
+        "$GENERATION" \
+        "$FILES_SNAPSHOT" \
+        "$DB_SNAPSHOT" \
+        "$PORTABLE_SET" \
+        "$COMPOSE_DIR" \
+        "$FALLBACK_ROOT" \
+        "$PLAN_FILE" \
+        "${BACKUP_PATHS[@]}" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+(
+    application,
+    repository,
+    portable_target,
+    generation,
+    files_snapshot,
+    db_snapshot,
+    portable_set,
+    compose_dir,
+    fallback_root,
+    output,
+    *backup_paths,
+) = sys.argv[1:]
+
+document = {
+    "schema_version": 1,
+    "mode": "plan",
+    "destructive": False,
+    "application": application,
+    "repository": repository,
+    "portable_target": portable_target,
+    "restic_generation": generation,
+    "files_snapshot": files_snapshot,
+    "db_snapshot": db_snapshot or None,
+    "portable_set": portable_set,
+    "compose_dir": compose_dir,
+    "backup_paths": backup_paths,
+    "fallback_root": fallback_root,
+    "recovery_validation": "PASS",
+}
+
+directory = os.path.dirname(output) or "."
+os.makedirs(directory, exist_ok=True)
+
+fd, temporary = tempfile.mkstemp(
+    prefix=".restore-plan.",
+    dir=directory,
+    text=True,
+)
+
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, output)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+
+    echo
+    echo "Plan file: $PLAN_FILE"
+fi
+
+rm -f "$VALIDATION_RESULT"
+trap - EXIT
+
+echo
+echo "PASS: production restore plan completed"
+echo "PASS: no production state was modified"

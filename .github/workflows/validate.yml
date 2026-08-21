@@ -33,7 +33,9 @@ jobs:
           shellcheck tests/test-install-preserve-config
           shellcheck tests/test-version
           shellcheck tests/test-resolve-snapshot
+          shellcheck tests/test-deployment-drill
           shellcheck scripts/acceptance-test
+          shellcheck scripts/deployment-drill
 
       - name: Shell syntax
         shell: bash
@@ -65,6 +67,9 @@ jobs:
 
       - name: Snapshot resolver regression tests
         run: tests/test-resolve-snapshot
+
+      - name: Deployment drill regression tests
+        run: tests/test-deployment-drill
 
       - name: Check disclosure patterns
         run: scripts/ci/check-disclosures

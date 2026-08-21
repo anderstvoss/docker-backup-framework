@@ -1,0 +1,522 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+    cat <<'HELP'
+Usage:
+  deployment-drill <repository-config> <portable-config>
+
+Runs the complete post-change deployment and recovery-validation workflow:
+
+- requires a clean committed Git checkout
+- records candidate framework identity
+- hashes host-local production configuration and secrets
+- deploys with --preserve-config
+- verifies deployed identity and runtime/source parity
+- verifies production configuration and secrets were preserved
+- verifies configured timer enablement state
+- runs the installed end-to-end acceptance test
+- tests installed runtime with the source checkout unavailable
+- writes a durable PASS/FAIL validation record
+- removes temporary validation artifacts
+
+This command intentionally creates fresh Restic and portable backup artifacts.
+HELP
+}
+
+if [ "$#" -ne 2 ]; then
+    usage >&2
+    exit 2
+fi
+
+if [ "$EUID" -ne 0 ]; then
+    echo "ERROR: deployment drill must run as root" >&2
+    exit 1
+fi
+
+REPO_CONFIG="$1"
+PORTABLE_CONFIG="$2"
+
+SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUNTIME_ROOT="/usr/local/lib/docker-backup"
+ETC_ROOT="/etc/docker-backup"
+VERSION_DEST="$ETC_ROOT/DEPLOYED_VERSION"
+LOG_DIR="/var/log/docker-backup/acceptance"
+
+SOURCE_MOVED=false
+MOVED_SOURCE=""
+TMP_ROOT=""
+LOG_FILE=""
+
+CURRENT_STAGE="initialization"
+
+CONFIG_PRESERVED="NOT_RUN"
+SECRETS_PRESERVED="NOT_RUN"
+RUNTIME_PARITY="NOT_RUN"
+TIMERS_RESULT="NOT_RUN"
+ACCEPTANCE_RESULT="NOT_RUN"
+SOURCE_INDEPENDENCE="NOT_RUN"
+
+FRAMEWORK_VERSION=""
+GIT_COMMIT=""
+GIT_DESCRIBE=""
+APP_NAME=""
+REPO_NAME=""
+PORTABLE_NAME=""
+GENERATION=""
+RECOVERY_SET=""
+DB_SNAPSHOT=""
+FILES_SNAPSHOT=""
+
+write_result_log() {
+    result="$1"
+
+    if [ -z "$LOG_FILE" ]; then
+        return 0
+    fi
+
+    {
+        printf 'RESULT=%s\n' "$result"
+        printf 'TIMESTAMP_UTC=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'FRAMEWORK_VERSION=%s\n' "$FRAMEWORK_VERSION"
+        printf 'GIT_COMMIT=%s\n' "$GIT_COMMIT"
+        printf 'GIT_DESCRIBE=%s\n' "$GIT_DESCRIBE"
+        printf 'APPLICATION=%s\n' "$APP_NAME"
+        printf 'REPOSITORY=%s\n' "$REPO_NAME"
+        printf 'PORTABLE_TARGET=%s\n' "$PORTABLE_NAME"
+        printf 'RESTIC_GENERATION=%s\n' "$GENERATION"
+        printf 'PORTABLE_SET=%s\n' "$RECOVERY_SET"
+        printf 'DB_SNAPSHOT=%s\n' "$DB_SNAPSHOT"
+        printf 'FILES_SNAPSHOT=%s\n' "$FILES_SNAPSHOT"
+        printf 'CONFIG_PRESERVED=%s\n' "$CONFIG_PRESERVED"
+        printf 'SECRETS_PRESERVED=%s\n' "$SECRETS_PRESERVED"
+        printf 'RUNTIME_PARITY=%s\n' "$RUNTIME_PARITY"
+        printf 'TIMERS=%s\n' "$TIMERS_RESULT"
+        printf 'ACCEPTANCE=%s\n' "$ACCEPTANCE_RESULT"
+        printf 'SOURCE_INDEPENDENCE=%s\n' "$SOURCE_INDEPENDENCE"
+        printf 'LAST_STAGE=%s\n' "$CURRENT_STAGE"
+    } > "$LOG_FILE"
+
+    chmod 0600 "$LOG_FILE"
+}
+
+restore_source_checkout() {
+    if [ "$SOURCE_MOVED" = true ]; then
+        if [ -e "$SOURCE_ROOT" ]; then
+            echo \
+                "ERROR: cannot restore source checkout because path already exists: $SOURCE_ROOT" \
+                >&2
+            return 1
+        fi
+
+        mv "$MOVED_SOURCE" "$SOURCE_ROOT"
+        SOURCE_MOVED=false
+
+        echo "PASS: source checkout restored"
+    fi
+}
+
+cleanup() {
+    rc=$?
+
+    set +e
+
+    restore_source_checkout
+
+    if [ -n "$TMP_ROOT" ] && [ -d "$TMP_ROOT" ]; then
+        rm -rf "$TMP_ROOT"
+    fi
+
+    if [ "$rc" -eq 0 ]; then
+        write_result_log PASS
+        echo
+        echo "PASS: deployment drill completed"
+        echo "Validation record: $LOG_FILE"
+    else
+        write_result_log FAIL
+        echo
+        echo "ERROR: deployment drill failed during: $CURRENT_STAGE" >&2
+
+        if [ -n "$LOG_FILE" ]; then
+            echo "Validation record: $LOG_FILE" >&2
+        fi
+    fi
+
+    exit "$rc"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+echo "===== DOCKER BACKUP FRAMEWORK DEPLOYMENT DRILL ====="
+
+CURRENT_STAGE="source preflight"
+
+if ! git -C "$SOURCE_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "ERROR: deployment drill requires a Git checkout" >&2
+    exit 1
+fi
+
+if [ -n "$(git -C "$SOURCE_ROOT" status --porcelain)" ]; then
+    echo "ERROR: source checkout is dirty" >&2
+    git -C "$SOURCE_ROOT" status --short >&2
+    exit 1
+fi
+
+if [ ! -x "$SOURCE_ROOT/scripts/version" ]; then
+    echo "ERROR: source version helper missing" >&2
+    exit 1
+fi
+
+if [ ! -x "$SOURCE_ROOT/scripts/install" ]; then
+    echo "ERROR: source installer missing" >&2
+    exit 1
+fi
+
+FRAMEWORK_VERSION="$("$SOURCE_ROOT/scripts/version" --version)"
+GIT_COMMIT="$("$SOURCE_ROOT/scripts/version" --commit)"
+GIT_DESCRIBE="$("$SOURCE_ROOT/scripts/version" --describe)"
+
+if ! [[ "$GIT_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: candidate does not have an exact Git commit identity" >&2
+    exit 1
+fi
+
+echo "Framework version: $FRAMEWORK_VERSION"
+echo "Git commit:        $GIT_COMMIT"
+echo "Git describe:      $GIT_DESCRIBE"
+
+CURRENT_STAGE="configuration preflight"
+
+for file in "$REPO_CONFIG" "$PORTABLE_CONFIG"; do
+    if [ ! -f "$file" ]; then
+        echo "ERROR: configuration file missing: $file" >&2
+        exit 1
+    fi
+done
+
+# Repository identity.
+# shellcheck source=/dev/null
+source "$REPO_CONFIG"
+
+: "${REPO_NAME:?Missing REPO_NAME}"
+: "${APP_NAME:?Missing APP_NAME}"
+: "${TIMERS_ENABLED:?Missing TIMERS_ENABLED}"
+
+REPOSITORY_APP_NAME="$APP_NAME"
+REPO_TIMERS_ENABLED="$TIMERS_ENABLED"
+
+# Portable identity.
+# shellcheck source=/dev/null
+source "$PORTABLE_CONFIG"
+
+: "${PORTABLE_NAME:?Missing PORTABLE_NAME}"
+: "${APP_NAME:?Missing APP_NAME}"
+: "${TIMERS_ENABLED:?Missing TIMERS_ENABLED}"
+
+PORTABLE_APP_NAME="$APP_NAME"
+PORTABLE_TIMERS_ENABLED="$TIMERS_ENABLED"
+
+if [ "$REPOSITORY_APP_NAME" != "$PORTABLE_APP_NAME" ]; then
+    echo "ERROR: repository and portable configs reference different applications" >&2
+    exit 1
+fi
+
+APP_NAME="$REPOSITORY_APP_NAME"
+APP_CONFIG="$ETC_ROOT/apps/${APP_NAME}.conf"
+
+if [ ! -f "$APP_CONFIG" ]; then
+    echo "ERROR: application config missing: $APP_CONFIG" >&2
+    exit 1
+fi
+
+case "$REPO_TIMERS_ENABLED" in
+    true|false) ;;
+    *)
+        echo "ERROR: invalid repository TIMERS_ENABLED value" >&2
+        exit 1
+        ;;
+esac
+
+case "$PORTABLE_TIMERS_ENABLED" in
+    true|false) ;;
+    *)
+        echo "ERROR: invalid portable TIMERS_ENABLED value" >&2
+        exit 1
+        ;;
+esac
+
+echo "Application:     $APP_NAME"
+echo "Repository:      $REPO_NAME"
+echo "Portable target: $PORTABLE_NAME"
+
+CURRENT_STAGE="validation-log initialization"
+
+install -d -o root -g root -m 0750 "$LOG_DIR"
+
+STAMP="$(date -u +%Y-%m-%dT%H%M%SZ)"
+SHORT_SHA="${GIT_COMMIT:0:12}"
+LOG_FILE="$LOG_DIR/${STAMP}-${FRAMEWORK_VERSION}-${SHORT_SHA}.log"
+
+TMP_ROOT="$(mktemp -d /run/docker-backup-deployment-drill.XXXXXX)"
+chmod 0700 "$TMP_ROOT"
+
+CONFIG_HASHES="$TMP_ROOT/config.sha256"
+SECRET_HASHES="$TMP_ROOT/secrets.sha256"
+ACCEPTANCE_OUTPUT="$TMP_ROOT/acceptance.log"
+
+CURRENT_STAGE="production hash capture"
+
+find \
+    "$ETC_ROOT/apps" \
+    "$ETC_ROOT/repos" \
+    "$ETC_ROOT/portable" \
+    -type f \
+    -print0 \
+    | sort -z \
+    | xargs -0 sha256sum \
+    > "$CONFIG_HASHES"
+
+if [ -d "$ETC_ROOT/secrets" ]; then
+    find "$ETC_ROOT/secrets" \
+        -type f \
+        -print0 \
+        | sort -z \
+        | xargs -0 -r sha256sum \
+        > "$SECRET_HASHES"
+else
+    : > "$SECRET_HASHES"
+fi
+
+echo "PASS: production configuration and secret hashes captured"
+
+CURRENT_STAGE="configuration-preserving deployment"
+
+"$SOURCE_ROOT/scripts/install" --preserve-config
+
+CURRENT_STAGE="deployed identity verification"
+
+if [ ! -f "$VERSION_DEST" ]; then
+    echo "ERROR: deployed version marker missing" >&2
+    exit 1
+fi
+
+DEPLOYED_FRAMEWORK_VERSION="$(
+    sed -n 's/^FRAMEWORK_VERSION=//p' "$VERSION_DEST"
+)"
+DEPLOYED_GIT_COMMIT="$(
+    sed -n 's/^GIT_COMMIT=//p' "$VERSION_DEST"
+)"
+DEPLOYED_GIT_DESCRIBE="$(
+    sed -n 's/^GIT_DESCRIBE=//p' "$VERSION_DEST"
+)"
+
+test "$DEPLOYED_FRAMEWORK_VERSION" = "$FRAMEWORK_VERSION"
+test "$DEPLOYED_GIT_COMMIT" = "$GIT_COMMIT"
+test "$DEPLOYED_GIT_DESCRIBE" = "$GIT_DESCRIBE"
+
+echo "PASS: deployed framework identity matches candidate"
+
+CURRENT_STAGE="production preservation verification"
+
+sha256sum -c "$CONFIG_HASHES"
+CONFIG_PRESERVED="PASS"
+
+if [ -s "$SECRET_HASHES" ]; then
+    sha256sum -c "$SECRET_HASHES"
+fi
+
+SECRETS_PRESERVED="PASS"
+
+echo "PASS: production configuration and secrets preserved"
+
+CURRENT_STAGE="runtime parity verification"
+
+for engine in \
+    backup-repository \
+    retention-repository \
+    maintain-repository \
+    portable-backup \
+    portable-retention
+do
+    cmp \
+        "$SOURCE_ROOT/src/$engine" \
+        "$RUNTIME_ROOT/$engine"
+done
+
+for tool in \
+    acceptance-test \
+    resolve-snapshot
+do
+    cmp \
+        "$SOURCE_ROOT/scripts/$tool" \
+        "$RUNTIME_ROOT/$tool"
+done
+
+RUNTIME_PARITY="PASS"
+echo "PASS: installed runtime matches candidate source"
+
+verify_timer() {
+    timer="$1"
+    expected="$2"
+
+    case "$expected" in
+        true)
+            if ! systemctl is-enabled --quiet "$timer"; then
+                echo "ERROR: expected enabled timer: $timer" >&2
+                return 1
+            fi
+
+            if ! systemctl is-active --quiet "$timer"; then
+                echo "ERROR: expected active timer: $timer" >&2
+                return 1
+            fi
+
+            echo "PASS: enabled and active: $timer"
+            ;;
+
+        false)
+            if systemctl is-enabled --quiet "$timer"; then
+                echo "ERROR: expected disabled timer: $timer" >&2
+                return 1
+            fi
+
+            if systemctl is-active --quiet "$timer"; then
+                echo "ERROR: expected inactive timer: $timer" >&2
+                return 1
+            fi
+
+            echo "PASS: disabled and inactive: $timer"
+            ;;
+    esac
+}
+
+CURRENT_STAGE="timer verification"
+
+for timer in \
+    "docker-backup@${REPO_NAME}.timer" \
+    "docker-retention@${REPO_NAME}.timer" \
+    "docker-check@${REPO_NAME}.timer" \
+    "docker-read-data@${REPO_NAME}.timer" \
+    "docker-prune@${REPO_NAME}.timer"
+do
+    verify_timer "$timer" "$REPO_TIMERS_ENABLED"
+done
+
+for timer in \
+    "docker-portable-backup@${PORTABLE_NAME}.timer" \
+    "docker-portable-retention@${PORTABLE_NAME}.timer"
+do
+    verify_timer "$timer" "$PORTABLE_TIMERS_ENABLED"
+done
+
+TIMERS_RESULT="PASS"
+
+CURRENT_STAGE="end-to-end acceptance"
+
+"$RUNTIME_ROOT/acceptance-test" \
+    "$REPO_CONFIG" \
+    "$PORTABLE_CONFIG" \
+    | tee "$ACCEPTANCE_OUTPUT"
+
+GENERATION="$(
+    awk -F': ' \
+        '/^Restic generation: / { value=$2 } END { print value }' \
+        "$ACCEPTANCE_OUTPUT"
+)"
+
+RECOVERY_SET="$(
+    awk -F': ' \
+        '/^Portable set: / { value=$2 } END { print value }' \
+        "$ACCEPTANCE_OUTPUT"
+)"
+
+DB_SNAPSHOT="$(
+    awk -F': ' \
+        '/^DB snapshot: / { value=$2 } END { print value }' \
+        "$ACCEPTANCE_OUTPUT"
+)"
+
+FILES_SNAPSHOT="$(
+    awk -F': ' \
+        '/^Files snapshot: / { value=$2 } END { print value }' \
+        "$ACCEPTANCE_OUTPUT"
+)"
+
+for value_name in \
+    GENERATION \
+    RECOVERY_SET \
+    DB_SNAPSHOT \
+    FILES_SNAPSHOT
+do
+    if [ -z "${!value_name}" ]; then
+        echo \
+            "ERROR: acceptance output did not report $value_name" \
+            >&2
+        exit 1
+    fi
+done
+
+ACCEPTANCE_RESULT="PASS"
+
+echo "PASS: installed acceptance harness completed"
+
+CURRENT_STAGE="source-checkout independence"
+
+PARENT_DIR="$(dirname "$SOURCE_ROOT")"
+BASE_NAME="$(basename "$SOURCE_ROOT")"
+MOVED_SOURCE="$PARENT_DIR/.${BASE_NAME}.runtime-test.$$"
+
+if [ -e "$MOVED_SOURCE" ]; then
+    echo "ERROR: temporary source-checkout path already exists" >&2
+    exit 1
+fi
+
+cd /
+mv "$SOURCE_ROOT" "$MOVED_SOURCE"
+SOURCE_MOVED=true
+
+if [ -e "$SOURCE_ROOT" ]; then
+    echo "ERROR: source checkout still available after move" >&2
+    exit 1
+fi
+
+"$RUNTIME_ROOT/maintain-repository" \
+    check \
+    "$REPO_CONFIG"
+
+SOURCE_INDEPENDENCE="PASS"
+
+restore_source_checkout
+cd "$SOURCE_ROOT"
+
+if [ "$(git rev-parse HEAD)" != "$GIT_COMMIT" ]; then
+    echo "ERROR: restored source checkout commit changed" >&2
+    exit 1
+fi
+
+echo "PASS: installed runtime operates without source checkout"
+
+CURRENT_STAGE="final verification"
+
+sha256sum -c "$CONFIG_HASHES"
+
+if [ -s "$SECRET_HASHES" ]; then
+    sha256sum -c "$SECRET_HASHES"
+fi
+
+echo "PASS: final configuration and secret preservation verified"
+
+CURRENT_STAGE="completed"
+
+echo
+echo "===== DEPLOYMENT DRILL RESULT ====="
+echo "Framework version: $FRAMEWORK_VERSION"
+echo "Git commit:        $GIT_COMMIT"
+echo "Application:       $APP_NAME"
+echo "Restic generation: $GENERATION"
+echo "Portable set:      $RECOVERY_SET"
+echo "DB snapshot:       $DB_SNAPSHOT"
+echo "Files snapshot:    $FILES_SNAPSHOT"
+echo "Result:            PASS"

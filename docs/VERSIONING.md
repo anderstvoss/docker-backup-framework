@@ -77,11 +77,15 @@ A release is produced from protected `main`.
 2. Implement and review the change through a feature branch and pull request.
 3. Require all repository validation and secret-scanning checks to pass.
 4. Merge to `main`.
-5. Deploy the exact merged commit using the configuration-preserving installer
-   on an existing production host.
-6. Run the post-change acceptance test against the deployed runtime.
-7. Confirm the fresh Restic and portable artifacts created by that revision
-   restore successfully.
+5. Run the deployment drill from the exact merged commit:
+
+       sudo ./scripts/deployment-drill \
+         /etc/docker-backup/repos/<repository>.conf \
+         /etc/docker-backup/portable/<target>.conf
+
+6. Confirm the deployment drill reports `PASS`.
+7. Review the durable validation record under
+   `/var/log/docker-backup/acceptance/`.
 8. Confirm the deployed version marker identifies the intended release and
    commit.
 9. Tag the validated `main` commit with `vMAJOR.MINOR.PATCH`.
@@ -89,6 +93,41 @@ A release is produced from protected `main`.
 
 A release tag must not be created before the corresponding deployed revision
 has passed the required post-change acceptance test.
+
+
+## Deployment drill
+
+`scripts/deployment-drill` is the source-side release-validation controller.
+
+It requires a clean committed Git checkout and performs the complete production
+framework-change drill:
+
+- records the candidate framework version and exact Git commit
+- hashes host-local production configuration and secrets
+- deploys with `--preserve-config`
+- verifies the structured deployed identity
+- verifies configuration and secret preservation
+- verifies installed runtime/source parity
+- verifies configured timer enablement state
+- runs the installed end-to-end acceptance harness
+- records the fresh Restic generation, portable recovery set, and immutable
+  component snapshot IDs
+- temporarily removes the source checkout from its normal path
+- verifies the installed runtime can perform a repository check without the
+  source checkout
+- restores the source checkout
+- re-verifies configuration and secret preservation
+- writes a durable PASS/FAIL record
+
+Validation records are stored under:
+
+`/var/log/docker-backup/acceptance/`
+
+These records contain operational identities and validation results only.
+They must never contain secret values.
+
+The source checkout is restored through failure cleanup if the
+source-independence stage fails or the drill is interrupted.
 
 ## Post-change acceptance
 

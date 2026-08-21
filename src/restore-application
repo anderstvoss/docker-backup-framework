@@ -206,10 +206,123 @@ esac
 [[ -d "$COMPOSE_DIR" ]] ||
     die "Compose directory not found: $COMPOSE_DIR"
 
-for path in "${BACKUP_PATHS[@]}"; do
-    [[ "$path" = /* ]] ||
-        die "BACKUP_PATHS entry is not absolute: $path"
-done
+# Generate the restore identity before recovery validation so the exact
+# fallback destination can be included in path-safety preflight.
+RESTORE_ID="$(
+    printf '%s-%s\n' \
+        "$(date -u +%Y%m%dT%H%M%SZ)" \
+        "$$"
+)"
+
+FALLBACK_BASE="${DOCKER_BACKUP_RESTORE_FALLBACK_ROOT:-/var/lib/docker-backup/restore-fallback}"
+FALLBACK_ROOT="${FALLBACK_BASE}/${APP_ID}/${RESTORE_ID}"
+
+validate_restore_paths() {
+    local -a exclude_paths=()
+
+    # EXCLUDE_PATHS is optional application configuration.
+    # shellcheck disable=SC2153
+    if declare -p EXCLUDE_PATHS >/dev/null 2>&1; then
+        exclude_paths=("${EXCLUDE_PATHS[@]}")
+    fi
+
+    python3 - \
+        "$FALLBACK_BASE" \
+        "$FALLBACK_ROOT" \
+        "${#BACKUP_PATHS[@]}" \
+        "${BACKUP_PATHS[@]}" \
+        "${exclude_paths[@]}" <<'PY'
+import os
+import sys
+
+fallback_base = sys.argv[1]
+fallback_root = sys.argv[2]
+backup_count = int(sys.argv[3])
+backup_paths = sys.argv[4:4 + backup_count]
+exclude_paths = sys.argv[4 + backup_count:]
+
+
+def fail(message):
+    print(f"ERROR: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def validate_path(label, path, allow_root=False):
+    if not path:
+        fail(f"{label} entry is empty")
+
+    if not os.path.isabs(path):
+        fail(f"{label} entry is not absolute: {path}")
+
+    normalized = os.path.normpath(path)
+
+    if path != normalized:
+        fail(
+            f"{label} entry is not lexically normalized: "
+            f"{path} -> {normalized}"
+        )
+
+    if not allow_root and normalized == os.path.sep:
+        fail(f"{label} entry may not be filesystem root: {path}")
+
+    return normalized
+
+
+def contains_or_equal(parent, child):
+    try:
+        return os.path.commonpath([parent, child]) == parent
+    except ValueError:
+        return False
+
+
+backup_paths = [
+    validate_path("BACKUP_PATHS", path)
+    for path in backup_paths
+]
+
+if len(set(backup_paths)) != len(backup_paths):
+    fail("BACKUP_PATHS contains duplicate paths")
+
+for index, left in enumerate(backup_paths):
+    for right in backup_paths[index + 1:]:
+        if contains_or_equal(left, right) or contains_or_equal(right, left):
+            fail(
+                "BACKUP_PATHS contains overlapping paths: "
+                f"{left} and {right}"
+            )
+
+for path in exclude_paths:
+    validate_path("EXCLUDE_PATHS", path)
+
+fallback_base = validate_path(
+    "restore fallback base",
+    fallback_base,
+)
+
+fallback_root = validate_path(
+    "restore fallback root",
+    fallback_root,
+)
+
+if not contains_or_equal(fallback_base, fallback_root):
+    fail(
+        "restore fallback root escapes configured fallback base: "
+        f"{fallback_root}"
+    )
+
+for path in backup_paths:
+    if (
+        contains_or_equal(path, fallback_base)
+        or contains_or_equal(fallback_base, path)
+    ):
+        fail(
+            "restore fallback storage overlaps production backup path: "
+            f"{fallback_base} and {path}"
+        )
+PY
+}
+
+validate_restore_paths
 
 RUNTIME_ROOT="${DOCKER_BACKUP_ENGINE_ROOT:-/usr/local/lib/docker-backup}"
 RECOVERY_VALIDATOR="${RUNTIME_ROOT}/validate-application-recovery"
@@ -334,13 +447,6 @@ fi
 
 echo
 echo "===== FALLBACK PLAN ====="
-
-RESTORE_ID="$(
-    printf '%s-%s\n'         "$(date -u +%Y%m%dT%H%M%SZ)"         "$$"
-)"
-
-FALLBACK_BASE="${DOCKER_BACKUP_RESTORE_FALLBACK_ROOT:-/var/lib/docker-backup/restore-fallback}"
-FALLBACK_ROOT="${FALLBACK_BASE}/${APP_ID}/${RESTORE_ID}"
 
 echo "Fallback root: $FALLBACK_ROOT"
 

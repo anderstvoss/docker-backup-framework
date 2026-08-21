@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENGINE="$ROOT/src/restore-application"
+
+TMP="$(mktemp -d)"
+CONFIG="$TMP/config"
+RUNTIME="$TMP/runtime"
+LOG="$TMP/runtime.log"
+
+cleanup() {
+    sudo rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+mkdir -p \
+    "$CONFIG" \
+    "$RUNTIME" \
+    "$TMP/compose" \
+    "$TMP/app/config" \
+    "$TMP/app/assets" \
+    "$TMP/portable/set"
+
+FILES="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+GEN="20260821T230000Z-12345"
+
+cat > "$CONFIG/repo.conf" <<EOF_REPO
+REPO_NAME="app-one-operational"
+APP_NAME="app-one"
+REPOSITORY="$TMP/repository"
+PASSWORD_FILE="$TMP/restic.password"
+STORAGE_TYPE="local"
+EOF_REPO
+
+cat > "$CONFIG/portable.conf" <<EOF_PORTABLE
+PORTABLE_NAME="app-one"
+APP_NAME="app-one"
+BACKUP_ROOT="$TMP/portable"
+STORAGE_TYPE="local"
+EOF_PORTABLE
+
+printf '%s\n' password > "$TMP/restic.password"
+
+cat > "$RUNTIME/validate-application-recovery" <<'EOF_VALIDATOR'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+echo "VALIDATOR_INVOKED" >> "$TEST_RUNTIME_LOG"
+exit 99
+EOF_VALIDATOR
+chmod +x "$RUNTIME/validate-application-recovery"
+
+write_app_config() {
+    cat > "$CONFIG/app.conf"
+}
+
+run_restore() {
+    sudo env \
+        "DOCKER_BACKUP_ENGINE_ROOT=$RUNTIME" \
+        "TEST_RUNTIME_LOG=$LOG" \
+        "$@" \
+        "$ENGINE" \
+        "$CONFIG/app.conf" \
+        "$CONFIG/repo.conf" \
+        "$CONFIG/portable.conf" \
+        --generation "$GEN" \
+        --files-snapshot "$FILES" \
+        --portable-set "$TMP/portable/set"
+}
+
+assert_prevalidation_rejection() {
+    local expected="$1"
+    local output="$2"
+
+    : > "$LOG"
+
+    if run_restore >"$output" 2>&1; then
+        echo "ERROR: unsafe restore configuration was accepted" >&2
+        cat "$output" >&2
+        exit 1
+    fi
+
+    grep -F "$expected" "$output"
+
+    if [[ -s "$LOG" ]]; then
+        echo "ERROR: recovery validator ran before path-safety rejection" >&2
+        cat "$LOG" >&2
+        exit 1
+    fi
+}
+
+echo "=== filesystem root rejected ==="
+
+write_app_config <<EOF_APP
+APP_NAME="app-one"
+COMPOSE_DIR="$TMP/compose"
+DB_TYPE="none"
+DB_BACKUP_MODE="none"
+BACKUP_PATHS=(
+    "/"
+)
+EXCLUDE_PATHS=()
+EOF_APP
+
+assert_prevalidation_rejection \
+    "BACKUP_PATHS entry may not be filesystem root: /" \
+    "$TMP/root.log"
+
+echo "PASS: filesystem root rejected before recovery validation"
+
+echo
+echo "=== lexical traversal rejected ==="
+
+write_app_config <<EOF_APP
+APP_NAME="app-one"
+COMPOSE_DIR="$TMP/compose"
+DB_TYPE="none"
+DB_BACKUP_MODE="none"
+BACKUP_PATHS=(
+    "$TMP/app/config/../assets"
+)
+EXCLUDE_PATHS=()
+EOF_APP
+
+assert_prevalidation_rejection \
+    "BACKUP_PATHS entry is not lexically normalized" \
+    "$TMP/traversal.log"
+
+echo "PASS: lexical traversal rejected before recovery validation"
+
+echo
+echo "=== duplicate backup paths rejected ==="
+
+write_app_config <<EOF_APP
+APP_NAME="app-one"
+COMPOSE_DIR="$TMP/compose"
+DB_TYPE="none"
+DB_BACKUP_MODE="none"
+BACKUP_PATHS=(
+    "$TMP/app/config"
+    "$TMP/app/config"
+)
+EXCLUDE_PATHS=()
+EOF_APP
+
+assert_prevalidation_rejection \
+    "BACKUP_PATHS contains duplicate paths" \
+    "$TMP/duplicate.log"
+
+echo "PASS: duplicate paths rejected before recovery validation"
+
+echo
+echo "=== nested backup paths rejected ==="
+
+write_app_config <<EOF_APP
+APP_NAME="app-one"
+COMPOSE_DIR="$TMP/compose"
+DB_TYPE="none"
+DB_BACKUP_MODE="none"
+BACKUP_PATHS=(
+    "$TMP/app"
+    "$TMP/app/config"
+)
+EXCLUDE_PATHS=()
+EOF_APP
+
+assert_prevalidation_rejection \
+    "BACKUP_PATHS contains overlapping paths" \
+    "$TMP/nested.log"
+
+echo "PASS: nested paths rejected before recovery validation"
+
+echo
+echo "=== unsafe excluded path rejected ==="
+
+write_app_config <<EOF_APP
+APP_NAME="app-one"
+COMPOSE_DIR="$TMP/compose"
+DB_TYPE="none"
+DB_BACKUP_MODE="none"
+BACKUP_PATHS=(
+    "$TMP/app/config"
+)
+EXCLUDE_PATHS=(
+    "$TMP/app/other/../excluded"
+)
+EOF_APP
+
+assert_prevalidation_rejection \
+    "EXCLUDE_PATHS entry is not lexically normalized" \
+    "$TMP/exclude.log"
+
+echo "PASS: unsafe excluded path rejected before recovery validation"
+
+echo
+echo "=== fallback inside production path rejected ==="
+
+write_app_config <<EOF_APP
+APP_NAME="app-one"
+COMPOSE_DIR="$TMP/compose"
+DB_TYPE="none"
+DB_BACKUP_MODE="none"
+BACKUP_PATHS=(
+    "$TMP/app"
+)
+EXCLUDE_PATHS=()
+EOF_APP
+
+: > "$LOG"
+
+if run_restore \
+       "DOCKER_BACKUP_RESTORE_FALLBACK_ROOT=$TMP/app/fallback" \
+       > "$TMP/fallback-inside.log" 2>&1
+then
+    echo "ERROR: fallback inside production path was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    "restore fallback storage overlaps production backup path" \
+    "$TMP/fallback-inside.log"
+
+[[ ! -s "$LOG" ]] || {
+    echo "ERROR: recovery validator ran before fallback-overlap rejection" >&2
+    cat "$LOG" >&2
+    exit 1
+}
+
+echo "PASS: fallback inside production path rejected before recovery validation"
+
+echo
+echo "=== production path inside fallback storage rejected ==="
+
+write_app_config <<EOF_APP
+APP_NAME="app-one"
+COMPOSE_DIR="$TMP/compose"
+DB_TYPE="none"
+DB_BACKUP_MODE="none"
+BACKUP_PATHS=(
+    "$TMP/fallback-base/app-data"
+)
+EXCLUDE_PATHS=()
+EOF_APP
+
+mkdir -p "$TMP/fallback-base/app-data"
+
+: > "$LOG"
+
+if run_restore \
+       "DOCKER_BACKUP_RESTORE_FALLBACK_ROOT=$TMP/fallback-base" \
+       > "$TMP/production-inside-fallback.log" 2>&1
+then
+    echo "ERROR: production path inside fallback storage was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    "restore fallback storage overlaps production backup path" \
+    "$TMP/production-inside-fallback.log"
+
+[[ ! -s "$LOG" ]] || {
+    echo "ERROR: recovery validator ran before fallback-overlap rejection" >&2
+    cat "$LOG" >&2
+    exit 1
+}
+
+echo "PASS: production path inside fallback storage rejected before recovery validation"
+
+echo
+echo "PASS: restore-application path-safety regression suite"

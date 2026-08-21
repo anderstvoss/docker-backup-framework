@@ -73,6 +73,7 @@ jobs:
             tests/test-validate-application-recovery-mariadb \
             tests/test-validate-group-recovery \
             tests/test-restore-application-plan \
+            tests/test-restore-application-path-safety \
             tests/test-restore-application-execute-boundary \
             tests/test-restore-application-execute-mariadb \
             tests/test-restore-group

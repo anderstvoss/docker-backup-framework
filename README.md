@@ -63,10 +63,11 @@ Deployment:
 - `scripts/render-timers`
 - `scripts/render-portable-timers`
 
-Revisioning and acceptance:
+Revisioning, deployment validation, and acceptance:
 
 - `VERSION`
 - `scripts/version`
+- `scripts/deployment-drill`
 - `/usr/local/lib/docker-backup/acceptance-test`
 - `/usr/local/lib/docker-backup/resolve-snapshot`
 
@@ -271,7 +272,19 @@ installation, or repository checks pass. After deployment, create fresh Restic
 and portable backups using the newly deployed framework revision and restore
 those newly created artifacts non-destructively.
 
-Post-change acceptance can be executed with:
+For a complete framework-change deployment and validation, run from a clean
+committed source checkout:
+
+    sudo ./scripts/deployment-drill \
+      /etc/docker-backup/repos/<repository>.conf \
+      /etc/docker-backup/portable/<target>.conf
+
+The deployment drill performs the configuration-preserving install, verifies
+the deployed revision and host-local configuration, runs the installed
+acceptance harness, validates timer state and source-checkout independence, and
+writes a durable PASS/FAIL record under `/var/log/docker-backup/acceptance/`.
+
+The installed acceptance harness can also be run independently:
 
     sudo /usr/local/lib/docker-backup/acceptance-test \
       /etc/docker-backup/repos/<repository>.conf \

@@ -1,0 +1,1805 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+    cat >&2 <<'HELP'
+Usage:
+  restore-application \
+    <application-config> \
+    <repository-config> \
+    <portable-config> \
+    --generation <generation> \
+    --files-snapshot <immutable-id> \
+    [--db-snapshot <immutable-id>] \
+    --portable-set <absolute-path> \
+    [--plan-file <path>] \
+    [--execute --confirm <application>]
+
+Without --execute, the command is plan/preflight only.
+
+With --execute, the command performs a guarded production restore using
+explicit immutable recovery coordinates. It creates fresh pre-restore
+repository and portable checkpoints, suspends scheduling, acquires restore
+locks, stages and validates recovery data, preserves current filesystem state
+to fallback storage, restores configured application paths, and restores
+supported logical databases.
+
+For mariadb:logical applications, database failure handling uses the fresh
+pre-restore database checkpoint for rollback. The application is not restarted
+if database rollback fails.
+HELP
+    exit 2
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+[[ "$EUID" -eq 0 ]] ||
+    die "restore operations must run as root"
+
+[[ $# -ge 3 ]] || usage
+
+APP_CONFIG="$1"
+REPO_CONFIG="$2"
+PORTABLE_CONFIG="$3"
+shift 3
+
+GENERATION=""
+FILES_SNAPSHOT=""
+DB_SNAPSHOT=""
+PORTABLE_SET=""
+PLAN_FILE=""
+EXECUTE=0
+CONFIRM=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --generation)
+            shift
+            [[ $# -gt 0 ]] || usage
+            GENERATION="$1"
+            ;;
+        --files-snapshot)
+            shift
+            [[ $# -gt 0 ]] || usage
+            FILES_SNAPSHOT="$1"
+            ;;
+        --db-snapshot)
+            shift
+            [[ $# -gt 0 ]] || usage
+            DB_SNAPSHOT="$1"
+            ;;
+        --portable-set)
+            shift
+            [[ $# -gt 0 ]] || usage
+            PORTABLE_SET="$1"
+            ;;
+        --plan-file)
+            shift
+            [[ $# -gt 0 ]] || usage
+            PLAN_FILE="$1"
+            ;;
+        --execute)
+            EXECUTE=1
+            ;;
+        --confirm)
+            shift
+            [[ $# -gt 0 ]] || usage
+            CONFIRM="$1"
+            ;;
+        *)
+            usage
+            ;;
+    esac
+
+    shift
+done
+
+for file in \
+    "$APP_CONFIG" \
+    "$REPO_CONFIG" \
+    "$PORTABLE_CONFIG"
+do
+    [[ -f "$file" ]] ||
+        die "configuration file not found: $file"
+done
+
+[[ -n "$GENERATION" ]] ||
+    die "--generation is required"
+
+[[ "$FILES_SNAPSHOT" =~ ^[0-9a-f]{64}$ ]] ||
+    die "invalid or missing files snapshot ID"
+
+[[ -n "$PORTABLE_SET" && "$PORTABLE_SET" = /* ]] ||
+    die "--portable-set must be an absolute path"
+
+# Repository config.
+# shellcheck disable=SC1090
+source "$REPO_CONFIG"
+
+REPO_APP_NAME="${APP_NAME:-}"
+REPO_ID="${REPO_NAME:-}"
+REPO_PATH="${REPOSITORY:-}"
+PASSWORD_PATH="${PASSWORD_FILE:-}"
+
+[[ -n "$REPO_APP_NAME" ]] ||
+    die "repository config missing APP_NAME"
+
+[[ -n "$REPO_ID" ]] ||
+    die "repository config missing REPO_NAME"
+
+[[ -n "$REPO_PATH" ]] ||
+    die "repository config missing REPOSITORY"
+
+[[ -n "$PASSWORD_PATH" ]] ||
+    die "repository config missing PASSWORD_FILE"
+
+# Portable config.
+# shellcheck disable=SC1090
+source "$PORTABLE_CONFIG"
+
+PORTABLE_APP_NAME="${APP_NAME:-}"
+PORTABLE_ID="${PORTABLE_NAME:-}"
+PORTABLE_ROOT="${BACKUP_ROOT:-}"
+
+[[ -n "$PORTABLE_APP_NAME" ]] ||
+    die "portable config missing APP_NAME"
+
+[[ -n "$PORTABLE_ID" ]] ||
+    die "portable config missing PORTABLE_NAME"
+
+[[ -n "$PORTABLE_ROOT" ]] ||
+    die "portable config missing BACKUP_ROOT"
+
+# Application config.
+# shellcheck disable=SC1090
+source "$APP_CONFIG"
+
+APP_ID="${APP_NAME:-}"
+
+[[ -n "$APP_ID" ]] ||
+    die "application config missing APP_NAME"
+
+if [[ "$EXECUTE" -eq 1 ]]; then
+    [[ -n "$CONFIRM" ]] ||
+        die "--confirm <application> is required with --execute"
+
+    [[ "$CONFIRM" == "$APP_ID" ]] ||
+        die "confirmation value does not match application: $APP_ID"
+elif [[ -n "$CONFIRM" ]]; then
+    die "--confirm is only valid with --execute"
+fi
+
+[[ "$REPO_APP_NAME" == "$APP_ID" ]] ||
+    die "repository/application identity mismatch"
+
+[[ "$PORTABLE_APP_NAME" == "$APP_ID" ]] ||
+    die "portable/application identity mismatch"
+
+: "${COMPOSE_DIR:?Missing COMPOSE_DIR}"
+: "${DB_TYPE:?Missing DB_TYPE}"
+: "${DB_BACKUP_MODE:?Missing DB_BACKUP_MODE}"
+
+declare -p BACKUP_PATHS >/dev/null 2>&1 ||
+    die "BACKUP_PATHS is not defined"
+
+[[ ${#BACKUP_PATHS[@]} -gt 0 ]] ||
+    die "BACKUP_PATHS is empty"
+
+case "${DB_TYPE}:${DB_BACKUP_MODE}" in
+    none:none)
+        [[ -z "$DB_SNAPSHOT" ]] ||
+            die "database snapshot supplied for DB_TYPE=none"
+        ;;
+    mariadb:logical)
+        [[ "$DB_SNAPSHOT" =~ ^[0-9a-f]{64}$ ]] ||
+            die "--db-snapshot is required for mariadb:logical"
+        : "${DB_CONTAINER:?Missing DB_CONTAINER}"
+        ;;
+    *)
+        die "unsupported database mode: ${DB_TYPE}:${DB_BACKUP_MODE}"
+        ;;
+esac
+
+[[ -d "$COMPOSE_DIR" ]] ||
+    die "Compose directory not found: $COMPOSE_DIR"
+
+# Generate the restore identity before recovery validation so the exact
+# fallback destination can be included in path-safety preflight.
+RESTORE_ID="$(
+    printf '%s-%s\n' \
+        "$(date -u +%Y%m%dT%H%M%SZ)" \
+        "$$"
+)"
+
+FALLBACK_BASE="${DOCKER_BACKUP_RESTORE_FALLBACK_ROOT:-/var/lib/docker-backup/restore-fallback}"
+FALLBACK_ROOT="${FALLBACK_BASE}/${APP_ID}/${RESTORE_ID}"
+
+validate_restore_paths() {
+    local -a exclude_paths=()
+
+    # EXCLUDE_PATHS is optional application configuration.
+    # shellcheck disable=SC2153
+    if declare -p EXCLUDE_PATHS >/dev/null 2>&1; then
+        exclude_paths=("${EXCLUDE_PATHS[@]}")
+    fi
+
+    python3 - \
+        "$FALLBACK_BASE" \
+        "$FALLBACK_ROOT" \
+        "${#BACKUP_PATHS[@]}" \
+        "${BACKUP_PATHS[@]}" \
+        "${exclude_paths[@]}" <<'PY'
+import os
+import sys
+
+fallback_base = sys.argv[1]
+fallback_root = sys.argv[2]
+backup_count = int(sys.argv[3])
+backup_paths = sys.argv[4:4 + backup_count]
+exclude_paths = sys.argv[4 + backup_count:]
+
+
+def fail(message):
+    print(f"ERROR: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def validate_path(label, path, allow_root=False):
+    if not path:
+        fail(f"{label} entry is empty")
+
+    if not os.path.isabs(path):
+        fail(f"{label} entry is not absolute: {path}")
+
+    normalized = os.path.normpath(path)
+
+    if path != normalized:
+        fail(
+            f"{label} entry is not lexically normalized: "
+            f"{path} -> {normalized}"
+        )
+
+    if not allow_root and normalized == os.path.sep:
+        fail(f"{label} entry may not be filesystem root: {path}")
+
+    return normalized
+
+
+def contains_or_equal(parent, child):
+    try:
+        return os.path.commonpath([parent, child]) == parent
+    except ValueError:
+        return False
+
+
+backup_paths = [
+    validate_path("BACKUP_PATHS", path)
+    for path in backup_paths
+]
+
+for path in backup_paths:
+    if os.path.islink(path):
+        fail(f"BACKUP_PATHS may not be a symbolic link: {path}")
+
+    current = os.path.dirname(path)
+
+    while current != os.path.sep:
+        if os.path.islink(current):
+            fail(
+                "BACKUP_PATHS traverses symbolic link: "
+                f"{current} -> {path}"
+            )
+
+        parent = os.path.dirname(current)
+
+        if parent == current:
+            break
+
+        current = parent
+
+if len(set(backup_paths)) != len(backup_paths):
+    fail("BACKUP_PATHS contains duplicate paths")
+
+for index, left in enumerate(backup_paths):
+    for right in backup_paths[index + 1:]:
+        if contains_or_equal(left, right) or contains_or_equal(right, left):
+            fail(
+                "BACKUP_PATHS contains overlapping paths: "
+                f"{left} and {right}"
+            )
+
+for path in exclude_paths:
+    validate_path("EXCLUDE_PATHS", path)
+
+fallback_base = validate_path(
+    "restore fallback base",
+    fallback_base,
+)
+
+fallback_root = validate_path(
+    "restore fallback root",
+    fallback_root,
+)
+
+if not contains_or_equal(fallback_base, fallback_root):
+    fail(
+        "restore fallback root escapes configured fallback base: "
+        f"{fallback_root}"
+    )
+
+for path in backup_paths:
+    if (
+        contains_or_equal(path, fallback_base)
+        or contains_or_equal(fallback_base, path)
+    ):
+        fail(
+            "restore fallback storage overlaps production backup path: "
+            f"{fallback_base} and {path}"
+        )
+PY
+}
+
+validate_restore_paths
+
+RUNTIME_ROOT="${DOCKER_BACKUP_ENGINE_ROOT:-/usr/local/lib/docker-backup}"
+RECOVERY_VALIDATOR="${RUNTIME_ROOT}/validate-application-recovery"
+BACKUP_REPOSITORY="${RUNTIME_ROOT}/backup-repository"
+PORTABLE_BACKUP="${RUNTIME_ROOT}/portable-backup"
+
+[[ -x "$RECOVERY_VALIDATOR" ]] ||
+    die "required executable missing: $RECOVERY_VALIDATOR"
+
+if [[ "$EXECUTE" -eq 1 ]]; then
+    [[ -x "$BACKUP_REPOSITORY" ]] ||
+        die "required executable missing: $BACKUP_REPOSITORY"
+
+    [[ -x "$PORTABLE_BACKUP" ]] ||
+        die "required executable missing: $PORTABLE_BACKUP"
+fi
+
+echo "===== PRODUCTION RESTORE PLAN ====="
+
+if [[ "$EXECUTE" -eq 1 ]]; then
+    echo "Mode:              GUARDED EXECUTE"
+else
+    echo "Mode:              PLAN ONLY"
+fi
+echo "Application:       $APP_ID"
+echo "Repository:        $REPO_ID"
+echo "Portable target:   $PORTABLE_ID"
+echo "Restic generation: $GENERATION"
+echo "Files snapshot:    $FILES_SNAPSHOT"
+
+if [[ -n "$DB_SNAPSHOT" ]]; then
+    echo "DB snapshot:       $DB_SNAPSHOT"
+fi
+
+echo "Portable set:      $PORTABLE_SET"
+
+echo
+echo "===== VERIFY RECOVERY POINT ====="
+
+VALIDATION_RESULT="$(mktemp /tmp/docker-restore-plan-validation.XXXXXX)"
+trap 'rm -f "$VALIDATION_RESULT"' EXIT
+
+args=(
+    "$APP_CONFIG"
+    "$REPO_CONFIG"
+    "$PORTABLE_CONFIG"
+    --generation "$GENERATION"
+    --files-snapshot "$FILES_SNAPSHOT"
+    --portable-set "$PORTABLE_SET"
+    --result-file "$VALIDATION_RESULT"
+)
+
+if [[ -n "$DB_SNAPSHOT" ]]; then
+    args+=(--db-snapshot "$DB_SNAPSHOT")
+fi
+
+"$RECOVERY_VALIDATOR" "${args[@]}"
+
+[[ -s "$VALIDATION_RESULT" ]] ||
+    die "recovery validator did not produce a result"
+
+# shellcheck disable=SC1090
+source "$VALIDATION_RESULT"
+
+[[ "${RESULT:-}" == "PASS" ]] ||
+    die "selected recovery point did not validate"
+
+echo "PASS: selected recovery point validated"
+
+echo
+echo "===== PRODUCTION PATHS ====="
+
+for path in "${BACKUP_PATHS[@]}"; do
+    echo "Would replace: $path"
+done
+
+if declare -p EXCLUDE_PATHS >/dev/null 2>&1; then
+    for path in "${EXCLUDE_PATHS[@]}"; do
+        echo "Would preserve excluded path: $path"
+    done
+fi
+
+echo
+echo "===== SCHEDULING ====="
+
+TIMER_UNITS=(
+    "docker-backup@${REPO_ID}.timer"
+    "docker-retention@${REPO_ID}.timer"
+    "docker-check@${REPO_ID}.timer"
+    "docker-read-data@${REPO_ID}.timer"
+    "docker-prune@${REPO_ID}.timer"
+    "docker-portable-backup@${PORTABLE_ID}.timer"
+    "docker-portable-retention@${PORTABLE_ID}.timer"
+)
+
+for timer in "${TIMER_UNITS[@]}"; do
+    state="$(systemctl is-active "$timer" 2>/dev/null || true)"
+    enabled="$(systemctl is-enabled "$timer" 2>/dev/null || true)"
+
+    echo "Timer: $timer"
+    echo "  active=$state"
+    echo "  enabled=$enabled"
+done
+
+echo
+echo "===== APPLICATION STATE ====="
+
+cd "$COMPOSE_DIR"
+
+docker compose config --quiet
+
+RUNNING_SERVICES="$(
+    docker compose ps \
+        --services \
+        --filter status=running
+)"
+
+if [[ -n "$RUNNING_SERVICES" ]]; then
+    echo "Currently running services:"
+    printf '%s\n' "$RUNNING_SERVICES"
+else
+    echo "Currently running services: none"
+fi
+
+echo
+echo "===== FALLBACK PLAN ====="
+
+echo "Fallback root: $FALLBACK_ROOT"
+
+for path in "${BACKUP_PATHS[@]}"; do
+    relative="${path#/}"
+    echo "Would preserve:"
+    echo "  $path"
+    echo "  -> ${FALLBACK_ROOT}/${relative}"
+done
+
+echo
+echo "===== PRE-RESTORE CHECKPOINT ====="
+
+if [[ "$EXECUTE" -eq 1 ]]; then
+    echo "A fresh repository and portable checkpoint will be created"
+    echo "before any scheduling or production-state mutation."
+else
+    echo "Would create fresh repository and portable backups before mutation."
+    echo "No checkpoint is created in plan mode."
+fi
+
+echo
+echo "===== EXECUTION SEQUENCE ====="
+echo "1. Create fresh pre-restore recovery checkpoint"
+echo "2. Stop relevant scheduling"
+echo "3. Verify conflicting locks are clear"
+echo "4. Stop application stack"
+echo "5. Restore selected filesystem snapshot to staging"
+echo "6. Validate staged filesystem"
+echo "7. Preserve existing production paths to fallback storage"
+echo "8. Place restored application filesystem state"
+if [[ "$DB_TYPE" == "mariadb" ]]; then
+    echo "9. Start database service and import selected logical DB snapshot"
+    echo "10. Start complete application stack"
+    echo "11. Validate application health"
+    echo "12. Restore scheduling state"
+else
+    echo "9. Start application stack"
+    echo "10. Validate application health"
+    echo "11. Restore scheduling state"
+fi
+
+if [[ -n "$PLAN_FILE" ]]; then
+    umask 077
+    mkdir -p "$(dirname "$PLAN_FILE")"
+
+    python3 - \
+        "$APP_ID" \
+        "$REPO_ID" \
+        "$PORTABLE_ID" \
+        "$GENERATION" \
+        "$FILES_SNAPSHOT" \
+        "$DB_SNAPSHOT" \
+        "$PORTABLE_SET" \
+        "$COMPOSE_DIR" \
+        "$FALLBACK_ROOT" \
+        "$PLAN_FILE" \
+        "${BACKUP_PATHS[@]}" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+(
+    application,
+    repository,
+    portable_target,
+    generation,
+    files_snapshot,
+    db_snapshot,
+    portable_set,
+    compose_dir,
+    fallback_root,
+    output,
+    *backup_paths,
+) = sys.argv[1:]
+
+document = {
+    "schema_version": 1,
+    "mode": "plan",
+    "destructive": False,
+    "application": application,
+    "repository": repository,
+    "portable_target": portable_target,
+    "restic_generation": generation,
+    "files_snapshot": files_snapshot,
+    "db_snapshot": db_snapshot or None,
+    "portable_set": portable_set,
+    "compose_dir": compose_dir,
+    "backup_paths": backup_paths,
+    "fallback_root": fallback_root,
+    "recovery_validation": "PASS",
+}
+
+directory = os.path.dirname(output) or "."
+os.makedirs(directory, exist_ok=True)
+
+fd, temporary = tempfile.mkstemp(
+    prefix=".restore-plan.",
+    dir=directory,
+    text=True,
+)
+
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, output)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+
+    echo
+    echo "Plan file: $PLAN_FILE"
+fi
+
+if [[ "$EXECUTE" -eq 0 ]]; then
+    rm -f "$VALIDATION_RESULT"
+    trap - EXIT
+
+    echo
+    echo "PASS: production restore plan completed"
+    echo "PASS: no production state was modified"
+    exit 0
+fi
+
+echo
+echo "===== GUARDED EXECUTION PRE-MUTATION ====="
+echo "Confirmation:      $CONFIRM"
+
+WORK_ROOT="$(mktemp -d /tmp/docker-restore-execute.XXXXXX)"
+REPO_CHECKPOINT_RESULT="${WORK_ROOT}/repository.result"
+PORTABLE_CHECKPOINT_RESULT="${WORK_ROOT}/portable.result"
+
+RESTORE_RECORD_ROOT="${DOCKER_BACKUP_RESTORE_RECORD_ROOT:-/var/lib/docker-backup/restore-records}"
+mkdir -p "${RESTORE_RECORD_ROOT}/${APP_ID}"
+RESTORE_RECORD="${RESTORE_RECORD_ROOT}/${APP_ID}/${RESTORE_ID}.json"
+
+umask 077
+
+python3 - \
+    "$RESTORE_RECORD" \
+    "$APP_ID" \
+    "$REPO_ID" \
+    "$PORTABLE_ID" \
+    "$GENERATION" \
+    "$FILES_SNAPSHOT" \
+    "$DB_SNAPSHOT" \
+    "$PORTABLE_SET" <<'RECORDPY'
+import json
+import os
+import sys
+import tempfile
+
+(
+    output,
+    application,
+    repository,
+    portable_target,
+    generation,
+    files_snapshot,
+    db_snapshot,
+    portable_set,
+) = sys.argv[1:]
+
+document = {
+    "schema_version": 1,
+    "result": "IN_PROGRESS",
+    "last_completed_stage": "selected-recovery-validation",
+    "production_mutation_started": False,
+    "application": application,
+    "repository": repository,
+    "portable_target": portable_target,
+    "selected_recovery": {
+        "restic_generation": generation,
+        "files_snapshot": files_snapshot,
+        "db_snapshot": db_snapshot or None,
+        "portable_set": portable_set,
+    },
+    "pre_restore_checkpoint": {
+        "restic_generation": None,
+        "files_snapshot": None,
+        "db_snapshot": None,
+        "portable_set": None,
+    },
+    "timer_state_before": [],
+    "failure": None,
+}
+
+directory = os.path.dirname(output)
+fd, temporary = tempfile.mkstemp(
+    prefix=".restore-record.",
+    dir=directory,
+    text=True,
+)
+
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, output)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+RECORDPY
+
+echo "Restore record:     $RESTORE_RECORD"
+
+TIMERS_NEED_RESTORE=0
+APPLICATION_NEEDS_RESTART=0
+FILESYSTEM_NEEDS_ROLLBACK=0
+FILESYSTEM_ROLLBACK_SAFE=1
+declare -a FILESYSTEM_PRESERVED=()
+
+DATABASE_NEEDS_ROLLBACK=0
+DATABASE_ROLLBACK_SAFE=1
+
+EXECUTION_STAGE="pre-restore-repository-checkpoint"
+
+finalize_failure_record() {
+    local rc="$1"
+    local database_rollback="$2"
+    local filesystem_rollback="$3"
+    local application_recovery="$4"
+    local timer_recovery="$5"
+
+    [[ -f "$RESTORE_RECORD" ]] || return 0
+
+    if ! python3 - \
+        "$RESTORE_RECORD" \
+        "$rc" \
+        "$EXECUTION_STAGE" \
+        "$database_rollback" \
+        "$filesystem_rollback" \
+        "$application_recovery" \
+        "$timer_recovery" <<'FAILPY'
+import json
+import os
+import sys
+import tempfile
+
+(
+    output,
+    exit_code,
+    failed_stage,
+    database_rollback,
+    filesystem_rollback,
+    application_recovery,
+    timer_recovery,
+) = sys.argv[1:]
+
+with open(output, encoding="utf-8") as f:
+    document = json.load(f)
+
+recovery_failed = any(
+    value in {"FAIL", "SUPPRESSED"}
+    for value in (
+        database_rollback,
+        filesystem_rollback,
+        application_recovery,
+        timer_recovery,
+    )
+)
+
+document["result"] = "RECOVERY_FAILED" if recovery_failed else "FAIL"
+document["database_rollback"] = database_rollback
+document["filesystem_rollback"] = filesystem_rollback
+document["application_state_restored"] = application_recovery
+document["timer_state_restored"] = (
+    True if timer_recovery == "PASS"
+    else False if timer_recovery in {"FAIL", "SUPPRESSED"}
+    else None
+)
+document["failure"] = {
+    "stage": failed_stage,
+    "exit_code": int(exit_code),
+    "recovery": {
+        "database_rollback": database_rollback,
+        "filesystem_rollback": filesystem_rollback,
+        "application": application_recovery,
+        "timers": timer_recovery,
+    },
+}
+
+directory = os.path.dirname(output)
+fd, temporary = tempfile.mkstemp(
+    prefix=".restore-record.",
+    dir=directory,
+    text=True,
+)
+
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, output)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+FAILPY
+    then
+        echo "ERROR: failed to finalize durable restore failure record" >&2
+    fi
+
+    return 0
+}
+
+cleanup_execute() {
+    rc=$?
+
+    local database_rollback="NOT_NEEDED"
+    local filesystem_rollback="NOT_NEEDED"
+    local application_recovery="NOT_NEEDED"
+    local timer_recovery="NOT_NEEDED"
+
+    if [[ "$DATABASE_NEEDS_ROLLBACK" -eq 1 ]] &&
+       declare -F rollback_database_state >/dev/null 2>&1
+    then
+        if rollback_database_state; then
+            database_rollback="PASS"
+        else
+            database_rollback="FAIL"
+            DATABASE_ROLLBACK_SAFE=0
+        fi
+    fi
+
+    if [[ "$FILESYSTEM_NEEDS_ROLLBACK" -eq 1 ]] &&
+       declare -F rollback_filesystem_state >/dev/null 2>&1
+    then
+        if rollback_filesystem_state; then
+            filesystem_rollback="PASS"
+        else
+            filesystem_rollback="FAIL"
+            FILESYSTEM_ROLLBACK_SAFE=0
+        fi
+    fi
+
+    if [[ "$APPLICATION_NEEDS_RESTART" -eq 1 ]] &&
+       [[ "$DATABASE_ROLLBACK_SAFE" -eq 1 ]] &&
+       [[ "$FILESYSTEM_ROLLBACK_SAFE" -eq 1 ]] &&
+       declare -F restore_application_state >/dev/null 2>&1
+    then
+        if restore_application_state; then
+            application_recovery="PASS"
+        else
+            application_recovery="FAIL"
+        fi
+    elif [[ "$APPLICATION_NEEDS_RESTART" -eq 1 ]]; then
+        application_recovery="SUPPRESSED"
+        echo "ERROR: application restart suppressed because rollback did not complete safely" >&2
+        cd "$COMPOSE_DIR"
+        docker compose down >/dev/null 2>&1 || true
+    fi
+
+    if [[ "$TIMERS_NEED_RESTORE" -eq 1 ]] &&
+       declare -F restore_timer_state >/dev/null 2>&1
+    then
+        if restore_timer_state; then
+            timer_recovery="PASS"
+        else
+            timer_recovery="FAIL"
+        fi
+    fi
+
+    if [[ "$rc" -ne 0 ]]; then
+        finalize_failure_record \
+            "$rc" \
+            "$database_rollback" \
+            "$filesystem_rollback" \
+            "$application_recovery" \
+            "$timer_recovery"
+    fi
+
+    rm -f "$VALIDATION_RESULT" 2>/dev/null || true
+    rm -rf "$WORK_ROOT" 2>/dev/null || true
+
+    exit "$rc"
+}
+
+trap cleanup_execute EXIT
+
+result_value() {
+    local file="$1"
+    local key="$2"
+
+    awk -F= -v key="$key" '
+        $1 == key {
+            sub(/^[^=]*=/, "")
+            print
+            found = 1
+            exit
+        }
+        END {
+            if (!found) {
+                exit 1
+            }
+        }
+    ' "$file"
+}
+
+echo
+EXECUTION_STAGE="pre-restore-repository-checkpoint"
+echo "===== CREATE PRE-RESTORE REPOSITORY CHECKPOINT ====="
+
+"$BACKUP_REPOSITORY" \
+    "$REPO_CONFIG" \
+    --result-file "$REPO_CHECKPOINT_RESULT"
+
+[[ -s "$REPO_CHECKPOINT_RESULT" ]] ||
+    die "repository checkpoint did not produce a result"
+
+REPO_CP_RESULT="$(result_value "$REPO_CHECKPOINT_RESULT" RESULT)"
+REPO_CP_APP="$(result_value "$REPO_CHECKPOINT_RESULT" APPLICATION)"
+REPO_CP_REPOSITORY="$(result_value "$REPO_CHECKPOINT_RESULT" REPOSITORY)"
+REPO_CP_GENERATION="$(
+    result_value "$REPO_CHECKPOINT_RESULT" RESTIC_GENERATION
+)"
+REPO_CP_FILES="$(result_value "$REPO_CHECKPOINT_RESULT" FILES_SNAPSHOT)"
+
+[[ "$REPO_CP_RESULT" == "PASS" ]] ||
+    die "repository checkpoint did not report PASS"
+
+[[ "$REPO_CP_APP" == "$APP_ID" ]] ||
+    die "repository checkpoint application identity mismatch"
+
+[[ "$REPO_CP_REPOSITORY" == "$REPO_ID" ]] ||
+    die "repository checkpoint repository identity mismatch"
+
+[[ -n "$REPO_CP_GENERATION" ]] ||
+    die "repository checkpoint returned empty generation"
+
+[[ "$REPO_CP_FILES" =~ ^[0-9a-f]{64}$ ]] ||
+    die "repository checkpoint returned invalid files snapshot"
+
+REPO_CP_DB=""
+
+if [[ "$DB_TYPE" != "none" ]]; then
+    REPO_CP_DB="$(
+        result_value "$REPO_CHECKPOINT_RESULT" DB_SNAPSHOT
+    )"
+
+    [[ "$REPO_CP_DB" =~ ^[0-9a-f]{64}$ ]] ||
+        die "repository checkpoint returned invalid database snapshot"
+fi
+
+echo "PASS: repository checkpoint created"
+echo "Generation:         $REPO_CP_GENERATION"
+echo "Files snapshot:     $REPO_CP_FILES"
+
+if [[ -n "$REPO_CP_DB" ]]; then
+    echo "DB snapshot:        $REPO_CP_DB"
+fi
+
+echo
+EXECUTION_STAGE="pre-restore-portable-checkpoint"
+echo "===== CREATE PRE-RESTORE PORTABLE CHECKPOINT ====="
+
+"$PORTABLE_BACKUP" \
+    "$PORTABLE_CONFIG" \
+    --result-file "$PORTABLE_CHECKPOINT_RESULT"
+
+[[ -s "$PORTABLE_CHECKPOINT_RESULT" ]] ||
+    die "portable checkpoint did not produce a result"
+
+PORTABLE_CP_RESULT="$(
+    result_value "$PORTABLE_CHECKPOINT_RESULT" RESULT
+)"
+PORTABLE_CP_APP="$(
+    result_value "$PORTABLE_CHECKPOINT_RESULT" APPLICATION
+)"
+PORTABLE_CP_TARGET="$(
+    result_value "$PORTABLE_CHECKPOINT_RESULT" PORTABLE_TARGET
+)"
+PORTABLE_CP_SET="$(
+    result_value "$PORTABLE_CHECKPOINT_RESULT" PORTABLE_SET
+)"
+
+[[ "$PORTABLE_CP_RESULT" == "PASS" ]] ||
+    die "portable checkpoint did not report PASS"
+
+[[ "$PORTABLE_CP_APP" == "$APP_ID" ]] ||
+    die "portable checkpoint application identity mismatch"
+
+[[ "$PORTABLE_CP_TARGET" == "$PORTABLE_ID" ]] ||
+    die "portable checkpoint target identity mismatch"
+
+[[ "$PORTABLE_CP_SET" = /* ]] ||
+    die "portable checkpoint returned a non-absolute recovery set"
+
+echo "PASS: portable checkpoint created"
+echo "Portable set:       $PORTABLE_CP_SET"
+
+echo
+EXECUTION_STAGE="capture-scheduling-state"
+echo "===== CAPTURE SCHEDULING STATE ====="
+
+declare -a TIMER_ACTIVE_BEFORE=()
+declare -a TIMER_ENABLED_BEFORE=()
+declare -a TIMER_STOPPED=()
+
+for timer in "${TIMER_UNITS[@]}"; do
+    active="$(systemctl is-active "$timer" 2>/dev/null || true)"
+    enabled="$(systemctl is-enabled "$timer" 2>/dev/null || true)"
+
+    TIMER_ACTIVE_BEFORE+=("$active")
+    TIMER_ENABLED_BEFORE+=("$enabled")
+    TIMER_STOPPED+=(0)
+
+    echo "$timer"
+    echo "  active=$active"
+    echo "  enabled=$enabled"
+done
+
+TIMER_STATE_DATA=""
+
+for i in "${!TIMER_UNITS[@]}"; do
+    TIMER_STATE_DATA+="$(
+        printf '%s\t%s\t%s\n' \
+            "${TIMER_UNITS[$i]}" \
+            "${TIMER_ACTIVE_BEFORE[$i]}" \
+            "${TIMER_ENABLED_BEFORE[$i]}"
+    )"
+    TIMER_STATE_DATA+=$'\n'
+done
+
+python3 - \
+    "$RESTORE_RECORD" \
+    "$REPO_CP_GENERATION" \
+    "$REPO_CP_FILES" \
+    "$REPO_CP_DB" \
+    "$PORTABLE_CP_SET" \
+    "$TIMER_STATE_DATA" <<'CHECKPOINTPY'
+import json
+import os
+import sys
+import tempfile
+
+(
+    output,
+    checkpoint_generation,
+    checkpoint_files,
+    checkpoint_db,
+    checkpoint_portable,
+    timer_state,
+) = sys.argv[1:]
+
+with open(output, encoding="utf-8") as f:
+    document = json.load(f)
+
+document["pre_restore_checkpoint"] = {
+    "restic_generation": checkpoint_generation,
+    "files_snapshot": checkpoint_files,
+    "db_snapshot": checkpoint_db or None,
+    "portable_set": checkpoint_portable,
+}
+
+timers = []
+
+for line in timer_state.splitlines():
+    if not line:
+        continue
+
+    unit, active, enabled = line.split("\t", 2)
+
+    timers.append({
+        "unit": unit,
+        "active": active,
+        "enabled": enabled,
+    })
+
+document["timer_state_before"] = timers
+document["last_completed_stage"] = "pre-restore-checkpoint"
+
+directory = os.path.dirname(output)
+fd, temporary = tempfile.mkstemp(
+    prefix=".restore-record.",
+    dir=directory,
+    text=True,
+)
+
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, output)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+CHECKPOINTPY
+
+
+restore_timer_state() {
+    local restore_failed=0
+
+    echo
+    echo "===== RESTORE TIMER STATE ====="
+
+    for i in "${!TIMER_UNITS[@]}"; do
+        timer="${TIMER_UNITS[$i]}"
+
+        if [[ "${TIMER_STOPPED[$i]}" -eq 1 ]]; then
+            if systemctl start "$timer"; then
+                TIMER_STOPPED[i]=0
+                echo "Restored active: $timer"
+            else
+                echo "ERROR: failed to restart timer: $timer" >&2
+                restore_failed=1
+            fi
+        fi
+    done
+
+    if [[ "$restore_failed" -eq 0 ]]; then
+        TIMERS_NEED_RESTORE=0
+        return 0
+    fi
+
+    return 1
+}
+
+echo
+EXECUTION_STAGE="suspend-active-timers"
+echo "===== SUSPEND ACTIVE TIMERS ====="
+
+for i in "${!TIMER_UNITS[@]}"; do
+    timer="${TIMER_UNITS[$i]}"
+
+    if [[ "${TIMER_ACTIVE_BEFORE[$i]}" == "active" ]]; then
+        systemctl stop "$timer"
+        TIMER_STOPPED[i]=1
+        TIMERS_NEED_RESTORE=1
+        echo "Stopped: $timer"
+    else
+        echo "Already inactive: $timer"
+    fi
+done
+
+echo
+EXECUTION_STAGE="acquire-restore-locks"
+echo "===== ACQUIRE RESTORE LOCKS ====="
+
+LOCK_ROOT="${DOCKER_BACKUP_LOCK_ROOT:-/run/lock}"
+mkdir -p "$LOCK_ROOT"
+
+APP_LOCK="${LOCK_ROOT}/docker-backup-app-${APP_ID}.lock"
+REPO_LOCK="${LOCK_ROOT}/docker-backup-${REPO_ID}.lock"
+PORTABLE_LOCK="${LOCK_ROOT}/docker-portable-${PORTABLE_ID}.lock"
+
+exec 6>"$APP_LOCK"
+
+if ! flock -n 6; then
+    restore_timer_state
+    die "application operation lock is busy: $APP_ID"
+fi
+
+exec 7>"$REPO_LOCK"
+
+if ! flock -n 7; then
+    restore_timer_state
+    die "repository operation lock is busy: $REPO_ID"
+fi
+
+exec 8>"$PORTABLE_LOCK"
+
+if ! flock -n 8; then
+    restore_timer_state
+    die "portable operation lock is busy: $PORTABLE_ID"
+fi
+
+echo "PASS: application, repository, and portable locks acquired"
+
+echo
+echo "===== PRE-MUTATION BOUNDARY ====="
+echo "PASS: selected recovery point validated"
+echo "PASS: fresh repository checkpoint created"
+echo "PASS: fresh portable checkpoint created"
+echo "PASS: scheduling state captured"
+echo "PASS: active timers suspended"
+echo "PASS: conflicting operation locks excluded"
+
+update_restore_record() {
+    local result="$1"
+    local stage="$2"
+    local mutation="$3"
+    local shutdown="$4"
+    local staging="$5"
+    local placement="$6"
+    local rollback="$7"
+    local app_restored="$8"
+    local timers_restored="$9"
+
+    python3 - \
+        "$RESTORE_RECORD" \
+        "$result" \
+        "$stage" \
+        "$mutation" \
+        "$shutdown" \
+        "$staging" \
+        "$placement" \
+        "$rollback" \
+        "$app_restored" \
+        "$timers_restored" <<'UPDATEPY'
+import json
+import os
+import sys
+import tempfile
+
+(
+    output,
+    result,
+    stage,
+    mutation,
+    shutdown,
+    staging,
+    placement,
+    rollback,
+    app_restored,
+    timers_restored,
+) = sys.argv[1:]
+
+with open(output, encoding="utf-8") as f:
+    document = json.load(f)
+
+document["result"] = result
+document["last_completed_stage"] = stage
+document["production_mutation_started"] = mutation == "true"
+document["application_shutdown"] = shutdown
+document["filesystem_staging"] = staging
+document["filesystem_placement"] = placement
+document["filesystem_rollback"] = rollback
+document["application_state_restored"] = app_restored
+document["timer_state_restored"] = timers_restored == "true"
+document["fallback_root"] = document.get("fallback_root")
+
+directory = os.path.dirname(output)
+fd, temporary = tempfile.mkstemp(
+    prefix=".restore-record.",
+    dir=directory,
+    text=True,
+)
+
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, output)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+UPDATEPY
+}
+
+restore_application_state() {
+    echo
+    echo "===== RESTORE APPLICATION STATE ====="
+
+    cd "$COMPOSE_DIR"
+
+    if docker compose up -d; then
+        APPLICATION_NEEDS_RESTART=0
+        echo "PASS: application stack restarted"
+        return 0
+    fi
+
+    echo "ERROR: failed to restart application stack" >&2
+    return 1
+}
+
+update_restore_record \
+    "IN_PROGRESS" \
+    "guarded-pre-mutation-boundary" \
+    "false" \
+    "NOT_STARTED" \
+    "NOT_STARTED" \
+    "NOT_STARTED" \
+    "NOT_NEEDED" \
+    "NOT_NEEDED" \
+    "false"
+
+echo
+EXECUTION_STAGE="application-shutdown"
+echo "===== STOP APPLICATION STACK ====="
+
+cd "$COMPOSE_DIR"
+
+# This is the first production-state mutation.
+update_restore_record \
+    "IN_PROGRESS" \
+    "starting-application-shutdown" \
+    "true" \
+    "IN_PROGRESS" \
+    "NOT_STARTED" \
+    "NOT_STARTED" \
+    "NOT_NEEDED" \
+    "PENDING" \
+    "false"
+
+docker compose down
+
+APPLICATION_NEEDS_RESTART=1
+
+REMAINING_SERVICES="$(
+    docker compose ps \
+        --services \
+        --filter status=running
+)"
+
+[[ -z "$REMAINING_SERVICES" ]] || {
+    printf 'ERROR: application services still running after shutdown:\n%s\n' \
+        "$REMAINING_SERVICES" >&2
+    die "application shutdown verification failed"
+}
+
+echo "PASS: application stack stopped"
+
+update_restore_record \
+    "IN_PROGRESS" \
+    "application-shutdown" \
+    "true" \
+    "PASS" \
+    "NOT_STARTED" \
+    "NOT_STARTED" \
+    "NOT_NEEDED" \
+    "PENDING" \
+    "false"
+
+echo
+EXECUTION_STAGE="filesystem-staging"
+echo "===== STAGE IMMUTABLE FILESYSTEM SNAPSHOT ====="
+
+STAGING_ROOT="${WORK_ROOT}/filesystem"
+mkdir -p "$STAGING_ROOT"
+
+export RESTIC_REPOSITORY="$REPO_PATH"
+export RESTIC_PASSWORD_FILE="$PASSWORD_PATH"
+
+restic restore \
+    "$FILES_SNAPSHOT" \
+    --target "$STAGING_ROOT"
+
+echo
+echo "===== VALIDATE STAGED FILESYSTEM ====="
+
+for path in "${BACKUP_PATHS[@]}"; do
+    relative="${path#/}"
+
+    [[ -e "$STAGING_ROOT/$relative" ]] ||
+        die "staged Restic restore missing expected path: $path"
+
+    echo "PASS: staged restore contains $path"
+done
+
+if declare -p EXCLUDE_PATHS >/dev/null 2>&1; then
+    for path in "${EXCLUDE_PATHS[@]}"; do
+        relative="${path#/}"
+
+        [[ ! -e "$STAGING_ROOT/$relative" ]] ||
+            die "staged Restic restore contains excluded path: $path"
+
+        echo "PASS: staged restore excludes $path"
+    done
+fi
+
+echo "PASS: immutable filesystem snapshot staged and validated"
+
+update_restore_record \
+    "IN_PROGRESS" \
+    "filesystem-staging" \
+    "true" \
+    "PASS" \
+    "PASS" \
+    "NOT_STARTED" \
+    "NOT_NEEDED" \
+    "PENDING" \
+    "false"
+
+SELECTED_DB_SQL=""
+CHECKPOINT_DB_SQL=""
+
+if [[ "$DB_TYPE" == "mariadb" ]]; then
+    echo
+    EXECUTION_STAGE="database-staging"
+    echo "===== STAGE DATABASE SNAPSHOTS ====="
+
+    SELECTED_DB_ROOT="${WORK_ROOT}/database-selected"
+    CHECKPOINT_DB_ROOT="${WORK_ROOT}/database-checkpoint"
+
+    mkdir -p \
+        "$SELECTED_DB_ROOT" \
+        "$CHECKPOINT_DB_ROOT"
+
+    restic restore \
+        "$DB_SNAPSHOT" \
+        --target "$SELECTED_DB_ROOT"
+
+    restic restore \
+        "$REPO_CP_DB" \
+        --target "$CHECKPOINT_DB_ROOT"
+
+    SELECTED_DB_SQL="${SELECTED_DB_ROOT}/database.sql"
+    CHECKPOINT_DB_SQL="${CHECKPOINT_DB_ROOT}/database.sql"
+
+    [[ -s "$SELECTED_DB_SQL" ]] ||
+        die "selected Restic database.sql missing or empty"
+
+    [[ -s "$CHECKPOINT_DB_SQL" ]] ||
+        die "pre-restore checkpoint database.sql missing or empty"
+
+    echo "PASS: selected database snapshot staged"
+    echo "PASS: pre-restore rollback database snapshot staged"
+fi
+
+rollback_filesystem_state() {
+    local rollback_failed=0
+
+    echo
+    echo "===== ROLLBACK PRODUCTION FILESYSTEM ====="
+
+    for (( i=${#FILESYSTEM_PRESERVED[@]}-1; i>=0; i-- )); do
+        path="${FILESYSTEM_PRESERVED[$i]}"
+        relative="${path#/}"
+        fallback="${FALLBACK_ROOT}/${relative}"
+
+        if [[ -e "$path" ]]; then
+            rm -rf -- "$path" || {
+                echo "ERROR: failed to remove current path during rollback: $path" >&2
+                rollback_failed=1
+                continue
+            }
+        fi
+
+        if [[ -e "$fallback" ]]; then
+            mkdir -p "$(dirname "$path")"
+
+            mv -- "$fallback" "$path" || {
+                echo "ERROR: failed to restore fallback path: $path" >&2
+                rollback_failed=1
+                continue
+            }
+
+            echo "PASS: rolled back $path"
+        else
+            echo "ERROR: fallback path missing during rollback: $fallback" >&2
+            rollback_failed=1
+        fi
+    done
+
+    if [[ "$rollback_failed" -eq 0 ]]; then
+        FILESYSTEM_NEEDS_ROLLBACK=0
+        FILESYSTEM_PRESERVED=()
+        return 0
+    fi
+
+    return 1
+}
+
+mariadb_wait_ready() {
+    local ready=0
+
+    for _ in $(seq 1 60); do
+        if docker compose exec -T "$DB_CONTAINER" \
+            sh -c '
+                root_password="${MARIADB_ROOT_PASSWORD:-${MYSQL_ROOT_PASSWORD:-}}"
+                [ -n "$root_password" ] || exit 2
+                exec mariadb \
+                    --batch \
+                    --skip-column-names \
+                    --user=root \
+                    --password="$root_password" \
+                    -e "SELECT 1;"
+            ' \
+            2>/dev/null |
+            grep -Fxq 1
+        then
+            ready=1
+            break
+        fi
+
+        sleep 1
+    done
+
+    [[ "$ready" -eq 1 ]]
+}
+
+mariadb_reset_database() {
+    docker compose exec -T "$DB_CONTAINER" \
+        sh -c '
+            root_password="${MARIADB_ROOT_PASSWORD:-${MYSQL_ROOT_PASSWORD:-}}"
+            database="${MARIADB_DATABASE:-${MYSQL_DATABASE:-}}"
+
+            [ -n "$root_password" ] || {
+                echo "MariaDB root password is not available" >&2
+                exit 2
+            }
+
+            [ -n "$database" ] || {
+                echo "MariaDB database name is not available" >&2
+                exit 2
+            }
+
+            exec mariadb \
+                --user=root \
+                --password="$root_password" \
+                -e "DROP DATABASE IF EXISTS \`$database\`;
+                    CREATE DATABASE \`$database\`;"
+        '
+}
+
+mariadb_import_sql() {
+    local sql_file="$1"
+
+    [[ -s "$sql_file" ]] ||
+        return 1
+
+    docker compose exec -T "$DB_CONTAINER" \
+        sh -c '
+            root_password="${MARIADB_ROOT_PASSWORD:-${MYSQL_ROOT_PASSWORD:-}}"
+            database="${MARIADB_DATABASE:-${MYSQL_DATABASE:-}}"
+
+            [ -n "$root_password" ] || exit 2
+            [ -n "$database" ] || exit 2
+
+            exec mariadb \
+                --user=root \
+                --password="$root_password" \
+                "$database"
+        ' \
+        < "$sql_file"
+}
+
+rollback_database_state() {
+    echo
+    echo "===== ROLLBACK PRODUCTION DATABASE ====="
+
+    cd "$COMPOSE_DIR"
+
+    if ! docker compose up -d "$DB_CONTAINER"; then
+        echo "ERROR: unable to start database service for rollback" >&2
+        return 1
+    fi
+
+    if ! mariadb_wait_ready; then
+        echo "ERROR: database did not become ready for rollback" >&2
+        return 1
+    fi
+
+    if ! mariadb_reset_database; then
+        echo "ERROR: unable to reset database for rollback" >&2
+        return 1
+    fi
+
+    if ! mariadb_import_sql "$CHECKPOINT_DB_SQL"; then
+        echo "ERROR: pre-restore database checkpoint import failed" >&2
+        return 1
+    fi
+
+    if ! mariadb_wait_ready; then
+        echo "ERROR: database failed readiness check after rollback" >&2
+        return 1
+    fi
+
+    DATABASE_NEEDS_ROLLBACK=0
+
+    echo "PASS: production database rolled back to pre-restore checkpoint"
+    return 0
+}
+
+echo
+EXECUTION_STAGE="filesystem-preservation"
+echo "===== PRESERVE PRODUCTION FILESYSTEM ====="
+
+mkdir -p "$FALLBACK_ROOT"
+
+echo
+echo "===== VERIFY ATOMIC FALLBACK RENAMES ====="
+
+for path in "${BACKUP_PATHS[@]}"; do
+    relative="${path#/}"
+    fallback="${FALLBACK_ROOT}/${relative}"
+
+    [[ -e "$path" ]] ||
+        die "production backup path missing before preservation: $path"
+
+    source_parent="$(dirname "$path")"
+    fallback_parent="$(dirname "$fallback")"
+
+    mkdir -p "$fallback_parent"
+
+    source_device="$(stat -c '%d' -- "$source_parent")" ||
+        die "unable to determine source filesystem device: $source_parent"
+
+    fallback_device="$(stat -c '%d' -- "$fallback_parent")" ||
+        die "unable to determine fallback filesystem device: $fallback_parent"
+
+    [[ "$source_device" == "$fallback_device" ]] ||
+        die "fallback destination is on a different filesystem: $path -> $fallback"
+
+    echo "PASS: atomic fallback rename available for $path"
+done
+
+# From the first production-path move onward, any failure must restore every
+# path that has already been preserved before the application can restart.
+FILESYSTEM_NEEDS_ROLLBACK=1
+
+python3 - "$RESTORE_RECORD" "$FALLBACK_ROOT" <<'FALLBACKPY'
+import json
+import os
+import sys
+import tempfile
+
+output, fallback = sys.argv[1:]
+
+with open(output, encoding="utf-8") as f:
+    document = json.load(f)
+
+document["fallback_root"] = fallback
+
+directory = os.path.dirname(output)
+fd, temporary = tempfile.mkstemp(
+    prefix=".restore-record.",
+    dir=directory,
+    text=True,
+)
+
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, output)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+FALLBACKPY
+
+for path in "${BACKUP_PATHS[@]}"; do
+    relative="${path#/}"
+    fallback="${FALLBACK_ROOT}/${relative}"
+
+    [[ -e "$path" ]] ||
+        die "production backup path missing before preservation: $path"
+
+    mkdir -p "$(dirname "$fallback")"
+
+    mv -- "$path" "$fallback"
+
+    FILESYSTEM_PRESERVED+=("$path")
+
+    echo "PASS: preserved $path -> $fallback"
+done
+
+update_restore_record \
+    "IN_PROGRESS" \
+    "production-filesystem-preserved" \
+    "true" \
+    "PASS" \
+    "PASS" \
+    "IN_PROGRESS" \
+    "NOT_NEEDED" \
+    "PENDING" \
+    "false"
+
+echo
+EXECUTION_STAGE="filesystem-placement"
+echo "===== PLACE RESTORED FILESYSTEM ====="
+
+for path in "${BACKUP_PATHS[@]}"; do
+    relative="${path#/}"
+    staged="${STAGING_ROOT}/${relative}"
+
+    [[ -e "$staged" ]] ||
+        die "validated staged path disappeared before placement: $path"
+
+    mkdir -p "$(dirname "$path")"
+
+    mv -- "$staged" "$path"
+
+    echo "PASS: restored $path"
+done
+
+echo "PASS: validated filesystem state placed into production"
+
+update_restore_record \
+    "IN_PROGRESS" \
+    "production-filesystem-placed" \
+    "true" \
+    "PASS" \
+    "PASS" \
+    "PASS" \
+    "NOT_NEEDED" \
+    "PENDING" \
+    "false"
+
+echo
+echo "===== DATABASE BOUNDARY ====="
+echo "Production filesystem has been replaced."
+
+if [[ "$DB_TYPE" == "mariadb" ]]; then
+    echo
+    EXECUTION_STAGE="database-restore"
+    echo "===== RESTORE MARIADB DATABASE ====="
+
+    cd "$COMPOSE_DIR"
+
+    docker compose up -d "$DB_CONTAINER"
+
+    mariadb_wait_ready ||
+        die "database service did not become ready"
+
+    # From the first destructive database operation onward, EXIT cleanup
+    # must restore the fresh pre-restore DB checkpoint before the original
+    # application is allowed to restart.
+    DATABASE_NEEDS_ROLLBACK=1
+
+    mariadb_reset_database ||
+        die "unable to reset production database"
+
+    mariadb_import_sql "$SELECTED_DB_SQL" ||
+        die "selected database import failed"
+
+    mariadb_wait_ready ||
+        die "database failed readiness check after selected import"
+
+    DATABASE_NEEDS_ROLLBACK=0
+
+    echo "PASS: selected immutable database snapshot imported"
+    echo "PASS: production database passed readiness validation"
+
+    # Filesystem and database now represent the selected recovery point.
+    # The fallback tree and pre-restore DB checkpoint coordinates remain
+    # durable recovery anchors, but automatic rollback is no longer needed.
+    FILESYSTEM_NEEDS_ROLLBACK=0
+
+    EXECUTION_STAGE="application-restart"
+    restore_application_state
+
+    RESTORED_SERVICES="$(
+        docker compose ps \
+            --services \
+            --filter status=running
+    )"
+
+    [[ -n "$RESTORED_SERVICES" ]] ||
+        die "application stack did not return to a running state"
+
+    echo "PASS: application has running services after database restore"
+
+    EXECUTION_STAGE="timer-state-restoration"
+    restore_timer_state
+
+    update_restore_record \
+        "RESTORE_COMPLETED" \
+        "production-filesystem-and-database-restored" \
+        "true" \
+        "PASS" \
+        "PASS" \
+        "PASS" \
+        "NOT_NEEDED" \
+        "PASS" \
+        "true"
+
+    echo
+    echo "PASS: production filesystem restored from immutable snapshot"
+    echo "PASS: production database restored from immutable snapshot"
+else
+    echo "Database state does not require restoration."
+
+    FILESYSTEM_NEEDS_ROLLBACK=0
+
+    EXECUTION_STAGE="application-restart"
+    restore_application_state
+
+    RESTORED_SERVICES="$(
+        docker compose ps \
+            --services \
+            --filter status=running
+    )"
+
+    [[ -n "$RESTORED_SERVICES" ]] ||
+        die "application stack did not return to a running state"
+
+    echo "PASS: application has running services after restart"
+
+    EXECUTION_STAGE="timer-state-restoration"
+    restore_timer_state
+
+    update_restore_record \
+        "FILESYSTEM_RESTORED" \
+        "production-filesystem-restored" \
+        "true" \
+        "PASS" \
+        "PASS" \
+        "PASS" \
+        "NOT_NEEDED" \
+        "PASS" \
+        "true"
+
+    echo
+    echo "PASS: production filesystem restored from immutable snapshot"
+    echo "PASS: database state was not modified"
+fi
+
+rm -f "$VALIDATION_RESULT"
+rm -rf "$WORK_ROOT"
+trap - EXIT
+
+echo "PASS: fallback copy preserved"
+echo "PASS: application state restored"
+echo "PASS: timer state restored"
+echo "Fallback root: $FALLBACK_ROOT"
+echo "Restore record: $RESTORE_RECORD"

@@ -37,6 +37,9 @@ replacements = {
     'PORTABLE_DEST="/etc/docker-backup/portable"':
         'PORTABLE_DEST="${TEST_ROOT:?}/etc/docker-backup/portable"',
 
+    'GROUP_DEST="/etc/docker-backup/groups"':
+        'GROUP_DEST="${TEST_ROOT:?}/etc/docker-backup/groups"',
+
     'VERSION_DEST="/etc/docker-backup/DEPLOYED_VERSION"':
         'VERSION_DEST="${TEST_ROOT:?}/etc/docker-backup/DEPLOYED_VERSION"',
 
@@ -201,12 +204,21 @@ test ! -e "$ROOT/etc/docker-backup/apps/example-app.conf"
 test ! -e "$ROOT/etc/docker-backup/repos/example-app-operational.conf"
 test ! -e "$ROOT/etc/docker-backup/portable/example-app.conf"
 
+# A v1.0 production deployment has no groups directory. Preserve-mode upgrade
+# must create the directory without installing source example configuration.
+test -d "$ROOT/etc/docker-backup/groups"
+test ! -e "$ROOT/etc/docker-backup/groups/example.conf"
+
 for engine in \
     backup-repository \
     retention-repository \
     maintain-repository \
     portable-backup \
-    portable-retention
+    portable-retention \
+    backup-group \
+    validate-application-recovery \
+    validate-group-recovery \
+    restore-application
 do
     cmp \
         "$SOURCE/src/$engine" \
@@ -215,7 +227,9 @@ done
 
 for tool in \
     acceptance-test \
-    resolve-snapshot
+    resolve-snapshot \
+    validate-group \
+    validate-group-manifest
 do
     cmp \
         "$SOURCE/scripts/$tool" \
@@ -225,9 +239,9 @@ done
 echo "=== deployed version marker ==="
 
 cat > "$PRESERVE/expected-version" <<'EOF_VERSION'
-FRAMEWORK_VERSION=1.0.0
+FRAMEWORK_VERSION=1.1.0
 GIT_COMMIT=unknown
-GIT_DESCRIBE=v1.0.0
+GIT_DESCRIBE=v1.1.0
 EOF_VERSION
 
 cmp \
@@ -278,10 +292,18 @@ cmp \
     "$SOURCE/config/portable/example-app.conf" \
     "$ROOT/etc/docker-backup/portable/example-app.conf"
 
+cmp \
+    "$SOURCE/config/groups/example.conf" \
+    "$ROOT/etc/docker-backup/groups/example.conf"
+
+cmp \
+    "$SOURCE/scripts/validate-group" \
+    "$ROOT/usr/local/lib/docker-backup/validate-group"
+
 cat > "$STANDARD/expected-version" <<'EOF_VERSION'
-FRAMEWORK_VERSION=1.0.0
+FRAMEWORK_VERSION=1.1.0
 GIT_COMMIT=unknown
-GIT_DESCRIBE=v1.0.0
+GIT_DESCRIBE=v1.1.0
 EOF_VERSION
 
 cmp \

@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+    echo "Usage: $0 <group-manifest>" >&2
+    exit 2
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+[[ $# -eq 1 ]] || usage
+
+MANIFEST="$1"
+
+[[ -f "$MANIFEST" ]] ||
+    die "group manifest not found: $MANIFEST"
+
+python3 - "$MANIFEST" <<'PY'
+import json
+import os
+import re
+import sys
+
+path = sys.argv[1]
+
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+SNAPSHOT_RE = re.compile(r"^[0-9a-f]{64}$")
+GENERATION_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
+
+def die(message):
+    print(f"ERROR: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    with open(path, encoding="utf-8") as f:
+        document = json.load(f)
+except (OSError, json.JSONDecodeError) as exc:
+    die(f"unable to read valid JSON manifest: {exc}")
+
+if not isinstance(document, dict):
+    die("manifest root must be a JSON object")
+
+if document.get("schema_version") != 1:
+    die("unsupported or missing schema_version")
+
+group = document.get("group")
+
+if not isinstance(group, str) or not NAME_RE.fullmatch(group):
+    die("invalid or missing group")
+
+generation = document.get("group_generation")
+
+if (
+    not isinstance(generation, str)
+    or not generation
+    or not GENERATION_RE.fullmatch(generation)
+):
+    die("invalid or missing group_generation")
+
+if document.get("consistency") != "coordinated-non-atomic":
+    die("unsupported or missing consistency mode")
+
+if document.get("result") != "PASS":
+    die("manifest is not a complete PASS recovery point")
+
+members = document.get("members")
+
+if not isinstance(members, list) or not members:
+    die("manifest members must be a non-empty array")
+
+seen_apps = set()
+seen_repos = set()
+seen_portable = set()
+
+required_keys = {
+    "application",
+    "repository",
+    "portable_target",
+    "result",
+    "restic_generation",
+    "db_snapshot",
+    "files_snapshot",
+    "portable_set",
+}
+
+for index, member in enumerate(members):
+    prefix = f"member[{index}]"
+
+    if not isinstance(member, dict):
+        die(f"{prefix} must be a JSON object")
+
+    missing = required_keys - set(member)
+
+    if missing:
+        die(
+            f"{prefix} missing required field(s): "
+            + ", ".join(sorted(missing))
+        )
+
+    app = member["application"]
+    repo = member["repository"]
+    portable = member["portable_target"]
+
+    for label, value in (
+        ("application", app),
+        ("repository", repo),
+        ("portable_target", portable),
+    ):
+        if not isinstance(value, str) or not NAME_RE.fullmatch(value):
+            die(f"{prefix} has invalid {label}")
+
+    if app in seen_apps:
+        die(f"duplicate application in manifest: {app}")
+
+    if repo in seen_repos:
+        die(f"duplicate repository in manifest: {repo}")
+
+    if portable in seen_portable:
+        die(f"duplicate portable target in manifest: {portable}")
+
+    seen_apps.add(app)
+    seen_repos.add(repo)
+    seen_portable.add(portable)
+
+    if member["result"] != "PASS":
+        die(f"{prefix} is not a complete PASS member")
+
+    restic_generation = member["restic_generation"]
+
+    if (
+        not isinstance(restic_generation, str)
+        or not restic_generation
+        or not GENERATION_RE.fullmatch(restic_generation)
+    ):
+        die(f"{prefix} has invalid restic_generation")
+
+    files_snapshot = member["files_snapshot"]
+
+    if (
+        not isinstance(files_snapshot, str)
+        or not SNAPSHOT_RE.fullmatch(files_snapshot)
+    ):
+        die(f"{prefix} has invalid files_snapshot")
+
+    db_snapshot = member["db_snapshot"]
+
+    if db_snapshot is not None:
+        if (
+            not isinstance(db_snapshot, str)
+            or not SNAPSHOT_RE.fullmatch(db_snapshot)
+        ):
+            die(f"{prefix} has invalid db_snapshot")
+
+    portable_set = member["portable_set"]
+
+    if (
+        not isinstance(portable_set, str)
+        or not portable_set
+        or not os.path.isabs(portable_set)
+    ):
+        die(f"{prefix} has invalid portable_set")
+
+print("PASS: group manifest valid")
+print(f"Group:      {group}")
+print(f"Generation: {generation}")
+print(f"Members:    {len(members)}")
+PY

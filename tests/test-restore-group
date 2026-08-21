@@ -1,0 +1,522 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ENGINE="$(pwd)/src/restore-group"
+TMP="$(mktemp -d)"
+CONFIG_ROOT="$TMP/config"
+RUNTIME_ROOT="$TMP/runtime"
+GROUP_RESTORE_ROOT="$TMP/group-restores"
+LOG="$TMP/commands.log"
+MANIFEST="$TMP/group.json"
+
+cleanup() {
+    sudo rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+mkdir -p \
+    "$CONFIG_ROOT/apps" \
+    "$CONFIG_ROOT/repos" \
+    "$CONFIG_ROOT/portable" \
+    "$RUNTIME_ROOT" \
+    "$GROUP_RESTORE_ROOT"
+
+FILES_ONE="1111111111111111111111111111111111111111111111111111111111111111"
+FILES_TWO="2222222222222222222222222222222222222222222222222222222222222222"
+DB_ONE="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+cat > "$MANIFEST" <<EOF_MANIFEST
+{
+  "schema_version": 1,
+  "group": "test-group",
+  "group_generation": "20260821T190000Z-12345",
+  "consistency": "coordinated-non-atomic",
+  "result": "PASS",
+  "members": [
+    {
+      "application": "app-one",
+      "repository": "app-one-operational",
+      "portable_target": "app-one",
+      "result": "PASS",
+      "restic_generation": "gen-one",
+      "db_snapshot": "$DB_ONE",
+      "files_snapshot": "$FILES_ONE",
+      "portable_set": "/backup/app-one/set-one"
+    },
+    {
+      "application": "app-two",
+      "repository": "app-two-operational",
+      "portable_target": "app-two",
+      "result": "PASS",
+      "restic_generation": "gen-two",
+      "db_snapshot": null,
+      "files_snapshot": "$FILES_TWO",
+      "portable_set": "/backup/app-two/set-two"
+    }
+  ]
+}
+EOF_MANIFEST
+
+for app in app-one app-two; do
+    cat > "$CONFIG_ROOT/apps/$app.conf" <<EOF_APP
+APP_NAME="$app"
+COMPOSE_DIR="$TMP/$app-compose"
+DB_TYPE="none"
+DB_BACKUP_MODE="none"
+BACKUP_PATHS=(
+    "$TMP/$app-data"
+)
+EXCLUDE_PATHS=()
+EOF_APP
+
+    mkdir -p "$TMP/$app-compose" "$TMP/$app-data"
+done
+
+cat > "$CONFIG_ROOT/repos/app-one-operational.conf" <<'EOF_REPO'
+REPO_NAME="app-one-operational"
+APP_NAME="app-one"
+REPOSITORY="/backup/app-one/restic"
+PASSWORD_FILE="/secrets/app-one"
+STORAGE_TYPE="local"
+EOF_REPO
+
+cat > "$CONFIG_ROOT/repos/app-two-operational.conf" <<'EOF_REPO'
+REPO_NAME="app-two-operational"
+APP_NAME="app-two"
+REPOSITORY="/backup/app-two/restic"
+PASSWORD_FILE="/secrets/app-two"
+STORAGE_TYPE="local"
+EOF_REPO
+
+cat > "$CONFIG_ROOT/portable/app-one.conf" <<'EOF_PORTABLE'
+PORTABLE_NAME="app-one"
+APP_NAME="app-one"
+BACKUP_ROOT="/backup/app-one/portable"
+STORAGE_TYPE="local"
+EOF_PORTABLE
+
+cat > "$CONFIG_ROOT/portable/app-two.conf" <<'EOF_PORTABLE'
+PORTABLE_NAME="app-two"
+APP_NAME="app-two"
+BACKUP_ROOT="/backup/app-two/portable"
+STORAGE_TYPE="local"
+EOF_PORTABLE
+
+cat > "$RUNTIME_ROOT/validate-group-recovery" <<'EOF_VALIDATOR'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'validate-group-recovery|%s\n' "$*" >> "$TEST_COMMAND_LOG"
+
+[[ "${FAIL_GROUP_VALIDATION:-0}" != "1" ]] || {
+    echo "injected group validation failure" >&2
+    exit 41
+}
+
+manifest="$1"
+shift
+
+result_file=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --result-file)
+            shift
+            result_file="$1"
+            ;;
+    esac
+    shift
+done
+
+python3 - "$manifest" "$result_file" <<'PY'
+import json
+import os
+import sys
+
+manifest, output = sys.argv[1:]
+
+with open(manifest, encoding="utf-8") as f:
+    source = json.load(f)
+
+document = {
+    "schema_version": 1,
+    "group": source["group"],
+    "group_generation": source["group_generation"],
+    "result": "PASS",
+    "validation_order": "reverse-manifest",
+    "members": list(reversed(source["members"])),
+}
+
+with open(output, "w", encoding="utf-8") as f:
+    json.dump(document, f)
+    f.write("\n")
+
+os.chmod(output, 0o600)
+PY
+
+echo "PASS: mock complete group validation"
+EOF_VALIDATOR
+chmod +x "$RUNTIME_ROOT/validate-group-recovery"
+
+cat > "$RUNTIME_ROOT/restore-application" <<'EOF_RESTORE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'restore-application|%s\n' "$*" >> "$TEST_COMMAND_LOG"
+
+app_config="$1"
+shift 3
+
+# shellcheck disable=SC1090
+source "$app_config"
+application="$APP_NAME"
+
+if [[ "${FAIL_MEMBER:-}" == "$application" ]]; then
+    record="$TEST_MEMBER_RECORD_ROOT/${application}-failed.json"
+
+    cat > "$record" <<EOF_RECORD
+{
+  "schema_version": 1,
+  "result": "FAIL",
+  "application": "$application"
+}
+EOF_RECORD
+
+    chmod 0600 "$record"
+
+    echo "Restore record: $record"
+    echo "injected member restore failure: $application" >&2
+    exit 51
+fi
+
+record="$TEST_MEMBER_RECORD_ROOT/${application}-pass.json"
+
+record_application="$application"
+record_result="RESTORE_COMPLETED"
+
+if [[ "${WRONG_MEMBER_RECORD_APPLICATION:-}" == "$application" ]]; then
+    record_application="wrong-application"
+fi
+
+if [[ "${BAD_MEMBER_RECORD_RESULT:-}" == "$application" ]]; then
+    record_result="FAIL"
+fi
+
+if [[ "${MISSING_MEMBER_RECORD:-}" != "$application" ]]; then
+    cat > "$record" <<EOF_RECORD
+{
+  "schema_version": 1,
+  "result": "$record_result",
+  "application": "$record_application"
+}
+EOF_RECORD
+
+    chmod 0600 "$record"
+else
+    rm -f "$record"
+fi
+
+echo "Restore record: $record"
+echo "PASS: mock member restore: $application"
+EOF_RESTORE
+chmod +x "$RUNTIME_ROOT/restore-application"
+
+run_group() {
+    sudo env \
+        "DOCKER_BACKUP_CONFIG_ROOT=$CONFIG_ROOT" \
+        "DOCKER_BACKUP_ENGINE_ROOT=$RUNTIME_ROOT" \
+        "DOCKER_BACKUP_GROUP_RESTORE_ROOT=$GROUP_RESTORE_ROOT" \
+        "TEST_COMMAND_LOG=$LOG" \
+        "TEST_MEMBER_RECORD_ROOT=$TMP" \
+        "FAIL_GROUP_VALIDATION=${FAIL_GROUP_VALIDATION:-0}" \
+        "FAIL_MEMBER=${FAIL_MEMBER:-}" \
+        "MISSING_MEMBER_RECORD=${MISSING_MEMBER_RECORD:-}" \
+        "WRONG_MEMBER_RECORD_APPLICATION=${WRONG_MEMBER_RECORD_APPLICATION:-}" \
+        "BAD_MEMBER_RECORD_RESULT=${BAD_MEMBER_RECORD_RESULT:-}" \
+        "$ENGINE" \
+        "$MANIFEST" \
+        "$@"
+}
+
+echo "=== plan validates complete group and performs no member restore ==="
+: > "$LOG"
+
+run_group > "$TMP/plan.log"
+
+grep -F \
+    'PASS: group restore plan completed' \
+    "$TMP/plan.log"
+
+grep -F \
+    '1. app-two' \
+    "$TMP/plan.log"
+
+grep -F \
+    '2. app-one' \
+    "$TMP/plan.log"
+
+grep -F \
+    'validate-group-recovery|' \
+    "$LOG" >/dev/null
+
+if grep -F 'restore-application|' "$LOG"; then
+    echo "ERROR: plan mode invoked destructive member restore" >&2
+    exit 1
+fi
+
+echo "PASS: plan is reverse-order and non-destructive"
+
+echo
+echo "=== confirmation guards ==="
+: > "$LOG"
+
+if run_group \
+       --execute \
+       > "$TMP/no-confirm.log" 2>&1
+then
+    echo "ERROR: execute without confirmation was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    -- '--confirm <group> is required with --execute' \
+    "$TMP/no-confirm.log"
+
+[[ ! -s "$LOG" ]] || {
+    echo "ERROR: runtime work occurred before confirmation guard" >&2
+    cat "$LOG" >&2
+    exit 1
+}
+
+if run_group \
+       --execute \
+       --confirm wrong-group \
+       > "$TMP/wrong-confirm.log" 2>&1
+then
+    echo "ERROR: incorrect group confirmation was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'confirmation value does not match group: test-group' \
+    "$TMP/wrong-confirm.log"
+
+echo "PASS: execute confirmation guards enforced"
+
+echo
+echo "=== full-group validation failure blocks all mutations ==="
+: > "$LOG"
+
+if FAIL_GROUP_VALIDATION=1 \
+   run_group \
+       --execute \
+       --confirm test-group \
+       > "$TMP/validation-fail.log" 2>&1
+then
+    echo "ERROR: group validation failure was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'injected group validation failure' \
+    "$TMP/validation-fail.log"
+
+if grep -F 'restore-application|' "$LOG"; then
+    echo "ERROR: member restore began after group validation failure" >&2
+    exit 1
+fi
+
+echo "PASS: every recovery point validates before first mutation"
+
+echo
+echo "=== successful reverse-order group restore ==="
+sudo rm -rf "$GROUP_RESTORE_ROOT"
+mkdir -p "$GROUP_RESTORE_ROOT"
+: > "$LOG"
+
+run_group \
+    --execute \
+    --confirm test-group \
+    > "$TMP/success.log"
+
+grep -F \
+    'PASS: coordinated non-atomic group restore completed' \
+    "$TMP/success.log"
+
+mapfile -t RESTORE_LINES < <(
+    grep -nF 'restore-application|' "$LOG" |
+    cut -d: -f1
+)
+
+[[ "${#RESTORE_LINES[@]}" -eq 2 ]]
+
+FIRST_RESTORE="$(
+    sed -n "${RESTORE_LINES[0]}p" "$LOG"
+)"
+
+SECOND_RESTORE="$(
+    sed -n "${RESTORE_LINES[1]}p" "$LOG"
+)"
+
+grep -F "$CONFIG_ROOT/apps/app-two.conf" <<<"$FIRST_RESTORE" >/dev/null
+grep -F "$CONFIG_ROOT/apps/app-one.conf" <<<"$SECOND_RESTORE" >/dev/null
+
+GROUP_RECORD="$(
+    sudo find "$GROUP_RESTORE_ROOT/test-group" \
+        -type f \
+        -name '*.json' |
+    sort |
+    tail -1
+)"
+
+sudo cat "$GROUP_RECORD" |
+python3 -c '
+import json
+import sys
+
+d = json.load(sys.stdin)
+
+assert d["result"] == "PASS"
+assert d["restore_order"] == "reverse-manifest"
+
+assert [m["application"] for m in d["members"]] == [
+    "app-two",
+    "app-one",
+]
+
+assert all(m["result"] == "PASS" for m in d["members"])
+assert all(m["restore_record"] for m in d["members"])
+'
+
+echo "PASS: successful group restore links member restore records"
+
+echo
+echo "=== successful child with missing restore record is rejected ==="
+
+sudo rm -rf "$GROUP_RESTORE_ROOT"
+mkdir -p "$GROUP_RESTORE_ROOT"
+: > "$LOG"
+
+if MISSING_MEMBER_RECORD=app-two \
+   run_group \
+       --execute \
+       --confirm test-group \
+       > "$TMP/missing-record.log" 2>&1
+then
+    echo "ERROR: missing member restore record was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'member restore record is missing or unreadable: app-two' \
+    "$TMP/missing-record.log"
+
+echo "PASS: missing child restore record rejected"
+
+echo
+echo "=== successful child with wrong application record is rejected ==="
+
+sudo rm -rf "$GROUP_RESTORE_ROOT"
+mkdir -p "$GROUP_RESTORE_ROOT"
+: > "$LOG"
+
+if WRONG_MEMBER_RECORD_APPLICATION=app-two \
+   run_group \
+       --execute \
+       --confirm test-group \
+       > "$TMP/wrong-record-app.log" 2>&1
+then
+    echo "ERROR: mismatched member restore record was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'member restore record application mismatch: app-two' \
+    "$TMP/wrong-record-app.log"
+
+echo "PASS: mismatched child restore record rejected"
+
+echo
+echo "=== successful child with non-success terminal record is rejected ==="
+
+sudo rm -rf "$GROUP_RESTORE_ROOT"
+mkdir -p "$GROUP_RESTORE_ROOT"
+: > "$LOG"
+
+if BAD_MEMBER_RECORD_RESULT=app-two \
+   run_group \
+       --execute \
+       --confirm test-group \
+       > "$TMP/bad-record-result.log" 2>&1
+then
+    echo "ERROR: non-success member restore record was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'member restore record does not report terminal success: app-two' \
+    "$TMP/bad-record-result.log"
+
+echo "PASS: non-success child restore record rejected"
+
+echo
+echo "=== member failure is fail-fast and durable ==="
+sudo rm -rf "$GROUP_RESTORE_ROOT"
+mkdir -p "$GROUP_RESTORE_ROOT"
+: > "$LOG"
+
+if FAIL_MEMBER=app-two \
+   run_group \
+       --execute \
+       --confirm test-group \
+       > "$TMP/member-fail.log" 2>&1
+then
+    echo "ERROR: member failure was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'group restore stopped after member failure: app-two' \
+    "$TMP/member-fail.log"
+
+RESTORE_COUNT="$(
+    grep -cF 'restore-application|' "$LOG" || true
+)"
+
+[[ "$RESTORE_COUNT" -eq 1 ]] || {
+    echo "ERROR: later member restored after fail-fast boundary" >&2
+    cat "$LOG" >&2
+    exit 1
+}
+
+FAIL_RECORD="$(
+    sudo find "$GROUP_RESTORE_ROOT/test-group" \
+        -type f \
+        -name '*.json' |
+    sort |
+    tail -1
+)"
+
+sudo cat "$FAIL_RECORD" |
+python3 -c '
+import json
+import sys
+
+d = json.load(sys.stdin)
+
+assert d["result"] == "FAIL"
+assert d["failure"] == {
+    "application": "app-two",
+    "stage": "member-restore",
+}
+
+assert len(d["members"]) == 1
+assert d["members"][0]["application"] == "app-two"
+assert d["members"][0]["result"] == "FAIL"
+assert d["members"][0]["restore_record"]
+'
+
+echo "PASS: failed member linked durably and later members not attempted"
+
+echo
+echo "PASS: restore-group regression suite"

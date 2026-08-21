@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+    cat >&2 <<'HELP'
+Usage:
+  validate-group-recovery <group-manifest> [--result-file <path>]
+
+Non-destructively validates every application recovery point represented by a
+completed group backup manifest.
+
+Recovery members are processed in reverse manifest order.
+
+The selected manifest is authoritative for:
+- application identity
+- repository identity
+- portable target identity
+- Restic generation
+- immutable filesystem snapshot ID
+- immutable database snapshot ID, when present
+- portable recovery-set path
+
+The current group configuration is not used to select or reorder members.
+HELP
+    exit 2
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+[[ "$EUID" -eq 0 ]] ||
+    die "group recovery validation must run as root"
+
+[[ $# -ge 1 ]] || usage
+
+MANIFEST="$1"
+shift
+
+RESULT_FILE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --result-file)
+            shift
+            [[ $# -gt 0 ]] || usage
+            RESULT_FILE="$1"
+            ;;
+        *)
+            usage
+            ;;
+    esac
+
+    shift
+done
+
+CONFIG_ROOT="${DOCKER_BACKUP_CONFIG_ROOT:-/etc/docker-backup}"
+RUNTIME_ROOT="${DOCKER_BACKUP_ENGINE_ROOT:-/usr/local/lib/docker-backup}"
+
+MANIFEST_VALIDATOR="${RUNTIME_ROOT}/validate-group-manifest"
+APP_VALIDATOR="${RUNTIME_ROOT}/validate-application-recovery"
+
+[[ -x "$MANIFEST_VALIDATOR" ]] ||
+    die "required executable missing: $MANIFEST_VALIDATOR"
+
+[[ -x "$APP_VALIDATOR" ]] ||
+    die "required executable missing: $APP_VALIDATOR"
+
+[[ -f "$MANIFEST" ]] ||
+    die "group manifest not found: $MANIFEST"
+
+echo "===== GROUP RECOVERY VALIDATION ====="
+echo "Manifest: $MANIFEST"
+
+echo
+echo "===== VALIDATE GROUP MANIFEST ====="
+
+"$MANIFEST_VALIDATOR" "$MANIFEST"
+
+MANIFEST_DATA="$(
+    python3 - "$MANIFEST" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    document = json.load(f)
+
+print(document["group"])
+print(document["group_generation"])
+print(len(document["members"]))
+
+for member in reversed(document["members"]):
+    values = [
+        member["application"],
+        member["repository"],
+        member["portable_target"],
+        member["restic_generation"],
+        member["files_snapshot"],
+        member["db_snapshot"] or "",
+        member["portable_set"],
+    ]
+
+    separator = "\x1f"
+
+    for value in values:
+        if (
+            "\n" in value
+            or "\t" in value
+            or separator in value
+        ):
+            raise SystemExit(
+                "manifest contains unsupported control characters"
+            )
+
+    print(separator.join(values))
+PY
+)"
+
+GROUP_NAME="$(sed -n '1p' <<<"$MANIFEST_DATA")"
+GROUP_GENERATION="$(sed -n '2p' <<<"$MANIFEST_DATA")"
+MEMBER_COUNT="$(sed -n '3p' <<<"$MANIFEST_DATA")"
+
+mapfile -t MEMBERS < <(
+    tail -n +4 <<<"$MANIFEST_DATA"
+)
+
+[[ "${#MEMBERS[@]}" -eq "$MEMBER_COUNT" ]] ||
+    die "manifest member extraction count mismatch"
+
+echo
+echo "Group:            $GROUP_NAME"
+echo "Group generation: $GROUP_GENERATION"
+echo "Members:          $MEMBER_COUNT"
+echo "Validation order: reverse manifest order"
+
+TMP_ROOT="$(mktemp -d /tmp/docker-group-recovery-validation.XXXXXX)"
+RESULTS_FILE="$TMP_ROOT/members.ndjson"
+
+cleanup() {
+    local rc=$?
+
+    rm -rf "$TMP_ROOT"
+
+    if [[ "$rc" -eq 0 ]]; then
+        echo
+        echo "PASS: group validation resources cleaned up"
+    else
+        echo
+        echo "ERROR: group recovery validation failed with exit $rc" >&2
+        echo "PASS: group validation resources cleaned up" >&2
+    fi
+
+    exit "$rc"
+}
+
+trap cleanup EXIT
+
+touch "$RESULTS_FILE"
+chmod 0600 "$RESULTS_FILE"
+
+INDEX=0
+
+for member in "${MEMBERS[@]}"; do
+    INDEX=$((INDEX + 1))
+
+    IFS=$'\x1f' read -r \
+        APPLICATION \
+        REPOSITORY \
+        PORTABLE_TARGET \
+        RESTIC_GENERATION \
+        FILES_SNAPSHOT \
+        DB_SNAPSHOT \
+        PORTABLE_SET \
+        <<<"$member"
+
+    [[ -n "$APPLICATION" ]] ||
+        die "manifest member missing application"
+
+    [[ -n "$REPOSITORY" ]] ||
+        die "manifest member missing repository"
+
+    [[ -n "$PORTABLE_TARGET" ]] ||
+        die "manifest member missing portable target"
+
+    APP_CONFIG="${CONFIG_ROOT}/apps/${APPLICATION}.conf"
+    REPO_CONFIG="${CONFIG_ROOT}/repos/${REPOSITORY}.conf"
+    PORTABLE_CONFIG="${CONFIG_ROOT}/portable/${PORTABLE_TARGET}.conf"
+
+    for config in \
+        "$APP_CONFIG" \
+        "$REPO_CONFIG" \
+        "$PORTABLE_CONFIG"
+    do
+        [[ -f "$config" ]] ||
+            die "required production configuration missing: $config"
+    done
+
+    MEMBER_RESULT="${TMP_ROOT}/member-${INDEX}.env"
+
+    echo
+    echo "===== MEMBER ${INDEX}/${MEMBER_COUNT}: ${APPLICATION} ====="
+    echo "Repository:        $REPOSITORY"
+    echo "Portable target:   $PORTABLE_TARGET"
+    echo "Restic generation: $RESTIC_GENERATION"
+    echo "Files snapshot:    $FILES_SNAPSHOT"
+
+    if [[ -n "$DB_SNAPSHOT" ]]; then
+        echo "DB snapshot:       $DB_SNAPSHOT"
+    fi
+
+    echo "Portable set:      $PORTABLE_SET"
+
+    args=(
+        "$APP_CONFIG"
+        "$REPO_CONFIG"
+        "$PORTABLE_CONFIG"
+        --generation "$RESTIC_GENERATION"
+        --files-snapshot "$FILES_SNAPSHOT"
+        --portable-set "$PORTABLE_SET"
+        --result-file "$MEMBER_RESULT"
+    )
+
+    if [[ -n "$DB_SNAPSHOT" ]]; then
+        args+=(
+            --db-snapshot "$DB_SNAPSHOT"
+        )
+    fi
+
+    "$APP_VALIDATOR" "${args[@]}"
+
+    [[ -s "$MEMBER_RESULT" ]] ||
+        die "member validation did not produce result file: $APPLICATION"
+
+    # shellcheck disable=SC1090
+    source "$MEMBER_RESULT"
+
+    [[ "${RESULT:-}" == "PASS" ]] ||
+        die "member validation did not report PASS: $APPLICATION"
+
+    [[ "${APPLICATION:-}" == "$APPLICATION" ]] ||
+        die "member result application identity mismatch"
+
+    [[ "${REPOSITORY:-}" == "$REPOSITORY" ]] ||
+        die "member result repository identity mismatch"
+
+    [[ "${PORTABLE_TARGET:-}" == "$PORTABLE_TARGET" ]] ||
+        die "member result portable-target identity mismatch"
+
+    [[ "${RESTIC_GENERATION:-}" == "$RESTIC_GENERATION" ]] ||
+        die "member result Restic generation mismatch"
+
+    [[ "${FILES_SNAPSHOT:-}" == "$FILES_SNAPSHOT" ]] ||
+        die "member result files snapshot mismatch"
+
+    if [[ -n "$DB_SNAPSHOT" ]]; then
+        [[ "${DB_SNAPSHOT:-}" == "$DB_SNAPSHOT" ]] ||
+            die "member result database snapshot mismatch"
+    fi
+
+    python3 - \
+        "$APPLICATION" \
+        "$REPOSITORY" \
+        "$PORTABLE_TARGET" \
+        "$RESTIC_GENERATION" \
+        "$FILES_SNAPSHOT" \
+        "$DB_SNAPSHOT" \
+        "$PORTABLE_SET" \
+        >> "$RESULTS_FILE" <<'PY'
+import json
+import sys
+
+(
+    application,
+    repository,
+    portable_target,
+    restic_generation,
+    files_snapshot,
+    db_snapshot,
+    portable_set,
+) = sys.argv[1:]
+
+print(json.dumps(
+    {
+        "application": application,
+        "repository": repository,
+        "portable_target": portable_target,
+        "result": "PASS",
+        "restic_generation": restic_generation,
+        "files_snapshot": files_snapshot,
+        "db_snapshot": db_snapshot or None,
+        "portable_set": portable_set,
+    },
+    sort_keys=True,
+))
+PY
+
+    echo "PASS: recovery point validated: $APPLICATION"
+done
+
+echo
+echo "===== GROUP RECOVERY VALIDATION RESULT ====="
+echo "Result:           PASS"
+echo "Group:            $GROUP_NAME"
+echo "Group generation: $GROUP_GENERATION"
+echo "Members:          $MEMBER_COUNT"
+
+if [[ -n "$RESULT_FILE" ]]; then
+    umask 077
+    mkdir -p "$(dirname "$RESULT_FILE")"
+
+    python3 - \
+        "$GROUP_NAME" \
+        "$GROUP_GENERATION" \
+        "$MEMBER_COUNT" \
+        "$RESULTS_FILE" \
+        "$RESULT_FILE" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+group = sys.argv[1]
+generation = sys.argv[2]
+expected_count = int(sys.argv[3])
+members_file = sys.argv[4]
+output = sys.argv[5]
+
+with open(members_file, encoding="utf-8") as f:
+    members = [
+        json.loads(line)
+        for line in f
+        if line.strip()
+    ]
+
+if len(members) != expected_count:
+    raise SystemExit(
+        "validated member count does not match manifest"
+    )
+
+document = {
+    "schema_version": 1,
+    "group": group,
+    "group_generation": generation,
+    "result": "PASS",
+    "validation_order": "reverse-manifest",
+    "members": members,
+}
+
+directory = os.path.dirname(output) or "."
+os.makedirs(directory, exist_ok=True)
+
+fd, temporary = tempfile.mkstemp(
+    prefix=".group-recovery-result.",
+    dir=directory,
+    text=True,
+)
+
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, output)
+
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+
+    echo "Result file:      $RESULT_FILE"
+fi
+
+trap - EXIT
+rm -rf "$TMP_ROOT"
+
+echo
+echo "PASS: group recovery point validated non-destructively"

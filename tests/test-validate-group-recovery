@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENGINE="${ROOT}/src/validate-group-recovery"
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+CONFIG_ROOT="$TMP/etc/docker-backup"
+RUNTIME_ROOT="$TMP/runtime"
+LOG="$TMP/invocations.log"
+RESULT_FILE="$TMP/group-result.json"
+
+mkdir -p \
+    "$CONFIG_ROOT/apps" \
+    "$CONFIG_ROOT/repos" \
+    "$CONFIG_ROOT/portable" \
+    "$RUNTIME_ROOT"
+
+for app in app-one app-two; do
+    cat > "$CONFIG_ROOT/apps/${app}.conf" <<EOF_APP
+APP_NAME="$app"
+EOF_APP
+done
+
+cat > "$CONFIG_ROOT/repos/app-one-operational.conf" <<'EOF_REPO'
+REPO_NAME="app-one-operational"
+APP_NAME="app-one"
+EOF_REPO
+
+cat > "$CONFIG_ROOT/repos/app-two-operational.conf" <<'EOF_REPO'
+REPO_NAME="app-two-operational"
+APP_NAME="app-two"
+EOF_REPO
+
+cat > "$CONFIG_ROOT/portable/app-one.conf" <<'EOF_PORTABLE'
+PORTABLE_NAME="app-one"
+APP_NAME="app-one"
+EOF_PORTABLE
+
+cat > "$CONFIG_ROOT/portable/app-two.conf" <<'EOF_PORTABLE'
+PORTABLE_NAME="app-two"
+APP_NAME="app-two"
+EOF_PORTABLE
+
+cat > "$RUNTIME_ROOT/validate-group-manifest" <<'EOF_VALIDATOR'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+MANIFEST="$1"
+
+python3 - "$MANIFEST" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    d = json.load(f)
+
+if d.get("result") != "PASS":
+    raise SystemExit("manifest is not a complete PASS recovery point")
+
+print("PASS: mock group manifest validation")
+PY
+EOF_VALIDATOR
+
+chmod +x "$RUNTIME_ROOT/validate-group-manifest"
+
+cat > "$RUNTIME_ROOT/validate-application-recovery" <<'EOF_APP_VALIDATOR'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_CONFIG="$1"
+REPO_CONFIG="$2"
+PORTABLE_CONFIG="$3"
+shift 3
+
+GENERATION=""
+FILES_SNAPSHOT=""
+DB_SNAPSHOT=""
+PORTABLE_SET=""
+RESULT_FILE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --generation)
+            shift
+            GENERATION="$1"
+            ;;
+        --files-snapshot)
+            shift
+            FILES_SNAPSHOT="$1"
+            ;;
+        --db-snapshot)
+            shift
+            DB_SNAPSHOT="$1"
+            ;;
+        --portable-set)
+            shift
+            PORTABLE_SET="$1"
+            ;;
+        --result-file)
+            shift
+            RESULT_FILE="$1"
+            ;;
+        *)
+            echo "unexpected argument: $1" >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+# shellcheck disable=SC1090
+source "$APP_CONFIG"
+APP_ID="$APP_NAME"
+
+# shellcheck disable=SC1090
+source "$REPO_CONFIG"
+REPO_ID="$REPO_NAME"
+
+# shellcheck disable=SC1090
+source "$PORTABLE_CONFIG"
+PORTABLE_ID="$PORTABLE_NAME"
+
+printf '%s|%s|%s|%s|%s|%s|%s\n' \
+    "$APP_ID" \
+    "$REPO_ID" \
+    "$PORTABLE_ID" \
+    "$GENERATION" \
+    "$FILES_SNAPSHOT" \
+    "$DB_SNAPSHOT" \
+    "$PORTABLE_SET" \
+    >> "$TEST_INVOCATION_LOG"
+
+if [[ "${FAIL_APPLICATION:-}" == "$APP_ID" ]]; then
+    echo "ERROR: injected validation failure: $APP_ID" >&2
+    exit 42
+fi
+
+{
+    echo "RESULT=PASS"
+    echo "APPLICATION=$APP_ID"
+    echo "REPOSITORY=$REPO_ID"
+    echo "PORTABLE_TARGET=$PORTABLE_ID"
+    echo "RESTIC_GENERATION=$GENERATION"
+    echo "FILES_SNAPSHOT=$FILES_SNAPSHOT"
+
+    if [[ -n "$DB_SNAPSHOT" ]]; then
+        echo "DB_SNAPSHOT=$DB_SNAPSHOT"
+    fi
+
+    echo "PORTABLE_SET=$PORTABLE_SET"
+} > "$RESULT_FILE"
+
+chmod 0600 "$RESULT_FILE"
+
+echo "PASS: mock application recovery validation: $APP_ID"
+EOF_APP_VALIDATOR
+
+chmod +x "$RUNTIME_ROOT/validate-application-recovery"
+
+FILES_ONE="1111111111111111111111111111111111111111111111111111111111111111"
+DB_ONE="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+FILES_TWO="2222222222222222222222222222222222222222222222222222222222222222"
+
+cat > "$TMP/pass.json" <<EOF_JSON
+{
+  "schema_version": 1,
+  "group": "test-group",
+  "group_generation": "20260821T210000Z-12345",
+  "consistency": "coordinated-non-atomic",
+  "result": "PASS",
+  "members": [
+    {
+      "application": "app-one",
+      "repository": "app-one-operational",
+      "portable_target": "app-one",
+      "result": "PASS",
+      "restic_generation": "gen-one",
+      "db_snapshot": "$DB_ONE",
+      "files_snapshot": "$FILES_ONE",
+      "portable_set": "/backup/app-one/set-one"
+    },
+    {
+      "application": "app-two",
+      "repository": "app-two-operational",
+      "portable_target": "app-two",
+      "result": "PASS",
+      "restic_generation": "gen-two",
+      "db_snapshot": null,
+      "files_snapshot": "$FILES_TWO",
+      "portable_set": "/backup/app-two/set-two"
+    }
+  ]
+}
+EOF_JSON
+
+run_group() {
+    sudo env \
+        "DOCKER_BACKUP_CONFIG_ROOT=$CONFIG_ROOT" \
+        "DOCKER_BACKUP_ENGINE_ROOT=$RUNTIME_ROOT" \
+        "TEST_INVOCATION_LOG=$LOG" \
+        "FAIL_APPLICATION=${FAIL_APPLICATION:-}" \
+        "$ENGINE" "$@"
+}
+
+echo "=== successful reverse-order group validation ==="
+
+: > "$LOG"
+
+run_group \
+    "$TMP/pass.json" \
+    --result-file "$RESULT_FILE"
+
+EXPECTED_ORDER="$(
+    cat <<EOF_EXPECTED
+app-two|app-two-operational|app-two|gen-two|$FILES_TWO||/backup/app-two/set-two
+app-one|app-one-operational|app-one|gen-one|$FILES_ONE|$DB_ONE|/backup/app-one/set-one
+EOF_EXPECTED
+)"
+
+ACTUAL_ORDER="$(cat "$LOG")"
+
+if [[ "$ACTUAL_ORDER" != "$EXPECTED_ORDER" ]]; then
+    echo "ERROR: recovery validation order/coordinates differ" >&2
+    echo "Expected:" >&2
+    printf '%s\n' "$EXPECTED_ORDER" >&2
+    echo "Actual:" >&2
+    printf '%s\n' "$ACTUAL_ORDER" >&2
+    exit 1
+fi
+
+echo "PASS: reverse manifest order and immutable coordinates preserved"
+
+RESULT_CONTENTS="$(sudo cat "$RESULT_FILE")"
+
+sudo cat "$RESULT_FILE" |
+python3 -c '
+import json
+import sys
+
+d = json.load(sys.stdin)
+
+assert d["schema_version"] == 1
+assert d["group"] == "test-group"
+assert d["group_generation"] == "20260821T210000Z-12345"
+assert d["result"] == "PASS"
+assert d["validation_order"] == "reverse-manifest"
+
+assert [m["application"] for m in d["members"]] == [
+    "app-two",
+    "app-one",
+]
+'
+
+grep -F '"result": "PASS"' <<<"$RESULT_CONTENTS"
+
+echo "PASS: group recovery result records reverse validation order"
+
+echo
+echo "=== current group configuration is irrelevant ==="
+
+mkdir -p "$CONFIG_ROOT/groups"
+
+cat > "$CONFIG_ROOT/groups/test-group.conf" <<'EOF_GROUP'
+GROUP_NAME="test-group"
+GROUP_MEMBERS=(
+    "wrong-app|wrong-repo|wrong-portable"
+)
+EOF_GROUP
+
+: > "$LOG"
+
+run_group "$TMP/pass.json" >/dev/null
+
+grep -Fx \
+    "app-two|app-two-operational|app-two|gen-two|$FILES_TWO||/backup/app-two/set-two" \
+    "$LOG"
+
+grep -Fx \
+    "app-one|app-one-operational|app-one|gen-one|$FILES_ONE|$DB_ONE|/backup/app-one/set-one" \
+    "$LOG"
+
+echo "PASS: current group configuration not consulted"
+
+echo
+echo "=== first reverse-order failure stops later members ==="
+
+: > "$LOG"
+
+if FAIL_APPLICATION=app-two \
+   run_group \
+       "$TMP/pass.json" \
+       > "$TMP/failure.log" 2>&1
+then
+    echo "ERROR: injected member failure was accepted" >&2
+    exit 1
+fi
+
+LINES="$(wc -l < "$LOG")"
+
+[[ "$LINES" -eq 1 ]] || {
+    echo "ERROR: validation continued after member failure" >&2
+    cat "$LOG" >&2
+    exit 1
+}
+
+grep -F 'app-two|' "$LOG"
+
+if grep -Fq 'app-one|' "$LOG"; then
+    echo "ERROR: app-one ran after app-two failure" >&2
+    exit 1
+fi
+
+echo "PASS: reverse-order member failure is fail-fast"
+
+echo
+echo "=== failed group manifest rejected before member validation ==="
+
+python3 - "$TMP/pass.json" "$TMP/fail.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    d = json.load(f)
+
+d["result"] = "FAIL"
+
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    json.dump(d, f)
+PY
+
+: > "$LOG"
+
+if run_group \
+       "$TMP/fail.json" \
+       > "$TMP/fail-manifest.log" 2>&1
+then
+    echo "ERROR: FAIL group manifest was accepted" >&2
+    exit 1
+fi
+
+[[ ! -s "$LOG" ]] || {
+    echo "ERROR: application validator ran for FAIL manifest" >&2
+    cat "$LOG" >&2
+    exit 1
+}
+
+grep -F \
+    'manifest is not a complete PASS recovery point' \
+    "$TMP/fail-manifest.log"
+
+echo "PASS: FAIL manifest rejected before member validation"
+
+echo
+echo "PASS: validate-group-recovery regression suite"

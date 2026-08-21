@@ -10,8 +10,8 @@ Usage: install [--preserve-config]
 Options:
   --preserve-config
       Install framework engines and systemd templates while preserving the
-      existing /etc/docker-backup application, repository, portable, and
-      secrets configuration. Timers are regenerated from the retained
+      existing /etc/docker-backup application, repository, portable, group,
+      and secrets configuration. Timers are regenerated from the retained
       production configuration.
 
 Without --preserve-config, configuration files included in the source tree
@@ -48,6 +48,7 @@ ENGINE_DEST="/usr/local/lib/docker-backup"
 APP_DEST="/etc/docker-backup/apps"
 REPO_DEST="/etc/docker-backup/repos"
 PORTABLE_DEST="/etc/docker-backup/portable"
+GROUP_DEST="/etc/docker-backup/groups"
 VERSION_DEST="/etc/docker-backup/DEPLOYED_VERSION"
 
 echo "===== INSTALL DOCKER BACKUP FRAMEWORK ====="
@@ -76,8 +77,15 @@ for file in \
     "$SOURCE_ROOT/src/maintain-repository" \
     "$SOURCE_ROOT/src/portable-backup" \
     "$SOURCE_ROOT/src/portable-retention" \
+    "$SOURCE_ROOT/src/backup-group" \
+    "$SOURCE_ROOT/src/validate-application-recovery" \
+    "$SOURCE_ROOT/src/validate-group-recovery" \
+    "$SOURCE_ROOT/src/restore-application" \
+    "$SOURCE_ROOT/src/restore-group" \
     "$SOURCE_ROOT/scripts/acceptance-test" \
-    "$SOURCE_ROOT/scripts/resolve-snapshot"
+    "$SOURCE_ROOT/scripts/resolve-snapshot" \
+    "$SOURCE_ROOT/scripts/validate-group" \
+    "$SOURCE_ROOT/scripts/validate-group-manifest"
 do
     if [ ! -f "$file" ]; then
         echo "ERROR: missing source file: $file" >&2
@@ -90,14 +98,22 @@ bash -n "$SOURCE_ROOT/src/retention-repository"
 bash -n "$SOURCE_ROOT/src/maintain-repository"
 bash -n "$SOURCE_ROOT/src/portable-backup"
 bash -n "$SOURCE_ROOT/src/portable-retention"
+bash -n "$SOURCE_ROOT/src/backup-group"
+bash -n "$SOURCE_ROOT/src/validate-application-recovery"
+bash -n "$SOURCE_ROOT/src/validate-group-recovery"
+bash -n "$SOURCE_ROOT/src/restore-application"
+bash -n "$SOURCE_ROOT/src/restore-group"
 bash -n "$SOURCE_ROOT/scripts/acceptance-test"
 bash -n "$SOURCE_ROOT/scripts/resolve-snapshot"
+bash -n "$SOURCE_ROOT/scripts/validate-group"
+bash -n "$SOURCE_ROOT/scripts/validate-group-manifest"
 
 if [ "$PRESERVE_CONFIG" = false ]; then
     for config_dir in \
         "$SOURCE_ROOT/config/apps" \
         "$SOURCE_ROOT/config/repos" \
-        "$SOURCE_ROOT/config/portable"
+        "$SOURCE_ROOT/config/portable" \
+        "$SOURCE_ROOT/config/groups"
     do
         if [ ! -d "$config_dir" ]; then
             echo "ERROR: missing configuration directory: $config_dir" >&2
@@ -136,7 +152,8 @@ install -d -o root -g root -m 0750 \
     "$ENGINE_DEST" \
     "$APP_DEST" \
     "$REPO_DEST" \
-    "$PORTABLE_DEST"
+    "$PORTABLE_DEST" \
+    "$GROUP_DEST"
 
 # Do not recreate or modify existing secrets.
 if [ ! -d /etc/docker-backup/secrets ]; then
@@ -168,12 +185,40 @@ install -o root -g root -m 0750 \
     "$ENGINE_DEST/portable-retention"
 
 install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/src/backup-group" \
+    "$ENGINE_DEST/backup-group"
+
+install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/src/validate-application-recovery" \
+    "$ENGINE_DEST/validate-application-recovery"
+
+install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/src/validate-group-recovery" \
+    "$ENGINE_DEST/validate-group-recovery"
+
+install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/src/restore-application" \
+    "$ENGINE_DEST/restore-application"
+
+install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/src/restore-group" \
+    "$ENGINE_DEST/restore-group"
+
+install -o root -g root -m 0750 \
     "$SOURCE_ROOT/scripts/acceptance-test" \
     "$ENGINE_DEST/acceptance-test"
 
 install -o root -g root -m 0750 \
     "$SOURCE_ROOT/scripts/resolve-snapshot" \
     "$ENGINE_DEST/resolve-snapshot"
+
+install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/scripts/validate-group" \
+    "$ENGINE_DEST/validate-group"
+
+install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/scripts/validate-group-manifest" \
+    "$ENGINE_DEST/validate-group-manifest"
 
 echo
 echo "===== INSTALL CONFIGURATION ====="
@@ -197,6 +242,12 @@ else
         install -o root -g root -m 0640 \
             "$config" \
             "$PORTABLE_DEST/$(basename "$config")"
+    done
+
+    for config in "$SOURCE_ROOT"/config/groups/*.conf; do
+        install -o root -g root -m 0640 \
+            "$config" \
+            "$GROUP_DEST/$(basename "$config")"
     done
 fi
 
@@ -250,11 +301,32 @@ cmp "$SOURCE_ROOT/src/portable-backup" \
 cmp "$SOURCE_ROOT/src/portable-retention" \
     "$ENGINE_DEST/portable-retention"
 
+cmp "$SOURCE_ROOT/src/backup-group" \
+    "$ENGINE_DEST/backup-group"
+
+cmp "$SOURCE_ROOT/src/validate-application-recovery" \
+    "$ENGINE_DEST/validate-application-recovery"
+
+cmp "$SOURCE_ROOT/src/validate-group-recovery" \
+    "$ENGINE_DEST/validate-group-recovery"
+
+cmp "$SOURCE_ROOT/src/restore-application" \
+    "$ENGINE_DEST/restore-application"
+
+cmp "$SOURCE_ROOT/src/restore-group" \
+    "$ENGINE_DEST/restore-group"
+
 cmp "$SOURCE_ROOT/scripts/acceptance-test" \
     "$ENGINE_DEST/acceptance-test"
 
 cmp "$SOURCE_ROOT/scripts/resolve-snapshot" \
     "$ENGINE_DEST/resolve-snapshot"
+
+cmp "$SOURCE_ROOT/scripts/validate-group" \
+    "$ENGINE_DEST/validate-group"
+
+cmp "$SOURCE_ROOT/scripts/validate-group-manifest" \
+    "$ENGINE_DEST/validate-group-manifest"
 
 if [ "$PRESERVE_CONFIG" = false ]; then
     for config in "$SOURCE_ROOT"/config/apps/*.conf; do
@@ -269,6 +341,10 @@ if [ "$PRESERVE_CONFIG" = false ]; then
         cmp "$config" "$PORTABLE_DEST/$(basename "$config")"
     done
 
+    for config in "$SOURCE_ROOT"/config/groups/*.conf; do
+        cmp "$config" "$GROUP_DEST/$(basename "$config")"
+    done
+
     echo "PASS: installed files and configuration match source"
 else
     echo "PASS: installed engines match source; production configuration preserved"
@@ -281,7 +357,8 @@ if grep -RqsF "$SOURCE_ROOT" \
     "$ENGINE_DEST" \
     "$APP_DEST" \
     "$REPO_DEST" \
-    "$PORTABLE_DEST"; then
+    "$PORTABLE_DEST" \
+    "$GROUP_DEST"; then
     echo "ERROR: installed runtime references source checkout" >&2
     exit 1
 fi

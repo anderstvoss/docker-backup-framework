@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+CONFIG_ROOT="$TMP/etc/docker-backup"
+ENGINE_ROOT="$TMP/engines"
+GROUP_ROOT="$TMP/groups"
+LOG="$TMP/execution.log"
+
+mkdir -p \
+    "$CONFIG_ROOT/apps" \
+    "$CONFIG_ROOT/repos" \
+    "$CONFIG_ROOT/portable" \
+    "$CONFIG_ROOT/groups" \
+    "$ENGINE_ROOT" \
+    "$GROUP_ROOT"
+
+for app in app-one app-two; do
+    cat > "$CONFIG_ROOT/apps/${app}.conf" <<EOF_APP
+APP_NAME="${app}"
+EOF_APP
+done
+
+cat > "$CONFIG_ROOT/repos/app-one-operational.conf" <<'EOF_REPO'
+REPO_NAME="app-one-operational"
+APP_NAME="app-one"
+EOF_REPO
+
+cat > "$CONFIG_ROOT/repos/app-two-operational.conf" <<'EOF_REPO'
+REPO_NAME="app-two-operational"
+APP_NAME="app-two"
+EOF_REPO
+
+cat > "$CONFIG_ROOT/portable/app-one.conf" <<'EOF_PORTABLE'
+PORTABLE_NAME="app-one"
+APP_NAME="app-one"
+EOF_PORTABLE
+
+cat > "$CONFIG_ROOT/portable/app-two.conf" <<'EOF_PORTABLE'
+PORTABLE_NAME="app-two"
+APP_NAME="app-two"
+EOF_PORTABLE
+
+cat > "$CONFIG_ROOT/groups/test-group.conf" <<'EOF_GROUP'
+GROUP_NAME="test-group"
+GROUP_MEMBERS=(
+    "app-one|app-one-operational|app-one"
+    "app-two|app-two-operational|app-two"
+)
+EOF_GROUP
+
+cp "$ROOT/scripts/validate-group" "$ENGINE_ROOT/validate-group"
+cp "$ROOT/src/backup-group" "$ENGINE_ROOT/backup-group"
+
+cat > "$ENGINE_ROOT/backup-repository" <<'EOF_REPO_BACKUP'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+config="$1"
+shift
+
+result_file=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --result-file)
+            shift
+            result_file="$1"
+            ;;
+        *)
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+# shellcheck disable=SC1090
+source "$config"
+
+printf 'repo:%s\n' "$APP_NAME" >> "${GROUP_TEST_LOG:?}"
+
+case "$APP_NAME" in
+    app-one)
+        generation="generation-one"
+        db_snapshot="1111111111111111111111111111111111111111111111111111111111111111"
+        files_snapshot="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ;;
+    app-two)
+        generation="generation-two"
+        db_snapshot="2222222222222222222222222222222222222222222222222222222222222222"
+        files_snapshot="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+
+mkdir -p "$(dirname "$result_file")"
+
+cat > "$result_file" <<EOF_RESULT
+RESULT=PASS
+APPLICATION=$APP_NAME
+REPOSITORY=$REPO_NAME
+RESTIC_GENERATION=$generation
+DB_SNAPSHOT=$db_snapshot
+FILES_SNAPSHOT=$files_snapshot
+EOF_RESULT
+EOF_REPO_BACKUP
+
+cat > "$ENGINE_ROOT/portable-backup" <<'EOF_PORTABLE_BACKUP'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+config="$1"
+shift
+
+result_file=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --result-file)
+            shift
+            result_file="$1"
+            ;;
+        *)
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+# shellcheck disable=SC1090
+source "$config"
+
+printf 'portable:%s\n' "$APP_NAME" >> "${GROUP_TEST_LOG:?}"
+
+if [[ "${GROUP_TEST_FAIL_APP:-}" == "$APP_NAME" ]]; then
+    echo "intentional portable failure: $APP_NAME" >&2
+    exit 42
+fi
+
+mkdir -p "$(dirname "$result_file")"
+
+cat > "$result_file" <<EOF_RESULT
+RESULT=PASS
+APPLICATION=$APP_NAME
+PORTABLE_TARGET=$PORTABLE_NAME
+PORTABLE_SET=/mock/storage/$APP_NAME/recovery-set
+EOF_RESULT
+EOF_PORTABLE_BACKUP
+
+chmod +x \
+    "$ENGINE_ROOT/validate-group" \
+    "$ENGINE_ROOT/backup-group" \
+    "$ENGINE_ROOT/backup-repository" \
+    "$ENGINE_ROOT/portable-backup"
+
+assert_manifest_pass() {
+    local manifest="$1"
+
+    python3 - "$manifest" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    d = json.load(f)
+
+assert d["schema_version"] == 1
+assert d["group"] == "test-group"
+assert d["consistency"] == "coordinated-non-atomic"
+assert d["result"] == "PASS"
+assert len(d["members"]) == 2
+
+one, two = d["members"]
+
+assert one == {
+    "application": "app-one",
+    "repository": "app-one-operational",
+    "portable_target": "app-one",
+    "result": "PASS",
+    "restic_generation": "generation-one",
+    "db_snapshot": "1111111111111111111111111111111111111111111111111111111111111111",
+    "files_snapshot": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "portable_set": "/mock/storage/app-one/recovery-set",
+}
+
+assert two == {
+    "application": "app-two",
+    "repository": "app-two-operational",
+    "portable_target": "app-two",
+    "result": "PASS",
+    "restic_generation": "generation-two",
+    "db_snapshot": "2222222222222222222222222222222222222222222222222222222222222222",
+    "files_snapshot": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "portable_set": "/mock/storage/app-two/recovery-set",
+}
+
+assert "failure" not in d
+PY
+}
+
+assert_manifest_fail() {
+    local manifest="$1"
+
+    python3 - "$manifest" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    d = json.load(f)
+
+assert d["schema_version"] == 1
+assert d["group"] == "test-group"
+assert d["result"] == "FAIL"
+
+# app-one completed and remains represented as a valid independent backup.
+assert len(d["members"]) == 1
+
+one = d["members"][0]
+
+assert one["application"] == "app-one"
+assert one["result"] == "PASS"
+assert one["restic_generation"] == "generation-one"
+assert one["portable_set"] == "/mock/storage/app-one/recovery-set"
+
+assert d["failure"] == {
+    "application": "app-two",
+    "stage": "portable-backup",
+}
+PY
+}
+
+echo "=== successful two-application group ==="
+
+: > "$LOG"
+
+GROUP_TEST_LOG="$LOG" \
+DOCKER_BACKUP_CONFIG_ROOT="$CONFIG_ROOT" \
+DOCKER_BACKUP_ENGINE_ROOT="$ENGINE_ROOT" \
+DOCKER_BACKUP_GROUP_ROOT="$GROUP_ROOT" \
+    "$ENGINE_ROOT/backup-group" \
+    "$CONFIG_ROOT/groups/test-group.conf"
+
+cat > "$TMP/expected-success-order" <<'EOF_ORDER'
+repo:app-one
+portable:app-one
+repo:app-two
+portable:app-two
+EOF_ORDER
+
+cmp "$TMP/expected-success-order" "$LOG"
+
+mapfile -t pass_manifests < <(
+    find "$GROUP_ROOT/test-group" \
+        -maxdepth 1 \
+        -type f \
+        -name '*.json' \
+        -print
+)
+
+[[ "${#pass_manifests[@]}" -eq 1 ]]
+
+assert_manifest_pass "${pass_manifests[0]}"
+
+echo "PASS: successful group manifest and ordering"
+
+echo
+echo "=== second-member failure ==="
+
+rm -rf "$GROUP_ROOT/test-group"
+: > "$LOG"
+
+set +e
+GROUP_TEST_LOG="$LOG" \
+GROUP_TEST_FAIL_APP="app-two" \
+DOCKER_BACKUP_CONFIG_ROOT="$CONFIG_ROOT" \
+DOCKER_BACKUP_ENGINE_ROOT="$ENGINE_ROOT" \
+DOCKER_BACKUP_GROUP_ROOT="$GROUP_ROOT" \
+    "$ENGINE_ROOT/backup-group" \
+    "$CONFIG_ROOT/groups/test-group.conf"
+rc=$?
+set -e
+
+[[ "$rc" -eq 42 ]]
+
+cat > "$TMP/expected-failure-order" <<'EOF_ORDER'
+repo:app-one
+portable:app-one
+repo:app-two
+portable:app-two
+EOF_ORDER
+
+cmp "$TMP/expected-failure-order" "$LOG"
+
+mapfile -t fail_manifests < <(
+    find "$GROUP_ROOT/test-group" \
+        -maxdepth 1 \
+        -type f \
+        -name '*.json' \
+        -print
+)
+
+[[ "${#fail_manifests[@]}" -eq 1 ]]
+
+assert_manifest_fail "${fail_manifests[0]}"
+
+echo "PASS: failed group preserves completed member and records failure"
+
+echo
+echo "PASS: backup-group regression suite"

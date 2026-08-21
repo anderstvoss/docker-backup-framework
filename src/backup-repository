@@ -1,12 +1,31 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 <repository-config>" >&2
+RESULT_FILE=""
+
+usage() {
+    echo "Usage: $0 <repository-config> [--result-file <path>]" >&2
     exit 2
-fi
+}
+
+[[ $# -ge 1 ]] || usage
 
 REPO_CONFIG="$1"
+shift
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --result-file)
+            shift
+            [[ "$#" -gt 0 ]] || usage
+            RESULT_FILE="$1"
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
 
 if [ ! -f "$REPO_CONFIG" ]; then
     echo "ERROR: repository config not found: $REPO_CONFIG" >&2
@@ -189,14 +208,30 @@ snapshot_id_for_component() {
 
 complete_component() {
     component="$1"
-    snapshot_id="$(snapshot_id_for_component "$component")"
+    building_snapshot_id="$(snapshot_id_for_component "$component")"
 
     restic tag \
         --remove "state:building" \
         --add "state:complete" \
-        "$snapshot_id" >/dev/null
+        "$building_snapshot_id" >/dev/null
 
-    echo "PASS: $component component complete ($snapshot_id)"
+    mapfile -t complete_ids < <(
+        snapshot_ids_matching_tags \
+            "app:${APP_NAME}" \
+            "repo:${REPO_NAME#"${APP_NAME}"-}" \
+            "generation:${GENERATION}" \
+            "component:${component}" \
+            "state:complete"
+    )
+
+    if [ "${#complete_ids[@]}" -ne 1 ]; then
+        echo \
+            "ERROR: expected exactly one completed ${component} snapshot for generation ${GENERATION}; found ${#complete_ids[@]}" \
+            >&2
+        return 1
+    fi
+
+    printf '%s\n' "${complete_ids[0]}"
 }
 
 echo "===== APPLICATION BACKUP ====="
@@ -313,13 +348,39 @@ echo
 echo "===== FINALIZE GENERATION ====="
 
 if [ "$DB_TYPE" != "none" ]; then
-    complete_component db
+    DB_COMPLETE_ID="$(complete_component db)"
+    echo "PASS: db component complete ($DB_COMPLETE_ID)"
 fi
 
-complete_component files
+FILES_COMPLETE_ID="$(complete_component files)"
+echo "PASS: files component complete ($FILES_COMPLETE_ID)"
 
 trap - EXIT
 
 echo
 echo "PASS: generation completed"
 echo "Generation: $GENERATION"
+
+if [ "$DB_TYPE" != "none" ]; then
+    echo "DB snapshot: $DB_COMPLETE_ID"
+fi
+
+echo "Files snapshot: $FILES_COMPLETE_ID"
+
+if [ -n "$RESULT_FILE" ]; then
+    umask 077
+    mkdir -p "$(dirname "$RESULT_FILE")"
+
+    {
+        echo "RESULT=PASS"
+        echo "APPLICATION=$APP_NAME"
+        echo "REPOSITORY=$REPO_NAME"
+        echo "RESTIC_GENERATION=$GENERATION"
+
+        if [ "$DB_TYPE" != "none" ]; then
+            echo "DB_SNAPSHOT=$DB_COMPLETE_ID"
+        fi
+
+        echo "FILES_SNAPSHOT=$FILES_COMPLETE_ID"
+    } > "$RESULT_FILE"
+fi

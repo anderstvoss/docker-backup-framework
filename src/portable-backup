@@ -1,12 +1,31 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 <portable-config>" >&2
+RESULT_FILE=""
+
+usage() {
+    echo "Usage: $0 <portable-config> [--result-file <path>]" >&2
     exit 2
-fi
+}
+
+[[ $# -ge 1 ]] || usage
 
 PORTABLE_CONFIG="$1"
+shift
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --result-file)
+            shift
+            [[ "$#" -gt 0 ]] || usage
+            RESULT_FILE="$1"
+            ;;
+        *)
+            usage
+            ;;
+    esac
+    shift
+done
 
 if [ ! -f "$PORTABLE_CONFIG" ]; then
     echo "ERROR: portable config not found: $PORTABLE_CONFIG" >&2
@@ -280,3 +299,15 @@ echo
 echo "===== RECOVERY SET CONTENTS ====="
 
 ls -lhn "$FINAL_DIR"
+
+if [ -n "$RESULT_FILE" ]; then
+    umask 077
+    mkdir -p "$(dirname "$RESULT_FILE")"
+
+    {
+        echo "RESULT=PASS"
+        echo "APPLICATION=$APP_NAME"
+        echo "PORTABLE_TARGET=$PORTABLE_NAME"
+        echo "PORTABLE_SET=$FINAL_DIR"
+    } > "$RESULT_FILE"
+fi

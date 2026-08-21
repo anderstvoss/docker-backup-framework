@@ -1,0 +1,723 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+    cat >&2 <<'HELP'
+Usage:
+  validate-application-recovery \
+    <application-config> \
+    <repository-config> \
+    <portable-config> \
+    --generation <generation> \
+    --files-snapshot <immutable-id> \
+    [--db-snapshot <immutable-id>] \
+    --portable-set <absolute-path> \
+    [--result-file <path>]
+
+Performs non-destructive validation of an explicitly selected application
+recovery point.
+
+The command never selects "latest" and never modifies production data.
+HELP
+    exit 2
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+[[ "$EUID" -eq 0 ]] ||
+    die "recovery validation must run as root"
+
+[[ $# -ge 3 ]] || usage
+
+APP_CONFIG="$1"
+REPO_CONFIG="$2"
+PORTABLE_CONFIG="$3"
+shift 3
+
+GENERATION=""
+FILES_SNAPSHOT=""
+DB_SNAPSHOT=""
+PORTABLE_SET=""
+RESULT_FILE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --generation)
+            shift
+            [[ $# -gt 0 ]] || usage
+            GENERATION="$1"
+            ;;
+        --files-snapshot)
+            shift
+            [[ $# -gt 0 ]] || usage
+            FILES_SNAPSHOT="$1"
+            ;;
+        --db-snapshot)
+            shift
+            [[ $# -gt 0 ]] || usage
+            DB_SNAPSHOT="$1"
+            ;;
+        --portable-set)
+            shift
+            [[ $# -gt 0 ]] || usage
+            PORTABLE_SET="$1"
+            ;;
+        --result-file)
+            shift
+            [[ $# -gt 0 ]] || usage
+            RESULT_FILE="$1"
+            ;;
+        *)
+            usage
+            ;;
+    esac
+
+    shift
+done
+
+for file in \
+    "$APP_CONFIG" \
+    "$REPO_CONFIG" \
+    "$PORTABLE_CONFIG"
+do
+    [[ -f "$file" ]] ||
+        die "configuration file not found: $file"
+done
+
+[[ -n "$GENERATION" ]] ||
+    die "--generation is required"
+
+[[ -n "$FILES_SNAPSHOT" ]] ||
+    die "--files-snapshot is required"
+
+[[ -n "$PORTABLE_SET" ]] ||
+    die "--portable-set is required"
+
+[[ "$FILES_SNAPSHOT" =~ ^[0-9a-f]{64}$ ]] ||
+    die "invalid files snapshot ID"
+
+if [[ -n "$DB_SNAPSHOT" ]]; then
+    [[ "$DB_SNAPSHOT" =~ ^[0-9a-f]{64}$ ]] ||
+        die "invalid database snapshot ID"
+fi
+
+[[ "$PORTABLE_SET" = /* ]] ||
+    die "portable recovery-set path must be absolute"
+
+# Repository configuration.
+# shellcheck disable=SC1090
+source "$REPO_CONFIG"
+
+REPO_APP_NAME="${APP_NAME:-}"
+REPO_ID="${REPO_NAME:-}"
+REPO_PATH="${REPOSITORY:-}"
+REPO_PASSWORD_FILE="${PASSWORD_FILE:-}"
+REPO_STORAGE_TYPE="${STORAGE_TYPE:-}"
+REPO_STORAGE_MOUNT="${STORAGE_MOUNT:-}"
+REPO_EXPECTED_SOURCE="${EXPECTED_SOURCE:-}"
+
+[[ -n "$REPO_APP_NAME" ]] ||
+    die "repository config missing APP_NAME"
+
+[[ -n "$REPO_ID" ]] ||
+    die "repository config missing REPO_NAME"
+
+[[ -n "$REPO_PATH" ]] ||
+    die "repository config missing REPOSITORY"
+
+[[ -n "$REPO_PASSWORD_FILE" ]] ||
+    die "repository config missing PASSWORD_FILE"
+
+[[ -n "$REPO_STORAGE_TYPE" ]] ||
+    die "repository config missing STORAGE_TYPE"
+
+# Portable configuration.
+# shellcheck disable=SC1090
+source "$PORTABLE_CONFIG"
+
+PORTABLE_APP_NAME="${APP_NAME:-}"
+PORTABLE_ID="${PORTABLE_NAME:-}"
+PORTABLE_ROOT="${BACKUP_ROOT:-}"
+PORTABLE_STORAGE_TYPE="${STORAGE_TYPE:-}"
+PORTABLE_STORAGE_MOUNT="${STORAGE_MOUNT:-}"
+PORTABLE_EXPECTED_SOURCE="${EXPECTED_SOURCE:-}"
+
+[[ -n "$PORTABLE_APP_NAME" ]] ||
+    die "portable config missing APP_NAME"
+
+[[ -n "$PORTABLE_ID" ]] ||
+    die "portable config missing PORTABLE_NAME"
+
+[[ -n "$PORTABLE_ROOT" ]] ||
+    die "portable config missing BACKUP_ROOT"
+
+[[ -n "$PORTABLE_STORAGE_TYPE" ]] ||
+    die "portable config missing STORAGE_TYPE"
+
+# Application configuration.
+# shellcheck disable=SC1090
+source "$APP_CONFIG"
+
+APP_ID="${APP_NAME:-}"
+
+[[ -n "$APP_ID" ]] ||
+    die "application config missing APP_NAME"
+
+[[ "$REPO_APP_NAME" == "$APP_ID" ]] ||
+    die "repository/application identity mismatch"
+
+[[ "$PORTABLE_APP_NAME" == "$APP_ID" ]] ||
+    die "portable/application identity mismatch"
+
+: "${COMPOSE_DIR:?Missing COMPOSE_DIR}"
+: "${DB_TYPE:?Missing DB_TYPE}"
+: "${DB_BACKUP_MODE:?Missing DB_BACKUP_MODE}"
+
+declare -p BACKUP_PATHS >/dev/null 2>&1 ||
+    die "BACKUP_PATHS is not defined"
+
+[[ ${#BACKUP_PATHS[@]} -gt 0 ]] ||
+    die "BACKUP_PATHS is empty"
+
+case "${DB_TYPE}:${DB_BACKUP_MODE}" in
+    none:none)
+        [[ -z "$DB_SNAPSHOT" ]] ||
+            die "database snapshot supplied for DB_TYPE=none"
+        ;;
+    mariadb:logical)
+        [[ -n "$DB_SNAPSHOT" ]] ||
+            die "--db-snapshot is required for mariadb:logical"
+        : "${DB_CONTAINER:?Missing DB_CONTAINER}"
+        ;;
+    *)
+        die "unsupported database mode: ${DB_TYPE}:${DB_BACKUP_MODE}"
+        ;;
+esac
+
+[[ -r "$REPO_PASSWORD_FILE" ]] ||
+    die "Restic password file is not readable: $REPO_PASSWORD_FILE"
+
+[[ -d "$REPO_PATH" ]] ||
+    die "Restic repository does not exist: $REPO_PATH"
+
+verify_storage() {
+    local label="$1"
+    local storage_type="$2"
+    local storage_mount="$3"
+    local expected_source="$4"
+
+    case "$storage_type" in
+        local)
+            ;;
+
+        nfs)
+            [[ -n "$storage_mount" ]] ||
+                die "$label STORAGE_MOUNT is required"
+
+            [[ -n "$expected_source" ]] ||
+                die "$label EXPECTED_SOURCE is required"
+
+            ls "$storage_mount" >/dev/null
+
+            local detected_type=""
+            local detected_source=""
+
+            while read -r candidate_type candidate_source; do
+                case "$candidate_type" in
+                    nfs|nfs4)
+                        detected_type="$candidate_type"
+                        detected_source="$candidate_source"
+                        break
+                        ;;
+                esac
+            done < <(
+                findmnt -T "$storage_mount" \
+                    --noheadings \
+                    --raw \
+                    --output FSTYPE,SOURCE
+            )
+
+            [[ -n "$detected_type" ]] ||
+                die "$label is not backed by NFS"
+
+            [[ "$detected_source" == "$expected_source" ]] ||
+                die "$label NFS source mismatch"
+            ;;
+
+        *)
+            die "$label has unsupported STORAGE_TYPE: $storage_type"
+            ;;
+    esac
+}
+
+echo "===== APPLICATION RECOVERY VALIDATION ====="
+echo "Application:       $APP_ID"
+echo "Repository:        $REPO_ID"
+echo "Portable target:   $PORTABLE_ID"
+echo "Restic generation: $GENERATION"
+echo "Files snapshot:    $FILES_SNAPSHOT"
+
+if [[ -n "$DB_SNAPSHOT" ]]; then
+    echo "DB snapshot:       $DB_SNAPSHOT"
+fi
+
+echo "Portable set:      $PORTABLE_SET"
+
+echo
+echo "===== VERIFY STORAGE ====="
+
+verify_storage \
+    "repository storage" \
+    "$REPO_STORAGE_TYPE" \
+    "$REPO_STORAGE_MOUNT" \
+    "$REPO_EXPECTED_SOURCE"
+
+verify_storage \
+    "portable storage" \
+    "$PORTABLE_STORAGE_TYPE" \
+    "$PORTABLE_STORAGE_MOUNT" \
+    "$PORTABLE_EXPECTED_SOURCE"
+
+echo "PASS: configured storage verified"
+
+PORTABLE_ROOT_REAL="$(realpath -e "$PORTABLE_ROOT")"
+PORTABLE_SET_REAL="$(realpath -e "$PORTABLE_SET")"
+
+[[ -d "$PORTABLE_SET_REAL" ]] ||
+    die "portable recovery set is not a directory"
+
+case "$PORTABLE_SET_REAL/" in
+    "$PORTABLE_ROOT_REAL"/*)
+        ;;
+    *)
+        die "portable recovery set is outside configured BACKUP_ROOT"
+        ;;
+esac
+
+case "$(basename "$PORTABLE_SET_REAL")" in
+    .incomplete-*)
+        die "incomplete portable recovery set cannot be validated"
+        ;;
+esac
+
+LOCK_ROOT="${DOCKER_BACKUP_LOCK_ROOT:-/run/lock}"
+
+mkdir -p "$LOCK_ROOT"
+
+REPO_LOCK_FILE="${LOCK_ROOT}/docker-backup-${REPO_ID}.lock"
+PORTABLE_LOCK_FILE="${LOCK_ROOT}/docker-portable-${PORTABLE_ID}.lock"
+
+exec 8>"$REPO_LOCK_FILE"
+
+flock -n 8 ||
+    die "repository operation already running for $REPO_ID"
+
+exec 9>"$PORTABLE_LOCK_FILE"
+
+flock -n 9 ||
+    die "portable backup/retention already running for $PORTABLE_ID"
+
+export RESTIC_REPOSITORY="$REPO_PATH"
+export RESTIC_PASSWORD_FILE="$REPO_PASSWORD_FILE"
+
+echo
+echo "===== VERIFY RESTIC REPOSITORY ====="
+
+RESTIC_JSON="$(restic snapshots --json)"
+
+echo "PASS: Restic repository opened"
+
+REPO_TAG="${REPO_ID#"${APP_ID}"-}"
+
+verify_snapshot() {
+    local snapshot_id="$1"
+    local component="$2"
+
+    printf '%s\n' "$RESTIC_JSON" |
+        python3 -c '
+import json
+import sys
+
+snapshot_id = sys.argv[1]
+required = set(sys.argv[2:])
+
+snapshots = json.load(sys.stdin)
+
+matches = [
+    snapshot
+    for snapshot in snapshots
+    if snapshot.get("id") == snapshot_id
+]
+
+if len(matches) != 1:
+    raise SystemExit(
+        f"expected immutable snapshot {snapshot_id}; "
+        f"found {len(matches)} matching IDs"
+    )
+
+tags = set(matches[0].get("tags") or [])
+
+missing = required - tags
+
+if missing:
+    raise SystemExit(
+        "snapshot is missing required tag(s): "
+        + ", ".join(sorted(missing))
+    )
+' \
+            "$snapshot_id" \
+            "app:${APP_ID}" \
+            "repo:${REPO_TAG}" \
+            "generation:${GENERATION}" \
+            "component:${component}" \
+            "state:complete"
+}
+
+echo
+echo "===== VERIFY IMMUTABLE RESTIC COORDINATES ====="
+
+verify_snapshot "$FILES_SNAPSHOT" files
+echo "PASS: files snapshot identity and tags verified"
+
+if [[ "$DB_TYPE" != "none" ]]; then
+    verify_snapshot "$DB_SNAPSHOT" db
+    echo "PASS: database snapshot identity and tags verified"
+fi
+
+echo
+echo "===== VERIFY PORTABLE RECOVERY SET ====="
+
+(
+    cd "$PORTABLE_SET_REAL"
+
+    [[ -s SHA256SUMS ]] ||
+        die "portable SHA256SUMS missing or empty"
+
+    [[ -s app-state.tar.gz ]] ||
+        die "portable app-state.tar.gz missing or empty"
+
+    sha256sum -c SHA256SUMS
+    gzip -t app-state.tar.gz
+    tar -tzf app-state.tar.gz >/dev/null
+
+    if [[ "$DB_TYPE" != "none" ]]; then
+        [[ -s database.sql.gz ]] ||
+            die "portable database.sql.gz missing or empty"
+
+        gzip -t database.sql.gz
+    fi
+)
+
+echo "PASS: portable recovery-set integrity verified"
+
+TMP_ROOT="$(mktemp -d /tmp/docker-recovery-validation.XXXXXX)"
+RESTIC_FILES="${TMP_ROOT}/restic-files"
+PORTABLE_FILES="${TMP_ROOT}/portable-files"
+RESTIC_DB="${TMP_ROOT}/restic-db"
+
+TEST_CONTAINER=""
+DB_VALIDATION="SKIPPED"
+
+cleanup() {
+    local rc=$?
+
+    if [[ -n "$TEST_CONTAINER" ]]; then
+        docker rm -f "$TEST_CONTAINER" >/dev/null 2>&1 || true
+    fi
+
+    rm -rf "$TMP_ROOT"
+
+    if [[ "$rc" -eq 0 ]]; then
+        echo
+        echo "PASS: disposable validation resources cleaned up"
+    else
+        echo
+        echo "ERROR: recovery validation failed with exit $rc" >&2
+        echo "PASS: disposable validation resources cleaned up" >&2
+    fi
+
+    exit "$rc"
+}
+
+trap cleanup EXIT
+
+mkdir -p \
+    "$RESTIC_FILES" \
+    "$PORTABLE_FILES" \
+    "$RESTIC_DB"
+
+echo
+echo "===== RESTORE FILESYSTEM COMPONENTS ====="
+
+restic restore \
+    "$FILES_SNAPSHOT" \
+    --target "$RESTIC_FILES"
+
+tar \
+    -xzf "$PORTABLE_SET_REAL/app-state.tar.gz" \
+    -C "$PORTABLE_FILES"
+
+validate_paths() {
+    local root="$1"
+    local label="$2"
+
+    for path in "${BACKUP_PATHS[@]}"; do
+        relative="${path#/}"
+
+        [[ -e "$root/$relative" ]] ||
+            die "$label missing expected path: $path"
+
+        echo "PASS: $label contains $path"
+    done
+
+    if declare -p EXCLUDE_PATHS >/dev/null 2>&1; then
+        for path in "${EXCLUDE_PATHS[@]}"; do
+            relative="${path#/}"
+
+            [[ ! -e "$root/$relative" ]] ||
+                die "$label contains excluded path: $path"
+
+            echo "PASS: $label excludes $path"
+        done
+    fi
+}
+
+echo
+echo "===== VALIDATE RESTIC FILESYSTEM ====="
+
+validate_paths "$RESTIC_FILES" "Restic"
+
+echo
+echo "===== VALIDATE PORTABLE FILESYSTEM ====="
+
+validate_paths "$PORTABLE_FILES" "Portable"
+
+if [[ "$DB_TYPE" != "none" ]]; then
+    echo
+    echo "===== PREPARE DISPOSABLE MARIADB ====="
+
+    cd "$COMPOSE_DIR"
+
+    DB_CID="$(docker compose ps -q "$DB_CONTAINER")"
+
+    [[ -n "$DB_CID" ]] ||
+        die "database Compose service is not running: $DB_CONTAINER"
+
+    DB_IMAGE="$(
+        docker inspect "$DB_CID" \
+            --format '{{.Config.Image}}'
+    )"
+
+    DB_NAME="$(
+        docker inspect "$DB_CID" \
+            --format '{{range .Config.Env}}{{println .}}{{end}}' |
+        sed -n \
+            -e 's/^MARIADB_DATABASE=//p' \
+            -e 's/^MYSQL_DATABASE=//p' |
+        head -n1
+    )"
+
+    [[ -n "$DB_IMAGE" ]] ||
+        die "unable to determine MariaDB image"
+
+    [[ -n "$DB_NAME" ]] ||
+        die "unable to determine MariaDB database name"
+
+    TEST_CONTAINER="docker-recovery-validation-${APP_ID}-$$"
+    TEST_ROOT_PASSWORD="validation-${RANDOM}-${RANDOM}"
+
+    docker run -d \
+        --name "$TEST_CONTAINER" \
+        --tmpfs /var/lib/mysql \
+        -e MARIADB_ROOT_PASSWORD="$TEST_ROOT_PASSWORD" \
+        -e MARIADB_DATABASE="$DB_NAME" \
+        "$DB_IMAGE" \
+        >/dev/null
+
+    READY=false
+
+    for _ in $(seq 1 60); do
+        if docker exec "$TEST_CONTAINER" \
+            mariadb \
+            --batch \
+            --skip-column-names \
+            -uroot \
+            -p"$TEST_ROOT_PASSWORD" \
+            -e 'SELECT 1;' \
+            2>/dev/null |
+            grep -Fxq 1
+        then
+            READY=true
+            break
+        fi
+
+        sleep 1
+    done
+
+    [[ "$READY" == true ]] ||
+        die "disposable MariaDB did not become authenticated-ready"
+
+    echo "PASS: disposable MariaDB ready"
+
+    reset_database() {
+        docker exec "$TEST_CONTAINER" \
+            mariadb \
+            -uroot \
+            -p"$TEST_ROOT_PASSWORD" \
+            -e "
+              DROP DATABASE IF EXISTS \`$DB_NAME\`;
+              CREATE DATABASE \`$DB_NAME\`;
+            "
+    }
+
+    database_metrics() {
+        docker exec "$TEST_CONTAINER" \
+            mariadb \
+            --batch \
+            --skip-column-names \
+            -uroot \
+            -p"$TEST_ROOT_PASSWORD" \
+            "$DB_NAME" \
+            -e "
+              SELECT CONCAT(
+                'tables=',
+                COUNT(*)
+              )
+              FROM information_schema.tables
+              WHERE table_schema='$DB_NAME';
+
+              SELECT CONCAT(
+                'triggers=',
+                COUNT(*)
+              )
+              FROM information_schema.triggers
+              WHERE trigger_schema='$DB_NAME';
+
+              SELECT IF(
+                EXISTS(
+                  SELECT 1
+                  FROM information_schema.tables
+                  WHERE table_schema='$DB_NAME'
+                    AND table_name='alembic_version'
+                ),
+                CONCAT(
+                  'alembic=',
+                  (
+                    SELECT version_num
+                    FROM \`$DB_NAME\`.alembic_version
+                    LIMIT 1
+                  )
+                ),
+                'alembic='
+              );
+            "
+    }
+
+    echo
+    echo "===== IMPORT PORTABLE DATABASE ====="
+
+    reset_database
+
+    gzip -dc "$PORTABLE_SET_REAL/database.sql.gz" |
+        docker exec -i "$TEST_CONTAINER" \
+            mariadb \
+            -uroot \
+            -p"$TEST_ROOT_PASSWORD" \
+            "$DB_NAME"
+
+    PORTABLE_DB_METRICS="$(database_metrics)"
+
+    printf '%s\n' "$PORTABLE_DB_METRICS"
+
+    echo "PASS: portable database imported"
+
+    echo
+    echo "===== RESTORE AND IMPORT RESTIC DATABASE ====="
+
+    restic restore \
+        "$DB_SNAPSHOT" \
+        --target "$RESTIC_DB"
+
+    [[ -s "$RESTIC_DB/database.sql" ]] ||
+        die "Restic database.sql missing or empty"
+
+    reset_database
+
+    docker exec -i "$TEST_CONTAINER" \
+        mariadb \
+        -uroot \
+        -p"$TEST_ROOT_PASSWORD" \
+        "$DB_NAME" \
+        < "$RESTIC_DB/database.sql"
+
+    RESTIC_DB_METRICS="$(database_metrics)"
+
+    printf '%s\n' "$RESTIC_DB_METRICS"
+
+    echo "PASS: Restic database imported"
+
+    if [[ "$RESTIC_DB_METRICS" != "$PORTABLE_DB_METRICS" ]]; then
+        echo "Portable database metrics:" >&2
+        printf '%s\n' "$PORTABLE_DB_METRICS" >&2
+
+        echo "Restic database metrics:" >&2
+        printf '%s\n' "$RESTIC_DB_METRICS" >&2
+
+        die "Restic and portable database structure differ"
+    fi
+
+    DB_VALIDATION="PASS"
+
+    echo "PASS: Restic and portable database structure agree"
+fi
+
+echo
+echo "===== RECOVERY VALIDATION RESULT ====="
+echo "Result:            PASS"
+echo "Application:       $APP_ID"
+echo "Restic generation: $GENERATION"
+echo "Files snapshot:    $FILES_SNAPSHOT"
+
+if [[ -n "$DB_SNAPSHOT" ]]; then
+    echo "DB snapshot:       $DB_SNAPSHOT"
+fi
+
+echo "Portable set:      $PORTABLE_SET_REAL"
+echo "Database:          $DB_VALIDATION"
+
+if [[ -n "$RESULT_FILE" ]]; then
+    umask 077
+    mkdir -p "$(dirname "$RESULT_FILE")"
+
+    {
+        echo "RESULT=PASS"
+        echo "APPLICATION=$APP_ID"
+        echo "REPOSITORY=$REPO_ID"
+        echo "PORTABLE_TARGET=$PORTABLE_ID"
+        echo "RESTIC_GENERATION=$GENERATION"
+        echo "FILES_SNAPSHOT=$FILES_SNAPSHOT"
+
+        if [[ -n "$DB_SNAPSHOT" ]]; then
+            echo "DB_SNAPSHOT=$DB_SNAPSHOT"
+        fi
+
+        echo "PORTABLE_SET=$PORTABLE_SET_REAL"
+        echo "RESTIC_FILES=PASS"
+        echo "PORTABLE_FILES=PASS"
+        echo "DATABASE=$DB_VALIDATION"
+    } > "$RESULT_FILE"
+fi
+
+trap - EXIT
+
+if [[ -n "$TEST_CONTAINER" ]]; then
+    docker rm -f "$TEST_CONTAINER" >/dev/null
+fi
+
+rm -rf "$TMP_ROOT"
+
+echo
+echo "PASS: application recovery point validated non-destructively"

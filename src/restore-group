@@ -1,0 +1,522 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+    cat >&2 <<'HELP'
+Usage:
+  restore-group <group-manifest> [--execute --confirm <group>]
+
+Without --execute, validates the complete group recovery point and prints the
+reverse-manifest restore plan. No production state is modified.
+
+With --execute, every member recovery point is validated before the first
+production mutation. Members are then restored sequentially in reverse manifest
+order by restore-application.
+
+Group restore is coordinated-non-atomic. If a member restore fails, processing
+stops immediately. Previously completed member restores remain completed and
+are not automatically rolled back as a group.
+HELP
+    exit 2
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+[[ "$EUID" -eq 0 ]] ||
+    die "group restore must run as root"
+
+[[ $# -ge 1 ]] || usage
+
+MANIFEST="$1"
+shift
+
+EXECUTE=0
+CONFIRM=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --execute)
+            EXECUTE=1
+            ;;
+        --confirm)
+            shift
+            [[ $# -gt 0 ]] || usage
+            CONFIRM="$1"
+            ;;
+        *)
+            usage
+            ;;
+    esac
+
+    shift
+done
+
+[[ -f "$MANIFEST" ]] ||
+    die "group manifest not found: $MANIFEST"
+
+CONFIG_ROOT="${DOCKER_BACKUP_CONFIG_ROOT:-/etc/docker-backup}"
+ENGINE_ROOT="${DOCKER_BACKUP_ENGINE_ROOT:-/usr/local/lib/docker-backup}"
+GROUP_RESTORE_ROOT="${DOCKER_BACKUP_GROUP_RESTORE_ROOT:-/var/lib/docker-backup/group-restores}"
+
+GROUP_VALIDATOR="${ENGINE_ROOT}/validate-group-recovery"
+APP_RESTORE="${ENGINE_ROOT}/restore-application"
+
+[[ -x "$GROUP_VALIDATOR" ]] ||
+    die "required executable missing: $GROUP_VALIDATOR"
+
+[[ -x "$APP_RESTORE" ]] ||
+    die "required executable missing: $APP_RESTORE"
+
+MANIFEST_DATA="$(
+    python3 - "$MANIFEST" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    document = json.load(f)
+
+print(document.get("group", ""))
+print(document.get("group_generation", ""))
+print(document.get("consistency", ""))
+PY
+)"
+
+GROUP_NAME="$(sed -n '1p' <<<"$MANIFEST_DATA")"
+GROUP_GENERATION="$(sed -n '2p' <<<"$MANIFEST_DATA")"
+CONSISTENCY="$(sed -n '3p' <<<"$MANIFEST_DATA")"
+
+[[ -n "$GROUP_NAME" ]] ||
+    die "manifest missing group"
+
+if [[ "$EXECUTE" -eq 1 ]]; then
+    [[ -n "$CONFIRM" ]] ||
+        die "--confirm <group> is required with --execute"
+
+    [[ "$CONFIRM" == "$GROUP_NAME" ]] ||
+        die "confirmation value does not match group: $GROUP_NAME"
+elif [[ -n "$CONFIRM" ]]; then
+    die "--confirm is only valid with --execute"
+fi
+
+echo "===== GROUP PRODUCTION RESTORE ====="
+
+if [[ "$EXECUTE" -eq 1 ]]; then
+    echo "Mode:             GUARDED EXECUTE"
+else
+    echo "Mode:             PLAN ONLY"
+fi
+
+echo "Manifest:         $MANIFEST"
+echo "Group:            $GROUP_NAME"
+echo "Group generation: $GROUP_GENERATION"
+echo "Consistency:      $CONSISTENCY"
+
+WORK_ROOT="$(mktemp -d /tmp/docker-group-restore.XXXXXX)"
+VALIDATION_RESULT="${WORK_ROOT}/validation.json"
+
+cleanup() {
+    local rc=$?
+    rm -rf "$WORK_ROOT"
+    exit "$rc"
+}
+
+trap cleanup EXIT
+
+echo
+echo "===== VALIDATE COMPLETE GROUP RECOVERY POINT ====="
+
+"$GROUP_VALIDATOR" \
+    "$MANIFEST" \
+    --result-file "$VALIDATION_RESULT"
+
+[[ -s "$VALIDATION_RESULT" ]] ||
+    die "group recovery validation did not produce a result"
+
+python3 - "$VALIDATION_RESULT" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    document = json.load(f)
+
+if document.get("result") != "PASS":
+    raise SystemExit(
+        "ERROR: group recovery validation did not report PASS"
+    )
+PY
+
+echo "PASS: complete group recovery point validated"
+
+MEMBERS_FILE="${WORK_ROOT}/members.ndjson"
+
+python3 - "$MANIFEST" > "$MEMBERS_FILE" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    document = json.load(f)
+
+for member in reversed(document["members"]):
+    print(json.dumps(member, separators=(",", ":")))
+PY
+
+mapfile -t MEMBERS < "$MEMBERS_FILE"
+
+[[ "${#MEMBERS[@]}" -gt 0 ]] ||
+    die "validated manifest contains no members"
+
+echo
+echo "===== RESTORE ORDER ====="
+
+INDEX=0
+
+for member_json in "${MEMBERS[@]}"; do
+    INDEX=$((INDEX + 1))
+
+    application="$(
+        python3 -c '
+import json, sys
+print(json.loads(sys.argv[1])["application"])
+' "$member_json"
+    )"
+
+    echo "${INDEX}. ${application}"
+done
+
+if [[ "$EXECUTE" -eq 0 ]]; then
+    rm -rf "$WORK_ROOT"
+    trap - EXIT
+
+    echo
+    echo "PASS: group restore plan completed"
+    echo "PASS: no production state was modified"
+    exit 0
+fi
+
+GROUP_RESTORE_ID="$(
+    printf '%s-%s\n' \
+        "$(date -u +%Y%m%dT%H%M%SZ)" \
+        "$$"
+)"
+
+GROUP_RESTORE_DIR="${GROUP_RESTORE_ROOT}/${GROUP_NAME}"
+GROUP_RESTORE_RECORD="${GROUP_RESTORE_DIR}/${GROUP_RESTORE_ID}.json"
+MEMBER_RESULTS="${WORK_ROOT}/member-results.ndjson"
+
+mkdir -p "$GROUP_RESTORE_DIR"
+chmod 0750 "$GROUP_RESTORE_DIR"
+
+touch "$MEMBER_RESULTS"
+chmod 0600 "$MEMBER_RESULTS"
+
+python3 - \
+    "$GROUP_RESTORE_RECORD" \
+    "$GROUP_NAME" \
+    "$GROUP_GENERATION" \
+    "$MANIFEST" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+output, group, generation, manifest = sys.argv[1:]
+
+document = {
+    "schema_version": 1,
+    "result": "IN_PROGRESS",
+    "group": group,
+    "group_generation": generation,
+    "consistency": "coordinated-non-atomic",
+    "manifest": os.path.abspath(manifest),
+    "restore_order": "reverse-manifest",
+    "members": [],
+    "failure": None,
+}
+
+directory = os.path.dirname(output)
+fd, temporary = tempfile.mkstemp(
+    prefix=".group-restore.",
+    dir=directory,
+    text=True,
+)
+
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, output)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+
+CURRENT_APPLICATION=""
+FINALIZED=0
+
+finalize_group_record() {
+    local result="$1"
+    local failure_application="${2:-}"
+
+    python3 - \
+        "$GROUP_RESTORE_RECORD" \
+        "$MEMBER_RESULTS" \
+        "$result" \
+        "$failure_application" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+output, members_file, result, failure_application = sys.argv[1:]
+
+with open(output, encoding="utf-8") as f:
+    document = json.load(f)
+
+members = []
+
+with open(members_file, encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            members.append(json.loads(line))
+
+document["result"] = result
+document["members"] = members
+
+if result == "PASS":
+    document["failure"] = None
+else:
+    document["failure"] = {
+        "application": failure_application or None,
+        "stage": "member-restore",
+    }
+
+directory = os.path.dirname(output)
+fd, temporary = tempfile.mkstemp(
+    prefix=".group-restore.",
+    dir=directory,
+    text=True,
+)
+
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, output)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+}
+
+cleanup_execute() {
+    local rc=$?
+
+    if [[ "$FINALIZED" -eq 0 ]]; then
+        finalize_group_record "FAIL" "$CURRENT_APPLICATION" || true
+    fi
+
+    rm -rf "$WORK_ROOT"
+    exit "$rc"
+}
+
+trap cleanup_execute EXIT
+
+echo
+echo "===== EXECUTE GROUP RESTORE ====="
+
+INDEX=0
+
+for member_json in "${MEMBERS[@]}"; do
+    INDEX=$((INDEX + 1))
+
+    MEMBER_DATA="$(
+        python3 - "$member_json" <<'PY'
+import json
+import sys
+
+m = json.loads(sys.argv[1])
+separator = "\x1f"
+
+values = [
+    m["application"],
+    m["repository"],
+    m["portable_target"],
+    m["restic_generation"],
+    m["files_snapshot"],
+    m["db_snapshot"] or "",
+    m["portable_set"],
+]
+
+for value in values:
+    if separator in value or "\n" in value or "\t" in value:
+        raise SystemExit(
+            "ERROR: unsupported control character in group manifest"
+        )
+
+print(separator.join(values))
+PY
+    )"
+
+    IFS=$'\x1f' read -r \
+        APPLICATION \
+        REPOSITORY \
+        PORTABLE_TARGET \
+        RESTIC_GENERATION \
+        FILES_SNAPSHOT \
+        DB_SNAPSHOT \
+        PORTABLE_SET \
+        <<<"$MEMBER_DATA"
+
+    CURRENT_APPLICATION="$APPLICATION"
+
+    APP_CONFIG="${CONFIG_ROOT}/apps/${APPLICATION}.conf"
+    REPO_CONFIG="${CONFIG_ROOT}/repos/${REPOSITORY}.conf"
+    PORTABLE_CONFIG="${CONFIG_ROOT}/portable/${PORTABLE_TARGET}.conf"
+
+    for config in \
+        "$APP_CONFIG" \
+        "$REPO_CONFIG" \
+        "$PORTABLE_CONFIG"
+    do
+        [[ -f "$config" ]] ||
+            die "required production configuration missing: $config"
+    done
+
+    echo
+    echo "===== MEMBER ${INDEX}/${#MEMBERS[@]}: ${APPLICATION} ====="
+
+    args=(
+        "$APP_CONFIG"
+        "$REPO_CONFIG"
+        "$PORTABLE_CONFIG"
+        --generation "$RESTIC_GENERATION"
+        --files-snapshot "$FILES_SNAPSHOT"
+        --portable-set "$PORTABLE_SET"
+        --execute
+        --confirm "$APPLICATION"
+    )
+
+    if [[ -n "$DB_SNAPSHOT" ]]; then
+        args+=(
+            --db-snapshot "$DB_SNAPSHOT"
+        )
+    fi
+
+    MEMBER_LOG="${WORK_ROOT}/member-${INDEX}.log"
+
+    if "$APP_RESTORE" "${args[@]}" > >(tee "$MEMBER_LOG") 2>&1; then
+        MEMBER_RESULT="PASS"
+    else
+        MEMBER_RESULT="FAIL"
+    fi
+
+    RESTORE_RECORD="$(
+        awk -F': ' '
+            /^Restore record:/ {
+                print $2
+            }
+        ' "$MEMBER_LOG" |
+        tail -1
+    )"
+
+    if [[ "$MEMBER_RESULT" == "PASS" ]]; then
+        [[ -n "$RESTORE_RECORD" && -r "$RESTORE_RECORD" ]] ||
+            die "member restore record is missing or unreadable: $APPLICATION"
+
+        python3 - \
+            "$RESTORE_RECORD" \
+            "$APPLICATION" <<'PY'
+import json
+import sys
+
+record_path, expected_application = sys.argv[1:]
+
+try:
+    with open(record_path, encoding="utf-8") as f:
+        document = json.load(f)
+except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(
+        f"ERROR: member restore record is invalid: "
+        f"{expected_application}: {exc}"
+    )
+
+if document.get("application") != expected_application:
+    raise SystemExit(
+        "ERROR: member restore record application mismatch: "
+        f"{expected_application}"
+    )
+
+if document.get("result") not in {
+    "RESTORE_COMPLETED",
+    "FILESYSTEM_RESTORED",
+}:
+    raise SystemExit(
+        "ERROR: member restore record does not report terminal success: "
+        f"{expected_application}"
+    )
+PY
+    fi
+
+    python3 - \
+        "$APPLICATION" \
+        "$MEMBER_RESULT" \
+        "$RESTORE_RECORD" \
+        >> "$MEMBER_RESULTS" <<'PY'
+import json
+import sys
+
+application, result, restore_record = sys.argv[1:]
+
+print(json.dumps(
+    {
+        "application": application,
+        "result": result,
+        "restore_record": restore_record or None,
+    },
+    separators=(",", ":"),
+))
+PY
+
+    if [[ "$MEMBER_RESULT" != "PASS" ]]; then
+        finalize_group_record "FAIL" "$APPLICATION"
+        FINALIZED=1
+
+        echo
+        echo "ERROR: group restore stopped after member failure: $APPLICATION" >&2
+        echo "Group restore record: $GROUP_RESTORE_RECORD" >&2
+        exit 1
+    fi
+
+    echo "PASS: member restored: $APPLICATION"
+done
+
+CURRENT_APPLICATION=""
+
+finalize_group_record "PASS"
+FINALIZED=1
+
+rm -rf "$WORK_ROOT"
+trap - EXIT
+
+echo
+echo "===== GROUP RESTORE RESULT ====="
+echo "Result:               PASS"
+echo "Group:                $GROUP_NAME"
+echo "Group generation:     $GROUP_GENERATION"
+echo "Members restored:     ${#MEMBERS[@]}"
+echo "Group restore record: $GROUP_RESTORE_RECORD"
+
+echo
+echo "PASS: coordinated non-atomic group restore completed"

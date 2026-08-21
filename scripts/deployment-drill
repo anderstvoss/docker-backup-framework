@@ -10,7 +10,7 @@ Runs the complete post-change deployment and recovery-validation workflow:
 
 - requires a clean committed Git checkout
 - records candidate framework identity
-- hashes host-local production configuration and secrets
+- hashes host-local production configuration, groups, and secrets
 - deploys with --preserve-config
 - verifies deployed identity and runtime/source parity
 - verifies production configuration and secrets were preserved
@@ -266,12 +266,25 @@ CONFIG_HASHES="$TMP_ROOT/config.sha256"
 SECRET_HASHES="$TMP_ROOT/secrets.sha256"
 ACCEPTANCE_OUTPUT="$TMP_ROOT/acceptance.log"
 
+GROUP_DIR_EXISTED=false
+
+if [ -d "$ETC_ROOT/groups" ]; then
+    GROUP_DIR_EXISTED=true
+fi
+
 CURRENT_STAGE="production hash capture"
 
-find \
-    "$ETC_ROOT/apps" \
-    "$ETC_ROOT/repos" \
-    "$ETC_ROOT/portable" \
+CONFIG_DIRS=(
+    "$ETC_ROOT/apps"
+    "$ETC_ROOT/repos"
+    "$ETC_ROOT/portable"
+)
+
+if [ "$GROUP_DIR_EXISTED" = true ]; then
+    CONFIG_DIRS+=("$ETC_ROOT/groups")
+fi
+
+find "${CONFIG_DIRS[@]}" \
     -type f \
     -print0 \
     | sort -z \
@@ -321,6 +334,25 @@ echo "PASS: deployed framework identity matches candidate"
 CURRENT_STAGE="production preservation verification"
 
 sha256sum -c "$CONFIG_HASHES"
+
+if [ "$GROUP_DIR_EXISTED" = false ]; then
+    if [ ! -d "$ETC_ROOT/groups" ]; then
+        echo "ERROR: installer did not create group configuration directory" >&2
+        exit 1
+    fi
+
+    if find "$ETC_ROOT/groups" \
+        -mindepth 1 \
+        -type f \
+        -print -quit \
+        | grep -q .; then
+        echo \
+            "ERROR: preserve-config deployment populated a previously absent groups directory" \
+            >&2
+        exit 1
+    fi
+fi
+
 CONFIG_PRESERVED="PASS"
 
 if [ -s "$SECRET_HASHES" ]; then
@@ -338,7 +370,11 @@ for engine in \
     retention-repository \
     maintain-repository \
     portable-backup \
-    portable-retention
+    portable-retention \
+    backup-group \
+    validate-application-recovery \
+    validate-group-recovery \
+    restore-application
 do
     cmp \
         "$SOURCE_ROOT/src/$engine" \
@@ -347,7 +383,9 @@ done
 
 for tool in \
     acceptance-test \
-    resolve-snapshot
+    resolve-snapshot \
+    validate-group \
+    validate-group-manifest
 do
     cmp \
         "$SOURCE_ROOT/scripts/$tool" \

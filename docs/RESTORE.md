@@ -84,6 +84,58 @@ The framework uses tags describing:
 
 Select only snapshots representing a complete generation.
 
+### Exact snapshot selection
+
+For validation and production recovery, resolve the intended snapshot from
+`restic snapshots --json` using the complete required tag set and restore by
+the resulting immutable snapshot ID.
+
+Do not rely on `latest` combined with several repeated `--tag` arguments to
+prove that all desired tags identify the same snapshot. During validation this
+can select the wrong component while still producing a syntactically valid
+restore.
+
+Required tags normally include:
+
+    app:<application>
+    repo:<repository>
+    generation:<generation>
+    component:<db|files>
+    state:complete
+
+Example exact resolver:
+
+    SNAPSHOT_ID="$(
+      restic snapshots --json |
+      python3 -c '
+    import json
+    import sys
+
+    required = set(sys.argv[1:])
+    matches = []
+
+    for snapshot in json.load(sys.stdin):
+        tags = set(snapshot.get("tags") or [])
+        if required.issubset(tags):
+            matches.append(snapshot["id"])
+
+    if len(matches) != 1:
+        raise SystemExit(
+            f"expected exactly one matching snapshot; found {len(matches)}"
+        )
+
+    print(matches[0])
+    ' \
+        "app:<application>" \
+        "repo:<repository>" \
+        "generation:<generation>" \
+        "component:<component>" \
+        "state:complete"
+    )"
+
+The resolver must return exactly one snapshot. Record the full snapshot ID and
+use that ID explicitly in `restic restore`.
+
 ## 5. Restore the Restic filesystem component
 
 Create a temporary destination:
@@ -91,7 +143,7 @@ Create a temporary destination:
     sudo rm -rf /tmp/docker-restore-files
     sudo mkdir -p /tmp/docker-restore-files
 
-Restore the filesystem snapshot selected for the desired generation:
+Restore the exact filesystem snapshot ID resolved from the complete tag set:
 
     sudo bash -c '
     source /etc/docker-backup/repos/<repository>.conf
@@ -132,7 +184,7 @@ Create a temporary restore destination:
     sudo rm -rf /tmp/docker-restore-db
     sudo mkdir -p /tmp/docker-restore-db
 
-Restore the database snapshot:
+Restore the exact database snapshot ID resolved from the complete tag set:
 
     sudo bash -c '
     source /etc/docker-backup/repos/<repository>.conf

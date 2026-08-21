@@ -506,3 +506,129 @@ Validated:
 
 This establishes the current implementation as the validated reusable baseline
 for onboarding additional Docker applications.
+
+## Public deployment with production-config preservation
+
+Validated public deployment revision:
+
+`ee8bd70ec466d7093898ffe62f1911429a434360`
+
+The framework was deployed from the canonical public Git repository using:
+
+    sudo ./scripts/install --preserve-config
+
+Validated:
+
+- deployed revision matched the intended public `main` commit
+- all five installed runtime engines matched the Git checkout
+- application configuration remained byte-for-byte unchanged
+- repository configuration remained byte-for-byte unchanged
+- portable-backup configuration remained byte-for-byte unchanged
+- Restic password file remained byte-for-byte unchanged
+- all seven production timer instances remained enabled
+- timer instances were regenerated from retained host-local configuration
+- repository check completed successfully after deployment
+- repository check completed successfully with the Git checkout temporarily
+  moved away
+- source checkout was restored afterward with a clean working tree
+
+This validates direct framework deployment from public Git while keeping
+deployment-specific production configuration and secrets host-local.
+
+## Post-framework-change end-to-end acceptance
+
+A fresh backup/restore acceptance test was performed against deployed revision:
+
+`ee8bd70ec466d7093898ffe62f1911429a434360`
+
+Fresh Restic generation:
+
+`20260821T005307Z-233885`
+
+Fresh portable recovery set:
+
+`2026-08-21_005314Z`
+
+Validated:
+
+- fresh coordinated Restic database and filesystem components completed
+- both Restic components reached `state:complete`
+- fresh portable database dump completed
+- fresh portable application-state archive completed
+- portable `SHA256SUMS` validation passed
+- portable database gzip integrity passed
+- portable application tar integrity passed
+- Restic filesystem component restored non-destructively
+- portable filesystem archive restored non-destructively
+- all expected application-state paths were present in both restores
+- live MariaDB storage remained absent from both filesystem restores
+- separately protected bulk media remained absent from both filesystem restores
+- portable logical database dump imported into an isolated `mariadb:11`
+  container
+- portable database restore contained 32 tables
+- portable database restore contained 4 triggers
+- portable database restore reported Alembic marker
+  `0103_roms_facets_provider_ids`
+- Restic logical database component was resolved by exact complete tag-set
+  matching and restored by immutable snapshot ID
+- Restic database snapshot ID was
+  `49e39914b291a925e41abc0b8907dfffd953573ff1d6a9c1113318e98f28bf9e`
+- restored Restic database dump imported successfully into the isolated
+  MariaDB container
+- Restic database restore contained 32 tables
+- Restic database restore contained 4 triggers
+- Restic database restore reported Alembic marker
+  `0103_roms_facets_provider_ids`
+
+### Restore-validation lesson: Restic tag filtering
+
+An initial manual database restore test used `restic restore latest` together
+with multiple repeated `--tag` arguments.
+
+That command selected the completed filesystem snapshot instead of the
+intended database component. The restore itself succeeded, which demonstrated
+that a syntactically successful restore is not sufficient proof that the
+intended snapshot was selected.
+
+The validation procedure was corrected to:
+
+1. read `restic snapshots --json`;
+2. require the complete tag set:
+   - application
+   - repository
+   - generation
+   - component
+   - `state:complete`;
+3. require exactly one matching snapshot;
+4. record the full immutable snapshot ID; and
+5. restore that exact snapshot ID.
+
+The corrected lookup selected database snapshot `49e39914...`, which restored
+`/database.sql` successfully and passed the isolated MariaDB import test.
+
+This exact-snapshot procedure is now required for framework acceptance testing
+and documented recovery validation.
+
+### Restore-validation lesson: MariaDB readiness
+
+The first disposable MariaDB restore harness used `mariadb-admin ping`.
+
+The temporary MariaDB server could respond to `ping` during initialization
+before password-authenticated SQL access was usable, causing an early import
+attempt to fail with an authentication error.
+
+The readiness requirement is therefore an authenticated SQL query such as:
+
+    SELECT 1;
+
+Database import must not begin until that authenticated query succeeds.
+
+## Post-change acceptance policy
+
+After any material framework change affecting installation, capture,
+retention, maintenance, snapshot selection, or restore behavior, validation
+must include a fresh backup created by the newly deployed revision and a
+non-destructive restore of that fresh backup.
+
+Static validation, CI, installer success, and repository integrity checks
+remain required, but they do not replace end-to-end backup/restore acceptance.

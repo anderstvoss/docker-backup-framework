@@ -193,15 +193,36 @@ Standard workflow:
 5. Validate installed runtime behavior.
 6. Record validation results.
 
-Deploy with:
+Deploy a new installation with:
 
     sudo ./scripts/install
+
+On an existing production host where `/etc/docker-backup` contains
+host-local production configuration, deploy framework updates with:
+
+    sudo ./scripts/install --preserve-config
+
+`--preserve-config` updates framework engines and systemd templates while
+retaining the existing application, repository, portable-backup, and secret
+configuration under `/etc/docker-backup`.
+
+The source-of-truth split is intentional:
+
+- Git contains generic framework code, service templates, documentation, and
+  example configuration.
+- `/etc/docker-backup/apps/`, `/etc/docker-backup/repos/`, and
+  `/etc/docker-backup/portable/` contain deployment-specific production
+  configuration.
+- `/etc/docker-backup/secrets/` contains host-local runtime secrets.
+- production-specific configuration and secrets must not be copied into the
+  public framework repository.
 
 The installer:
 
 - validates source files
 - installs runtime engines
-- installs application, repository, and portable configurations
+- optionally installs source configuration for a new deployment
+- preserves existing production configuration when `--preserve-config` is used
 - installs systemd service templates
 - renders timer instances
 - applies timer enablement policy
@@ -233,6 +254,27 @@ Follow:
 
 An application is not considered fully protected until both backup mechanisms
 have been created and restored successfully in a non-destructive validation.
+
+A material framework change is not considered accepted merely because CI,
+installation, or repository checks pass. After deployment, create fresh Restic
+and portable backups using the newly deployed framework revision and restore
+those newly created artifacts non-destructively.
+
+Post-change acceptance should prove:
+
+- the deployed revision is the intended Git commit
+- host-local production configuration and secrets were preserved
+- a fresh Restic generation completes
+- a fresh portable recovery set completes
+- portable checksums and archives validate
+- both filesystem backup formats restore expected paths
+- intentionally excluded paths remain absent
+- both logical database backup formats import into an isolated disposable
+  database
+- meaningful restored database characteristics match the live application or
+  another independently validated reference
+- repository integrity checking succeeds
+- deployed runtime remains functional with the source checkout unavailable
 
 ## Recovery
 

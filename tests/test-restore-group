@@ -191,15 +191,30 @@ fi
 
 record="$TEST_MEMBER_RECORD_ROOT/${application}-pass.json"
 
-cat > "$record" <<EOF_RECORD
+record_application="$application"
+record_result="RESTORE_COMPLETED"
+
+if [[ "${WRONG_MEMBER_RECORD_APPLICATION:-}" == "$application" ]]; then
+    record_application="wrong-application"
+fi
+
+if [[ "${BAD_MEMBER_RECORD_RESULT:-}" == "$application" ]]; then
+    record_result="FAIL"
+fi
+
+if [[ "${MISSING_MEMBER_RECORD:-}" != "$application" ]]; then
+    cat > "$record" <<EOF_RECORD
 {
   "schema_version": 1,
-  "result": "RESTORE_COMPLETED",
-  "application": "$application"
+  "result": "$record_result",
+  "application": "$record_application"
 }
 EOF_RECORD
 
-chmod 0600 "$record"
+    chmod 0600 "$record"
+else
+    rm -f "$record"
+fi
 
 echo "Restore record: $record"
 echo "PASS: mock member restore: $application"
@@ -215,6 +230,9 @@ run_group() {
         "TEST_MEMBER_RECORD_ROOT=$TMP" \
         "FAIL_GROUP_VALIDATION=${FAIL_GROUP_VALIDATION:-0}" \
         "FAIL_MEMBER=${FAIL_MEMBER:-}" \
+        "MISSING_MEMBER_RECORD=${MISSING_MEMBER_RECORD:-}" \
+        "WRONG_MEMBER_RECORD_APPLICATION=${WRONG_MEMBER_RECORD_APPLICATION:-}" \
+        "BAD_MEMBER_RECORD_RESULT=${BAD_MEMBER_RECORD_RESULT:-}" \
         "$ENGINE" \
         "$MANIFEST" \
         "$@"
@@ -371,6 +389,75 @@ assert all(m["restore_record"] for m in d["members"])
 '
 
 echo "PASS: successful group restore links member restore records"
+
+echo
+echo "=== successful child with missing restore record is rejected ==="
+
+sudo rm -rf "$GROUP_RESTORE_ROOT"
+mkdir -p "$GROUP_RESTORE_ROOT"
+: > "$LOG"
+
+if MISSING_MEMBER_RECORD=app-two \
+   run_group \
+       --execute \
+       --confirm test-group \
+       > "$TMP/missing-record.log" 2>&1
+then
+    echo "ERROR: missing member restore record was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'member restore record is missing or unreadable: app-two' \
+    "$TMP/missing-record.log"
+
+echo "PASS: missing child restore record rejected"
+
+echo
+echo "=== successful child with wrong application record is rejected ==="
+
+sudo rm -rf "$GROUP_RESTORE_ROOT"
+mkdir -p "$GROUP_RESTORE_ROOT"
+: > "$LOG"
+
+if WRONG_MEMBER_RECORD_APPLICATION=app-two \
+   run_group \
+       --execute \
+       --confirm test-group \
+       > "$TMP/wrong-record-app.log" 2>&1
+then
+    echo "ERROR: mismatched member restore record was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'member restore record application mismatch: app-two' \
+    "$TMP/wrong-record-app.log"
+
+echo "PASS: mismatched child restore record rejected"
+
+echo
+echo "=== successful child with non-success terminal record is rejected ==="
+
+sudo rm -rf "$GROUP_RESTORE_ROOT"
+mkdir -p "$GROUP_RESTORE_ROOT"
+: > "$LOG"
+
+if BAD_MEMBER_RECORD_RESULT=app-two \
+   run_group \
+       --execute \
+       --confirm test-group \
+       > "$TMP/bad-record-result.log" 2>&1
+then
+    echo "ERROR: non-success member restore record was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'member restore record does not report terminal success: app-two' \
+    "$TMP/bad-record-result.log"
+
+echo "PASS: non-success child restore record rejected"
 
 echo
 echo "=== member failure is fail-fast and durable ==="

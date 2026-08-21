@@ -431,6 +431,44 @@ PY
         tail -1
     )"
 
+    if [[ "$MEMBER_RESULT" == "PASS" ]]; then
+        [[ -n "$RESTORE_RECORD" && -r "$RESTORE_RECORD" ]] ||
+            die "member restore record is missing or unreadable: $APPLICATION"
+
+        python3 - \
+            "$RESTORE_RECORD" \
+            "$APPLICATION" <<'PY'
+import json
+import sys
+
+record_path, expected_application = sys.argv[1:]
+
+try:
+    with open(record_path, encoding="utf-8") as f:
+        document = json.load(f)
+except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(
+        f"ERROR: member restore record is invalid: "
+        f"{expected_application}: {exc}"
+    )
+
+if document.get("application") != expected_application:
+    raise SystemExit(
+        "ERROR: member restore record application mismatch: "
+        f"{expected_application}"
+    )
+
+if document.get("result") not in {
+    "RESTORE_COMPLETED",
+    "FILESYSTEM_RESTORED",
+}:
+    raise SystemExit(
+        "ERROR: member restore record does not report terminal success: "
+        f"{expected_application}"
+    )
+PY
+    fi
+
     python3 - \
         "$APPLICATION" \
         "$MEMBER_RESULT" \

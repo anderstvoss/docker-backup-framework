@@ -17,8 +17,16 @@ Usage:
 
 Without --execute, the command is plan/preflight only.
 
-The current execute implementation stops at a guarded pre-mutation boundary.
-It does not stop containers, restore files, or modify a database.
+With --execute, the command performs a guarded production restore using
+explicit immutable recovery coordinates. It creates fresh pre-restore
+repository and portable checkpoints, suspends scheduling, acquires restore
+locks, stages and validates recovery data, preserves current filesystem state
+to fallback storage, restores configured application paths, and restores
+supported logical databases.
+
+For mariadb:logical applications, database failure handling uses the fresh
+pre-restore database checkpoint for rollback. The application is not restarted
+if database rollback fails.
 HELP
     exit 2
 }
@@ -477,8 +485,19 @@ APPLICATION_NEEDS_RESTART=0
 FILESYSTEM_NEEDS_ROLLBACK=0
 declare -a FILESYSTEM_PRESERVED=()
 
+DATABASE_NEEDS_ROLLBACK=0
+DATABASE_ROLLBACK_SAFE=1
+
 cleanup_execute() {
     rc=$?
+
+    if [[ "$DATABASE_NEEDS_ROLLBACK" -eq 1 ]] &&
+       declare -F rollback_database_state >/dev/null 2>&1
+    then
+        if ! rollback_database_state; then
+            DATABASE_ROLLBACK_SAFE=0
+        fi
+    fi
 
     if [[ "$FILESYSTEM_NEEDS_ROLLBACK" -eq 1 ]] &&
        declare -F rollback_filesystem_state >/dev/null 2>&1
@@ -487,9 +506,14 @@ cleanup_execute() {
     fi
 
     if [[ "$APPLICATION_NEEDS_RESTART" -eq 1 ]] &&
+       [[ "$DATABASE_ROLLBACK_SAFE" -eq 1 ]] &&
        declare -F restore_application_state >/dev/null 2>&1
     then
         restore_application_state || true
+    elif [[ "$APPLICATION_NEEDS_RESTART" -eq 1 ]]; then
+        echo "ERROR: application restart suppressed because database rollback failed" >&2
+        cd "$COMPOSE_DIR"
+        docker compose down >/dev/null 2>&1 || true
     fi
 
     if [[ "$TIMERS_NEED_RESTORE" -eq 1 ]] &&
@@ -1004,6 +1028,41 @@ update_restore_record \
     "PENDING" \
     "false"
 
+SELECTED_DB_SQL=""
+CHECKPOINT_DB_SQL=""
+
+if [[ "$DB_TYPE" == "mariadb" ]]; then
+    echo
+    echo "===== STAGE DATABASE SNAPSHOTS ====="
+
+    SELECTED_DB_ROOT="${WORK_ROOT}/database-selected"
+    CHECKPOINT_DB_ROOT="${WORK_ROOT}/database-checkpoint"
+
+    mkdir -p \
+        "$SELECTED_DB_ROOT" \
+        "$CHECKPOINT_DB_ROOT"
+
+    restic restore \
+        "$DB_SNAPSHOT" \
+        --target "$SELECTED_DB_ROOT"
+
+    restic restore \
+        "$REPO_CP_DB" \
+        --target "$CHECKPOINT_DB_ROOT"
+
+    SELECTED_DB_SQL="${SELECTED_DB_ROOT}/database.sql"
+    CHECKPOINT_DB_SQL="${CHECKPOINT_DB_ROOT}/database.sql"
+
+    [[ -s "$SELECTED_DB_SQL" ]] ||
+        die "selected Restic database.sql missing or empty"
+
+    [[ -s "$CHECKPOINT_DB_SQL" ]] ||
+        die "pre-restore checkpoint database.sql missing or empty"
+
+    echo "PASS: selected database snapshot staged"
+    echo "PASS: pre-restore rollback database snapshot staged"
+fi
+
 rollback_filesystem_state() {
     local rollback_failed=0
 
@@ -1046,6 +1105,117 @@ rollback_filesystem_state() {
     fi
 
     return 1
+}
+
+mariadb_wait_ready() {
+    local ready=0
+
+    for _ in $(seq 1 60); do
+        if docker compose exec -T "$DB_CONTAINER" \
+            sh -c '
+                root_password="${MARIADB_ROOT_PASSWORD:-${MYSQL_ROOT_PASSWORD:-}}"
+                [ -n "$root_password" ] || exit 2
+                exec mariadb \
+                    --batch \
+                    --skip-column-names \
+                    --user=root \
+                    --password="$root_password" \
+                    -e "SELECT 1;"
+            ' \
+            2>/dev/null |
+            grep -Fxq 1
+        then
+            ready=1
+            break
+        fi
+
+        sleep 1
+    done
+
+    [[ "$ready" -eq 1 ]]
+}
+
+mariadb_reset_database() {
+    docker compose exec -T "$DB_CONTAINER" \
+        sh -c '
+            root_password="${MARIADB_ROOT_PASSWORD:-${MYSQL_ROOT_PASSWORD:-}}"
+            database="${MARIADB_DATABASE:-${MYSQL_DATABASE:-}}"
+
+            [ -n "$root_password" ] || {
+                echo "MariaDB root password is not available" >&2
+                exit 2
+            }
+
+            [ -n "$database" ] || {
+                echo "MariaDB database name is not available" >&2
+                exit 2
+            }
+
+            exec mariadb \
+                --user=root \
+                --password="$root_password" \
+                -e "DROP DATABASE IF EXISTS \`$database\`;
+                    CREATE DATABASE \`$database\`;"
+        '
+}
+
+mariadb_import_sql() {
+    local sql_file="$1"
+
+    [[ -s "$sql_file" ]] ||
+        return 1
+
+    docker compose exec -T "$DB_CONTAINER" \
+        sh -c '
+            root_password="${MARIADB_ROOT_PASSWORD:-${MYSQL_ROOT_PASSWORD:-}}"
+            database="${MARIADB_DATABASE:-${MYSQL_DATABASE:-}}"
+
+            [ -n "$root_password" ] || exit 2
+            [ -n "$database" ] || exit 2
+
+            exec mariadb \
+                --user=root \
+                --password="$root_password" \
+                "$database"
+        ' \
+        < "$sql_file"
+}
+
+rollback_database_state() {
+    echo
+    echo "===== ROLLBACK PRODUCTION DATABASE ====="
+
+    cd "$COMPOSE_DIR"
+
+    if ! docker compose up -d "$DB_CONTAINER"; then
+        echo "ERROR: unable to start database service for rollback" >&2
+        return 1
+    fi
+
+    if ! mariadb_wait_ready; then
+        echo "ERROR: database did not become ready for rollback" >&2
+        return 1
+    fi
+
+    if ! mariadb_reset_database; then
+        echo "ERROR: unable to reset database for rollback" >&2
+        return 1
+    fi
+
+    if ! mariadb_import_sql "$CHECKPOINT_DB_SQL"; then
+        echo "ERROR: pre-restore database checkpoint import failed" >&2
+        return 1
+    fi
+
+    if ! mariadb_wait_ready; then
+        echo "ERROR: database failed readiness check after rollback" >&2
+        return 1
+    fi
+
+    DATABASE_NEEDS_ROLLBACK=0
+
+    echo "PASS: production database rolled back to pre-restore checkpoint"
+    return 0
 }
 
 echo
@@ -1151,47 +1321,112 @@ update_restore_record \
 echo
 echo "===== DATABASE BOUNDARY ====="
 echo "Production filesystem has been replaced."
-echo "Database state has NOT been modified."
 
-# At this checkpoint, a successful filesystem placement is accepted.
-# Preserve the fallback tree for operator recovery, but disable automatic
-# rollback before intentionally restarting into the restored filesystem.
-FILESYSTEM_NEEDS_ROLLBACK=0
+if [[ "$DB_TYPE" == "mariadb" ]]; then
+    echo
+    echo "===== RESTORE MARIADB DATABASE ====="
 
-restore_application_state
+    cd "$COMPOSE_DIR"
 
-RESTORED_SERVICES="$(
-    docker compose ps \
-        --services \
-        --filter status=running
-)"
+    docker compose up -d "$DB_CONTAINER"
 
-[[ -n "$RESTORED_SERVICES" ]] ||
-    die "application stack did not return to a running state"
+    mariadb_wait_ready ||
+        die "database service did not become ready"
 
-echo "PASS: application has running services after restart"
+    # From the first destructive database operation onward, EXIT cleanup
+    # must restore the fresh pre-restore DB checkpoint before the original
+    # application is allowed to restart.
+    DATABASE_NEEDS_ROLLBACK=1
 
-restore_timer_state
+    mariadb_reset_database ||
+        die "unable to reset production database"
 
-update_restore_record \
-    "FILESYSTEM_RESTORED" \
-    "production-filesystem-restored" \
-    "true" \
-    "PASS" \
-    "PASS" \
-    "PASS" \
-    "NOT_NEEDED" \
-    "PASS" \
-    "true"
+    mariadb_import_sql "$SELECTED_DB_SQL" ||
+        die "selected database import failed"
+
+    mariadb_wait_ready ||
+        die "database failed readiness check after selected import"
+
+    DATABASE_NEEDS_ROLLBACK=0
+
+    echo "PASS: selected immutable database snapshot imported"
+    echo "PASS: production database passed readiness validation"
+
+    # Filesystem and database now represent the selected recovery point.
+    # The fallback tree and pre-restore DB checkpoint coordinates remain
+    # durable recovery anchors, but automatic rollback is no longer needed.
+    FILESYSTEM_NEEDS_ROLLBACK=0
+
+    restore_application_state
+
+    RESTORED_SERVICES="$(
+        docker compose ps \
+            --services \
+            --filter status=running
+    )"
+
+    [[ -n "$RESTORED_SERVICES" ]] ||
+        die "application stack did not return to a running state"
+
+    echo "PASS: application has running services after database restore"
+
+    restore_timer_state
+
+    update_restore_record \
+        "RESTORE_COMPLETED" \
+        "production-filesystem-and-database-restored" \
+        "true" \
+        "PASS" \
+        "PASS" \
+        "PASS" \
+        "NOT_NEEDED" \
+        "PASS" \
+        "true"
+
+    echo
+    echo "PASS: production filesystem restored from immutable snapshot"
+    echo "PASS: production database restored from immutable snapshot"
+else
+    echo "Database state does not require restoration."
+
+    FILESYSTEM_NEEDS_ROLLBACK=0
+
+    restore_application_state
+
+    RESTORED_SERVICES="$(
+        docker compose ps \
+            --services \
+            --filter status=running
+    )"
+
+    [[ -n "$RESTORED_SERVICES" ]] ||
+        die "application stack did not return to a running state"
+
+    echo "PASS: application has running services after restart"
+
+    restore_timer_state
+
+    update_restore_record \
+        "FILESYSTEM_RESTORED" \
+        "production-filesystem-restored" \
+        "true" \
+        "PASS" \
+        "PASS" \
+        "PASS" \
+        "NOT_NEEDED" \
+        "PASS" \
+        "true"
+
+    echo
+    echo "PASS: production filesystem restored from immutable snapshot"
+    echo "PASS: database state was not modified"
+fi
 
 rm -f "$VALIDATION_RESULT"
 rm -rf "$WORK_ROOT"
 trap - EXIT
 
-echo
-echo "PASS: production filesystem restored from immutable snapshot"
 echo "PASS: fallback copy preserved"
-echo "PASS: database state was not modified"
 echo "PASS: application state restored"
 echo "PASS: timer state restored"
 echo "Fallback root: $FALLBACK_ROOT"

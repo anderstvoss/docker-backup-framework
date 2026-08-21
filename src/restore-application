@@ -1540,6 +1540,33 @@ echo "===== PRESERVE PRODUCTION FILESYSTEM ====="
 
 mkdir -p "$FALLBACK_ROOT"
 
+echo
+echo "===== VERIFY ATOMIC FALLBACK RENAMES ====="
+
+for path in "${BACKUP_PATHS[@]}"; do
+    relative="${path#/}"
+    fallback="${FALLBACK_ROOT}/${relative}"
+
+    [[ -e "$path" ]] ||
+        die "production backup path missing before preservation: $path"
+
+    source_parent="$(dirname "$path")"
+    fallback_parent="$(dirname "$fallback")"
+
+    mkdir -p "$fallback_parent"
+
+    source_device="$(stat -c '%d' -- "$source_parent")" ||
+        die "unable to determine source filesystem device: $source_parent"
+
+    fallback_device="$(stat -c '%d' -- "$fallback_parent")" ||
+        die "unable to determine fallback filesystem device: $fallback_parent"
+
+    [[ "$source_device" == "$fallback_device" ]] ||
+        die "fallback destination is on a different filesystem: $path -> $fallback"
+
+    echo "PASS: atomic fallback rename available for $path"
+done
+
 # From the first production-path move onward, any failure must restore every
 # path that has already been preserved before the application can restart.
 FILESYSTEM_NEEDS_ROLLBACK=1

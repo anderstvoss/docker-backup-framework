@@ -333,6 +333,45 @@ fi
 EOF_RESTIC
 chmod +x "$BIN/restic"
 
+cat > "$BIN/stat" <<'EOF_STAT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'stat|%s\n' "$*" >> "$TEST_COMMAND_LOG"
+
+[[ "${1:-}" == "-c" ]] || {
+    echo "unexpected stat arguments: $*" >&2
+    exit 1
+}
+
+[[ "${2:-}" == "%d" ]] || {
+    echo "unexpected stat format: $*" >&2
+    exit 1
+}
+
+shift 2
+
+if [[ "${1:-}" == "--" ]]; then
+    shift
+fi
+
+[[ $# -eq 1 ]] || {
+    echo "unexpected stat path arguments: $*" >&2
+    exit 1
+}
+
+path="$1"
+
+if [[ "${CROSS_FILESYSTEM_FALLBACK:-0}" == "1" ]] &&
+   [[ "$path" == "$TEST_FALLBACK_ROOT"* ]]
+then
+    echo 200
+else
+    echo 100
+fi
+EOF_STAT
+chmod +x "$BIN/stat"
+
 cat > "$BIN/mv" <<'EOF_MV'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -419,6 +458,8 @@ run_execute() {
         "TEST_BACKUP_PATH=$TMP/app/config" \
         "TEST_BACKUP_PATH_TWO=$TMP/app/assets" \
         "TEST_EXCLUDED_PATH=$TMP/app/excluded" \
+        "TEST_FALLBACK_ROOT=$TMP/fallback" \
+        "CROSS_FILESYSTEM_FALLBACK=${CROSS_FILESYSTEM_FALLBACK:-0}" \
         "FAIL_REPOSITORY_CHECKPOINT=${FAIL_REPOSITORY_CHECKPOINT:-0}" \
         "FAIL_PORTABLE_CHECKPOINT=${FAIL_PORTABLE_CHECKPOINT:-0}" \
         "FAIL_TIMER_STOP=${FAIL_TIMER_STOP:-}" \
@@ -843,6 +884,50 @@ fi
 }
 
 echo "PASS: failed shutdown prevents staging"
+
+echo
+echo "=== cross-filesystem fallback rejected before first production move ==="
+
+sudo rm -rf "$TMP/fallback"
+sudo rm -rf "$TMP/app/config" "$TMP/app/assets"
+mkdir -p "$TMP/app/config" "$TMP/app/assets"
+
+printf '%s\n' "production-current-state" > "$PRODUCTION_FILE"
+printf '%s\n' "production-second-state" > "$PRODUCTION_FILE_TWO"
+
+: > "$LOG"
+printf '%s\n' running > "$TMP/app-state"
+
+if CROSS_FILESYSTEM_FALLBACK=1 \
+   run_execute > "$TMP/cross-filesystem.log" 2>&1
+then
+    echo "ERROR: cross-filesystem fallback was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'fallback destination is on a different filesystem' \
+    "$TMP/cross-filesystem.log"
+
+if grep -F 'mv|' "$LOG"; then
+    echo "ERROR: production move occurred despite cross-filesystem fallback" >&2
+    exit 1
+fi
+
+sudo grep -Fx \
+    'production-current-state' \
+    "$PRODUCTION_FILE" >/dev/null
+
+sudo grep -Fx \
+    'production-second-state' \
+    "$PRODUCTION_FILE_TWO" >/dev/null
+
+[[ "$(cat "$TMP/app-state")" == "running" ]] || {
+    echo "ERROR: application was not recovered after filesystem preflight failure" >&2
+    exit 1
+}
+
+echo "PASS: cross-filesystem fallback rejected before first production move"
 
 echo
 echo "=== partial preservation failure rolls back ==="

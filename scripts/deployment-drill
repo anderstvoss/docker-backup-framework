@@ -421,26 +421,42 @@ CURRENT_STAGE="end-to-end acceptance"
     | tee "$ACCEPTANCE_OUTPUT"
 
 GENERATION="$(
-    awk -F': ' \
-        '/^Restic generation: / { value=$2 } END { print value }' \
+    awk -F':' \
+        '/^Restic generation:/ {
+            value=$2
+            sub(/^[[:space:]]+/, "", value)
+        }
+        END { print value }' \
         "$ACCEPTANCE_OUTPUT"
 )"
 
 RECOVERY_SET="$(
-    awk -F': ' \
-        '/^Portable set: / { value=$2 } END { print value }' \
+    awk -F':' \
+        '/^Portable set:/ {
+            value=$2
+            sub(/^[[:space:]]+/, "", value)
+        }
+        END { print value }' \
         "$ACCEPTANCE_OUTPUT"
 )"
 
 DB_SNAPSHOT="$(
-    awk -F': ' \
-        '/^DB snapshot: / { value=$2 } END { print value }' \
+    awk -F':' \
+        '/^DB snapshot:/ {
+            value=$2
+            sub(/^[[:space:]]+/, "", value)
+        }
+        END { print value }' \
         "$ACCEPTANCE_OUTPUT"
 )"
 
 FILES_SNAPSHOT="$(
-    awk -F': ' \
-        '/^Files snapshot: / { value=$2 } END { print value }' \
+    awk -F':' \
+        '/^Files snapshot:/ {
+            value=$2
+            sub(/^[[:space:]]+/, "", value)
+        }
+        END { print value }' \
         "$ACCEPTANCE_OUTPUT"
 )"
 

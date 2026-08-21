@@ -104,9 +104,9 @@ set -Eeuo pipefail
 
 echo "===== MOCK ACCEPTANCE ====="
 echo "Restic generation: generation-test-001"
-echo "Portable set: /mock/portable/2026-01-01_000000Z"
-echo "DB snapshot: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-echo "Files snapshot: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+echo "Portable set:      /mock/portable/2026-01-01_000000Z"
+echo "DB snapshot:       aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+echo "Files snapshot:    bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 echo "PASS: mock acceptance"
 STUB
 

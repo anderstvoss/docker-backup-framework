@@ -154,7 +154,8 @@ for engine in \
     maintain-repository \
     portable-backup \
     portable-retention \
-    backup-group
+    backup-group \
+    validate-application-recovery
 do
     cp "$SOURCE_ROOT/src/$engine" "$RUNTIME_ROOT/$engine"
     chmod 0750 "$RUNTIME_ROOT/$engine"
@@ -163,7 +164,8 @@ done
 for tool in \
     acceptance-test \
     resolve-snapshot \
-    validate-group
+    validate-group \
+    validate-group-manifest
 do
     cp "$SOURCE_ROOT/scripts/$tool" "$RUNTIME_ROOT/$tool"
     chmod 0750 "$RUNTIME_ROOT/$tool"
@@ -180,7 +182,9 @@ STUB
         "$source/scripts/acceptance-test" \
         "$source/scripts/resolve-snapshot" \
         "$source/scripts/validate-group" \
+        "$source/scripts/validate-group-manifest" \
         "$source/src/backup-group" \
+        "$source/src/validate-application-recovery" \
         "$source/src/maintain-repository"
 
     # Create a real disposable Git repository so clean/dirty and exact commit

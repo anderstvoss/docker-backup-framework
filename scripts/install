@@ -78,9 +78,11 @@ for file in \
     "$SOURCE_ROOT/src/portable-backup" \
     "$SOURCE_ROOT/src/portable-retention" \
     "$SOURCE_ROOT/src/backup-group" \
+    "$SOURCE_ROOT/src/validate-application-recovery" \
     "$SOURCE_ROOT/scripts/acceptance-test" \
     "$SOURCE_ROOT/scripts/resolve-snapshot" \
-    "$SOURCE_ROOT/scripts/validate-group"
+    "$SOURCE_ROOT/scripts/validate-group" \
+    "$SOURCE_ROOT/scripts/validate-group-manifest"
 do
     if [ ! -f "$file" ]; then
         echo "ERROR: missing source file: $file" >&2
@@ -94,9 +96,11 @@ bash -n "$SOURCE_ROOT/src/maintain-repository"
 bash -n "$SOURCE_ROOT/src/portable-backup"
 bash -n "$SOURCE_ROOT/src/portable-retention"
 bash -n "$SOURCE_ROOT/src/backup-group"
+bash -n "$SOURCE_ROOT/src/validate-application-recovery"
 bash -n "$SOURCE_ROOT/scripts/acceptance-test"
 bash -n "$SOURCE_ROOT/scripts/resolve-snapshot"
 bash -n "$SOURCE_ROOT/scripts/validate-group"
+bash -n "$SOURCE_ROOT/scripts/validate-group-manifest"
 
 if [ "$PRESERVE_CONFIG" = false ]; then
     for config_dir in \
@@ -179,6 +183,10 @@ install -o root -g root -m 0750 \
     "$ENGINE_DEST/backup-group"
 
 install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/src/validate-application-recovery" \
+    "$ENGINE_DEST/validate-application-recovery"
+
+install -o root -g root -m 0750 \
     "$SOURCE_ROOT/scripts/acceptance-test" \
     "$ENGINE_DEST/acceptance-test"
 
@@ -189,6 +197,10 @@ install -o root -g root -m 0750 \
 install -o root -g root -m 0750 \
     "$SOURCE_ROOT/scripts/validate-group" \
     "$ENGINE_DEST/validate-group"
+
+install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/scripts/validate-group-manifest" \
+    "$ENGINE_DEST/validate-group-manifest"
 
 echo
 echo "===== INSTALL CONFIGURATION ====="
@@ -274,6 +286,9 @@ cmp "$SOURCE_ROOT/src/portable-retention" \
 cmp "$SOURCE_ROOT/src/backup-group" \
     "$ENGINE_DEST/backup-group"
 
+cmp "$SOURCE_ROOT/src/validate-application-recovery" \
+    "$ENGINE_DEST/validate-application-recovery"
+
 cmp "$SOURCE_ROOT/scripts/acceptance-test" \
     "$ENGINE_DEST/acceptance-test"
 
@@ -282,6 +297,9 @@ cmp "$SOURCE_ROOT/scripts/resolve-snapshot" \
 
 cmp "$SOURCE_ROOT/scripts/validate-group" \
     "$ENGINE_DEST/validate-group"
+
+cmp "$SOURCE_ROOT/scripts/validate-group-manifest" \
+    "$ENGINE_DEST/validate-group-manifest"
 
 if [ "$PRESERVE_CONFIG" = false ]; then
     for config in "$SOURCE_ROOT"/config/apps/*.conf; do

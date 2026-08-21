@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENGINE="${ROOT}/src/validate-application-recovery"
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+APP_ROOT="$TMP/app"
+REPO_ROOT="$TMP/repository"
+PORTABLE_ROOT="$TMP/portable"
+BIN="$TMP/bin"
+LOCK_ROOT="$TMP/locks"
+RESULT_FILE="$TMP/result.env"
+DOCKER_LOG="$TMP/docker.log"
+
+mkdir -p \
+    "$APP_ROOT/config" \
+    "$REPO_ROOT" \
+    "$PORTABLE_ROOT/set-one" \
+    "$BIN" \
+    "$LOCK_ROOT" \
+    "$TMP/compose"
+
+FILES_SNAPSHOT="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+DB_SNAPSHOT="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+GENERATION="20260821T200000Z-12345"
+
+printf '%s\n' 'config-data' > "$APP_ROOT/config/example.conf"
+
+cat > "$TMP/app.conf" <<EOF_APP
+APP_NAME="app-one"
+COMPOSE_DIR="$TMP/compose"
+DB_TYPE="mariadb"
+DB_BACKUP_MODE="logical"
+DB_CONTAINER="db"
+BACKUP_PATHS=(
+    "$APP_ROOT/config"
+)
+EXCLUDE_PATHS=(
+    "$APP_ROOT/excluded"
+)
+EOF_APP
+
+cat > "$TMP/repo.conf" <<EOF_REPO
+REPO_NAME="app-one-operational"
+APP_NAME="app-one"
+REPOSITORY="$REPO_ROOT"
+PASSWORD_FILE="$TMP/restic.password"
+STORAGE_TYPE="local"
+EOF_REPO
+
+cat > "$TMP/portable.conf" <<EOF_PORTABLE
+PORTABLE_NAME="app-one"
+APP_NAME="app-one"
+BACKUP_ROOT="$PORTABLE_ROOT"
+STORAGE_TYPE="local"
+EOF_PORTABLE
+
+printf '%s\n' 'test-password' > "$TMP/restic.password"
+chmod 0600 "$TMP/restic.password"
+
+STAGE="$TMP/stage"
+
+mkdir -p "$STAGE${APP_ROOT}/config"
+
+printf '%s\n' 'config-data' \
+    > "$STAGE${APP_ROOT}/config/example.conf"
+
+tar \
+    -C "$STAGE" \
+    -czf "$PORTABLE_ROOT/set-one/app-state.tar.gz" \
+    .
+
+cat > "$TMP/portable.sql" <<'SQL'
+CREATE TABLE example (id INT);
+SQL
+
+gzip -c "$TMP/portable.sql" \
+    > "$PORTABLE_ROOT/set-one/database.sql.gz"
+
+(
+    cd "$PORTABLE_ROOT/set-one"
+    sha256sum \
+        app-state.tar.gz \
+        database.sql.gz \
+        > SHA256SUMS
+)
+
+cat > "$BIN/restic" <<'EOF_RESTIC'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+FILES_SNAPSHOT="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+DB_SNAPSHOT="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+GENERATION="20260821T200000Z-12345"
+
+case "$1" in
+    snapshots)
+        cat <<EOF_JSON
+[
+  {
+    "id": "$FILES_SNAPSHOT",
+    "tags": [
+      "app:app-one",
+      "repo:operational",
+      "generation:$GENERATION",
+      "component:files",
+      "state:complete"
+    ]
+  },
+  {
+    "id": "$DB_SNAPSHOT",
+    "tags": [
+      "app:app-one",
+      "repo:operational",
+      "generation:$GENERATION",
+      "component:db",
+      "state:complete"
+    ]
+  }
+]
+EOF_JSON
+        ;;
+
+    restore)
+        snapshot="$2"
+        shift 2
+
+        target=""
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --target)
+                    shift
+                    target="$1"
+                    ;;
+            esac
+            shift
+        done
+
+        [[ -n "$target" ]] || exit 1
+
+        case "$snapshot" in
+            "$FILES_SNAPSHOT")
+                mkdir -p "$target${TEST_APP_ROOT}/config"
+
+                printf '%s\n' 'config-data' \
+                    > "$target${TEST_APP_ROOT}/config/example.conf"
+                ;;
+
+            "$DB_SNAPSHOT")
+                mkdir -p "$target"
+
+                cat > "$target/database.sql" <<'SQL'
+CREATE TABLE example (id INT);
+SQL
+                ;;
+
+            *)
+                echo "unexpected snapshot: $snapshot" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+
+    *)
+        echo "unexpected restic command: $*" >&2
+        exit 1
+        ;;
+esac
+EOF_RESTIC
+
+chmod +x "$BIN/restic"
+
+cat > "$BIN/docker" <<'EOF_DOCKER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf '%s\n' "$*" >> "$TEST_DOCKER_LOG"
+
+if [[ "$1" == "compose" && "$2" == "ps" && "$3" == "-q" ]]; then
+    echo "mock-db-container"
+    exit 0
+fi
+
+if [[ "$1" == "inspect" ]]; then
+    if [[ "$*" == *"{{.Config.Image}}"* ]]; then
+        echo "mariadb:11"
+        exit 0
+    fi
+
+    if [[ "$*" == *"{{range .Config.Env}}"* ]]; then
+        echo "MARIADB_DATABASE=appdb"
+        exit 0
+    fi
+fi
+
+if [[ "$1" == "run" ]]; then
+    echo "mock-container-id"
+    exit 0
+fi
+
+if [[ "$1" == "rm" ]]; then
+    exit 0
+fi
+
+if [[ "$1" == "logs" ]]; then
+    exit 0
+fi
+
+if [[ "$1" == "exec" ]]; then
+    # Read piped SQL when -i is used so the producer does not hit SIGPIPE.
+    if [[ " $* " == *" -i "* ]]; then
+        cat >/dev/null
+        exit 0
+    fi
+
+    if [[ "$*" == *"SELECT 1;"* ]]; then
+        echo "1"
+        exit 0
+    fi
+
+    if [[ "$*" == *"DROP DATABASE IF EXISTS"* ]]; then
+        exit 0
+    fi
+
+    if [[ "$*" == *"information_schema.tables"* ]]; then
+        cat <<'METRICS'
+tables=1
+triggers=0
+alembic=
+METRICS
+        exit 0
+    fi
+
+    exit 0
+fi
+
+echo "unexpected docker command: $*" >&2
+exit 1
+EOF_DOCKER
+
+chmod +x "$BIN/docker"
+
+run_validator() {
+    sudo env \
+        "PATH=$BIN:$PATH" \
+        "TEST_APP_ROOT=$APP_ROOT" \
+        "TEST_DOCKER_LOG=$DOCKER_LOG" \
+        "DOCKER_BACKUP_LOCK_ROOT=$LOCK_ROOT" \
+        "$ENGINE" "$@"
+}
+
+echo "=== successful MariaDB recovery validation ==="
+
+run_validator \
+    "$TMP/app.conf" \
+    "$TMP/repo.conf" \
+    "$TMP/portable.conf" \
+    --generation "$GENERATION" \
+    --files-snapshot "$FILES_SNAPSHOT" \
+    --db-snapshot "$DB_SNAPSHOT" \
+    --portable-set "$PORTABLE_ROOT/set-one" \
+    --result-file "$RESULT_FILE"
+
+RESULT_CONTENTS="$(sudo cat "$RESULT_FILE")"
+
+grep -Fx 'RESULT=PASS' <<<"$RESULT_CONTENTS"
+grep -Fx 'APPLICATION=app-one' <<<"$RESULT_CONTENTS"
+grep -Fx 'DATABASE=PASS' <<<"$RESULT_CONTENTS"
+grep -Fx "DB_SNAPSHOT=$DB_SNAPSHOT" <<<"$RESULT_CONTENTS"
+
+grep -F 'docker-recovery-validation-app-one-' "$DOCKER_LOG"
+grep -F 'mariadb:11' "$DOCKER_LOG"
+
+echo "PASS: MariaDB recovery point validated"
+
+echo
+echo "=== missing DB snapshot rejection ==="
+
+if run_validator \
+       "$TMP/app.conf" \
+       "$TMP/repo.conf" \
+       "$TMP/portable.conf" \
+       --generation "$GENERATION" \
+       --files-snapshot "$FILES_SNAPSHOT" \
+       --portable-set "$PORTABLE_ROOT/set-one" \
+       > "$TMP/missing-db.log" 2>&1
+then
+    echo "ERROR: missing DB snapshot was accepted" >&2
+    exit 1
+fi
+
+grep -F -- \
+    '--db-snapshot is required for mariadb:logical' \
+    "$TMP/missing-db.log"
+
+echo "PASS: missing DB snapshot rejected"
+
+echo
+echo "=== wrong DB snapshot rejection ==="
+
+BAD_DB="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+if run_validator \
+       "$TMP/app.conf" \
+       "$TMP/repo.conf" \
+       "$TMP/portable.conf" \
+       --generation "$GENERATION" \
+       --files-snapshot "$FILES_SNAPSHOT" \
+       --db-snapshot "$BAD_DB" \
+       --portable-set "$PORTABLE_ROOT/set-one" \
+       > "$TMP/bad-db.log" 2>&1
+then
+    echo "ERROR: wrong DB snapshot was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    "expected immutable snapshot $BAD_DB" \
+    "$TMP/bad-db.log"
+
+echo "PASS: wrong DB snapshot rejected"
+
+echo
+echo "PASS: MariaDB validate-application-recovery regression suite"

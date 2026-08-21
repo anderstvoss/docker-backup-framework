@@ -371,7 +371,8 @@ for engine in \
     maintain-repository \
     portable-backup \
     portable-retention \
-    backup-group
+    backup-group \
+    validate-application-recovery
 do
     cmp \
         "$SOURCE_ROOT/src/$engine" \
@@ -381,7 +382,8 @@ done
 for tool in \
     acceptance-test \
     resolve-snapshot \
-    validate-group
+    validate-group \
+    validate-group-manifest
 do
     cmp \
         "$SOURCE_ROOT/scripts/$tool" \

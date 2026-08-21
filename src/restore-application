@@ -431,7 +431,9 @@ echo "===== SCHEDULING ====="
 TIMER_UNITS=(
     "docker-backup@${REPO_ID}.timer"
     "docker-retention@${REPO_ID}.timer"
-    "docker-maintenance@${REPO_ID}.timer"
+    "docker-check@${REPO_ID}.timer"
+    "docker-read-data@${REPO_ID}.timer"
+    "docker-prune@${REPO_ID}.timer"
     "docker-portable-backup@${PORTABLE_ID}.timer"
     "docker-portable-retention@${PORTABLE_ID}.timer"
 )

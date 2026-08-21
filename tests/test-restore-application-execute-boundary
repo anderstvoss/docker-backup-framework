@@ -738,13 +738,13 @@ START_COUNT="$(
     grep -c '^systemctl|start ' "$LOG" || true
 )"
 
-[[ "$STOP_COUNT" -eq 5 ]] || {
-    echo "ERROR: expected 5 timer stops, got $STOP_COUNT" >&2
+[[ "$STOP_COUNT" -eq 7 ]] || {
+    echo "ERROR: expected 7 timer stops, got $STOP_COUNT" >&2
     exit 1
 }
 
-[[ "$START_COUNT" -eq 5 ]] || {
-    echo "ERROR: expected 5 timer restarts after lock failure, got $START_COUNT" >&2
+[[ "$START_COUNT" -eq 7 ]] || {
+    echo "ERROR: expected 7 timer restarts after lock failure, got $START_COUNT" >&2
     exit 1
 }
 
@@ -754,7 +754,7 @@ echo
 echo "=== partial timer-stop failure ==="
 : > "$LOG"
 
-FAIL_UNIT="docker-maintenance@app-one-operational.timer"
+FAIL_UNIT="docker-read-data@app-one-operational.timer"
 
 if FAIL_TIMER_STOP="$FAIL_UNIT" \
    run_execute > "$TMP/timer-fail.log" 2>&1

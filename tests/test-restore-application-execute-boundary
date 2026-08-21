@@ -696,41 +696,52 @@ echo "=== busy application lock ==="
 : > "$LOG"
 
 APP_LOCK="$LOCK_ROOT/docker-backup-app-app-one.lock"
+LOCK_READY="$TMP/lock-ready"
+LOCK_PID_FILE="$TMP/lock-holder-pid"
 
-sudo env     APP_LOCK="$APP_LOCK"     READY_FILE="$TMP/lock-ready"     bash -c '
+sudo env \
+    APP_LOCK="$APP_LOCK" \
+    READY_FILE="$LOCK_READY" \
+    PID_FILE="$LOCK_PID_FILE" \
+    bash -c '
         exec 9>"$APP_LOCK"
         flock 9
+        printf "%s\n" "$$" > "$PID_FILE"
         printf "%s\n" locked > "$READY_FILE"
-        sleep 30
+        exec sleep 30
     ' &
-LOCK_PID=$!
+LOCK_WRAPPER_PID=$!
 
 for _ in $(seq 1 100); do
-    [[ -f "$TMP/lock-ready" ]] && break
+    [[ -f "$LOCK_READY" && -f "$LOCK_PID_FILE" ]] && break
     sleep 0.05
 done
 
-[[ -f "$TMP/lock-ready" ]] || {
-    sudo kill "$LOCK_PID" 2>/dev/null || true
-    wait "$LOCK_PID" 2>/dev/null || true
+if [[ ! -f "$LOCK_READY" || ! -f "$LOCK_PID_FILE" ]]; then
+    sudo kill "$LOCK_WRAPPER_PID" 2>/dev/null || true
+    wait "$LOCK_WRAPPER_PID" 2>/dev/null || true
     echo "ERROR: lock-holder process did not become ready" >&2
     exit 1
+fi
+
+LOCK_HOLDER_PID="$(cat "$LOCK_PID_FILE")"
+
+cleanup_lock_holder() {
+    sudo kill "$LOCK_HOLDER_PID" 2>/dev/null || true
+    wait "$LOCK_WRAPPER_PID" 2>/dev/null || true
 }
 
 if run_execute > "$TMP/lock-fail.log" 2>&1; then
-    sudo kill "$LOCK_PID" 2>/dev/null || true
-    wait "$LOCK_PID" 2>/dev/null || true
+    cleanup_lock_holder
     echo "ERROR: busy application lock was accepted" >&2
     exit 1
 fi
 
-sudo kill "$LOCK_PID" 2>/dev/null || true
-wait "$LOCK_PID" 2>/dev/null || true
+cleanup_lock_holder
 
 grep -F \
     'application operation lock is busy: app-one' \
     "$TMP/lock-fail.log"
-
 STOP_COUNT="$(
     grep -c '^systemctl|stop ' "$LOG" || true
 )"

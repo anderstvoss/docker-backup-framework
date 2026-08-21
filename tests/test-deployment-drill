@@ -348,7 +348,7 @@ test -z "$(git -C "$CASE_ROOT/source" status --porcelain)"
 LOG_FILE="$(latest_log "$CASE_ROOT")"
 
 grep -Fx 'RESULT=PASS' "$LOG_FILE"
-grep -Fx 'FRAMEWORK_VERSION=1.0.0' "$LOG_FILE"
+grep -Fx 'FRAMEWORK_VERSION=1.1.0' "$LOG_FILE"
 grep -Fx "GIT_COMMIT=$EXPECTED_COMMIT" "$LOG_FILE"
 grep -Fx 'APPLICATION=test-app' "$LOG_FILE"
 grep -Fx 'REPOSITORY=test-app-operational' "$LOG_FILE"

@@ -239,9 +239,9 @@ done
 echo "=== deployed version marker ==="
 
 cat > "$PRESERVE/expected-version" <<'EOF_VERSION'
-FRAMEWORK_VERSION=1.0.0
+FRAMEWORK_VERSION=1.1.0
 GIT_COMMIT=unknown
-GIT_DESCRIBE=v1.0.0
+GIT_DESCRIBE=v1.1.0
 EOF_VERSION
 
 cmp \
@@ -301,9 +301,9 @@ cmp \
     "$ROOT/usr/local/lib/docker-backup/validate-group"
 
 cat > "$STANDARD/expected-version" <<'EOF_VERSION'
-FRAMEWORK_VERSION=1.0.0
+FRAMEWORK_VERSION=1.1.0
 GIT_COMMIT=unknown
-GIT_DESCRIBE=v1.0.0
+GIT_DESCRIBE=v1.1.0
 EOF_VERSION
 
 cmp \

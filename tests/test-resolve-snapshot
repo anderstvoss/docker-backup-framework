@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RESOLVER="$REPO_ROOT/scripts/resolve-snapshot"
+
+FIXTURE='[
+  {
+    "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tags": [
+      "app:example-app",
+      "repo:operational",
+      "generation:generation-one",
+      "component:db",
+      "state:complete"
+    ]
+  },
+  {
+    "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "tags": [
+      "app:example-app",
+      "repo:operational",
+      "generation:generation-one",
+      "component:files",
+      "state:complete"
+    ]
+  },
+  {
+    "id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "tags": [
+      "app:example-app",
+      "repo:operational",
+      "generation:generation-two",
+      "component:db",
+      "state:complete"
+    ]
+  }
+]'
+
+echo "=== exact DB selection ==="
+
+ID="$(
+    printf '%s\n' "$FIXTURE" |
+    "$RESOLVER" \
+        app:example-app \
+        repo:operational \
+        generation:generation-one \
+        component:db \
+        state:complete
+)"
+
+test "$ID" = \
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+echo "PASS: exact DB component selected"
+
+echo
+echo "=== exact files selection ==="
+
+ID="$(
+    printf '%s\n' "$FIXTURE" |
+    "$RESOLVER" \
+        app:example-app \
+        repo:operational \
+        generation:generation-one \
+        component:files \
+        state:complete
+)"
+
+test "$ID" = \
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+echo "PASS: exact filesystem component selected"
+
+echo
+echo "=== ambiguous selection rejection ==="
+
+if printf '%s\n' "$FIXTURE" |
+   "$RESOLVER" \
+       app:example-app \
+       repo:operational \
+       component:db \
+       state:complete \
+       >/dev/null 2>&1
+then
+    echo "ERROR: ambiguous selection was accepted" >&2
+    exit 1
+fi
+
+echo "PASS: ambiguous selection rejected"
+
+echo
+echo "=== missing selection rejection ==="
+
+if printf '%s\n' "$FIXTURE" |
+   "$RESOLVER" \
+       app:example-app \
+       repo:operational \
+       generation:does-not-exist \
+       component:db \
+       state:complete \
+       >/dev/null 2>&1
+then
+    echo "ERROR: missing selection was accepted" >&2
+    exit 1
+fi
+
+echo "PASS: missing selection rejected"
+
+echo
+echo "PASS: exact snapshot resolver regression suite"

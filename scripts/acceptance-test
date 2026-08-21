@@ -1,0 +1,554 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+    cat <<'HELP'
+Usage:
+  acceptance-test <repository-config> <portable-config>
+
+Performs a destructive-to-backup-storage but non-destructive-to-production
+post-change acceptance test:
+
+- creates a fresh Restic generation
+- creates a fresh portable recovery set
+- runs Restic repository check
+- resolves exact completed snapshots by full tag set
+- restores Restic and portable filesystem state to temporary locations
+- validates included and excluded paths
+- imports both logical database backups into a disposable MariaDB container
+- compares restored schema metrics with the live application database
+- removes all disposable local test resources
+
+Currently supported database mode:
+  mariadb:logical
+HELP
+}
+
+if [ "$#" -ne 2 ]; then
+    usage >&2
+    exit 2
+fi
+
+if [ "$EUID" -ne 0 ]; then
+    echo "ERROR: acceptance test must run as root" >&2
+    exit 1
+fi
+
+REPO_CONFIG="$1"
+PORTABLE_CONFIG="$2"
+
+for file in "$REPO_CONFIG" "$PORTABLE_CONFIG"; do
+    if [ ! -f "$file" ]; then
+        echo "ERROR: configuration file not found: $file" >&2
+        exit 1
+    fi
+done
+
+RUNTIME_ROOT="/usr/local/lib/docker-backup"
+VERSION_FILE="/etc/docker-backup/DEPLOYED_VERSION"
+
+for file in \
+    "$RUNTIME_ROOT/backup-repository" \
+    "$RUNTIME_ROOT/portable-backup" \
+    "$RUNTIME_ROOT/maintain-repository" \
+    "$RUNTIME_ROOT/resolve-snapshot"
+do
+    if [ ! -x "$file" ]; then
+        echo "ERROR: required executable missing: $file" >&2
+        exit 1
+    fi
+done
+
+# Repository configuration.
+# shellcheck source=/dev/null
+source "$REPO_CONFIG"
+
+REPOSITORY_APP_NAME="$APP_NAME"
+
+: "${REPO_NAME:?Missing REPO_NAME}"
+: "${REPOSITORY_APP_NAME:?Missing APP_NAME}"
+: "${REPOSITORY:?Missing REPOSITORY}"
+: "${PASSWORD_FILE:?Missing PASSWORD_FILE}"
+
+# Portable configuration.
+# shellcheck source=/dev/null
+source "$PORTABLE_CONFIG"
+
+PORTABLE_APP_NAME="$APP_NAME"
+
+: "${PORTABLE_NAME:?Missing PORTABLE_NAME}"
+: "${PORTABLE_APP_NAME:?Missing APP_NAME}"
+: "${BACKUP_ROOT:?Missing BACKUP_ROOT}"
+
+if [ "$REPOSITORY_APP_NAME" != "$PORTABLE_APP_NAME" ]; then
+    echo "ERROR: repository and portable configs reference different apps" >&2
+    exit 1
+fi
+
+APP_NAME="$REPOSITORY_APP_NAME"
+APP_CONFIG="/etc/docker-backup/apps/${APP_NAME}.conf"
+
+if [ ! -f "$APP_CONFIG" ]; then
+    echo "ERROR: application config not found: $APP_CONFIG" >&2
+    exit 1
+fi
+
+# Application configuration.
+# shellcheck source=/dev/null
+source "$APP_CONFIG"
+
+: "${COMPOSE_DIR:?Missing COMPOSE_DIR}"
+: "${DB_TYPE:?Missing DB_TYPE}"
+: "${DB_BACKUP_MODE:?Missing DB_BACKUP_MODE}"
+
+if [ "$DB_TYPE:$DB_BACKUP_MODE" != "mariadb:logical" ]; then
+    echo \
+        "ERROR: unsupported database mode: $DB_TYPE:$DB_BACKUP_MODE" \
+        >&2
+    exit 1
+fi
+
+: "${DB_CONTAINER:?Missing DB_CONTAINER}"
+
+if ! declare -p BACKUP_PATHS >/dev/null 2>&1; then
+    echo "ERROR: BACKUP_PATHS is not defined" >&2
+    exit 1
+fi
+
+TMP_ROOT="$(mktemp -d /tmp/docker-backup-acceptance.XXXXXX)"
+RESTIC_FILES="$TMP_ROOT/restic-files"
+PORTABLE_FILES="$TMP_ROOT/portable-files"
+RESTIC_DB="$TMP_ROOT/restic-db"
+BACKUP_LOG="$TMP_ROOT/restic-backup.log"
+PORTABLE_LOG="$TMP_ROOT/portable-backup.log"
+
+TEST_CONTAINER="docker-backup-acceptance-${APP_NAME}-$$"
+TEST_ROOT_PASSWORD="acceptance-${RANDOM}-${RANDOM}"
+
+cleanup() {
+    rc=$?
+
+    docker rm -f "$TEST_CONTAINER" >/dev/null 2>&1 || true
+    rm -rf "$TMP_ROOT"
+
+    if [ "$rc" -eq 0 ]; then
+        echo
+        echo "PASS: acceptance-test cleanup completed"
+    else
+        echo
+        echo "ERROR: acceptance test failed with exit $rc" >&2
+        echo "PASS: disposable local resources cleaned up" >&2
+    fi
+
+    exit "$rc"
+}
+
+trap cleanup EXIT
+
+mkdir -p \
+    "$RESTIC_FILES" \
+    "$PORTABLE_FILES" \
+    "$RESTIC_DB"
+
+echo "===== DOCKER BACKUP FRAMEWORK ACCEPTANCE TEST ====="
+echo "Application: $APP_NAME"
+echo "Repository:  $REPO_NAME"
+echo "Portable:    $PORTABLE_NAME"
+
+echo
+echo "===== DEPLOYED FRAMEWORK IDENTITY ====="
+
+if [ ! -f "$VERSION_FILE" ]; then
+    echo "ERROR: deployed version marker missing: $VERSION_FILE" >&2
+    exit 1
+fi
+
+if grep -q '=' "$VERSION_FILE"; then
+    cat "$VERSION_FILE"
+else
+    LEGACY_COMMIT="$(tr -d '[:space:]' < "$VERSION_FILE")"
+    echo "LEGACY_GIT_COMMIT=$LEGACY_COMMIT"
+fi
+
+echo
+echo "===== VERIFY LIVE COMPOSE SERVICE ====="
+
+cd "$COMPOSE_DIR"
+
+DB_CID="$(docker compose ps -q "$DB_CONTAINER")"
+
+if [ -z "$DB_CID" ]; then
+    echo "ERROR: database Compose service is not running: $DB_CONTAINER" >&2
+    exit 1
+fi
+
+DB_IMAGE="$(docker inspect "$DB_CID" --format '{{.Config.Image}}')"
+
+DB_NAME="$(
+    docker inspect "$DB_CID" \
+        --format '{{range .Config.Env}}{{println .}}{{end}}' |
+    sed -n \
+        -e 's/^MARIADB_DATABASE=//p' \
+        -e 's/^MYSQL_DATABASE=//p' |
+    head -n1
+)"
+
+if [ -z "$DB_NAME" ]; then
+    echo "ERROR: unable to determine MariaDB database name" >&2
+    exit 1
+fi
+
+echo "PASS: Compose DB service is running"
+echo "Database image: $DB_IMAGE"
+echo "Database name:  $DB_NAME"
+
+db_query_live() {
+    query="$1"
+
+    docker compose exec -T "$DB_CONTAINER" sh -c '
+        exec mariadb \
+            --batch \
+            --skip-column-names \
+            --user="$MARIADB_USER" \
+            --password="$MARIADB_PASSWORD" \
+            "$MARIADB_DATABASE" \
+            -e "$1"
+    ' sh "$query"
+}
+
+db_query_test() {
+    query="$1"
+
+    docker exec "$TEST_CONTAINER" \
+        mariadb \
+        --batch \
+        --skip-column-names \
+        -uroot \
+        -p"$TEST_ROOT_PASSWORD" \
+        "$DB_NAME" \
+        -e "$query"
+}
+
+schema_metrics_live() {
+    echo "tables=$(db_query_live \
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$DB_NAME';")"
+
+    echo "triggers=$(db_query_live \
+        "SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema='$DB_NAME';")"
+}
+
+schema_metrics_test() {
+    echo "tables=$(db_query_test \
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$DB_NAME';")"
+
+    echo "triggers=$(db_query_test \
+        "SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema='$DB_NAME';")"
+}
+
+echo
+echo "===== LIVE DATABASE METRICS ====="
+
+LIVE_METRICS="$(schema_metrics_live)"
+printf '%s\n' "$LIVE_METRICS"
+
+LIVE_ALEMBIC=""
+
+if db_query_live \
+    "SELECT COUNT(*) FROM information_schema.tables
+     WHERE table_schema='$DB_NAME'
+       AND table_name='alembic_version';" |
+   grep -Fxq 1
+then
+    LIVE_ALEMBIC="$(
+        db_query_live \
+            "SELECT version_num FROM alembic_version LIMIT 1;"
+    )"
+    echo "alembic=$LIVE_ALEMBIC"
+fi
+
+echo
+echo "===== CREATE FRESH RESTIC GENERATION ====="
+
+"$RUNTIME_ROOT/backup-repository" "$REPO_CONFIG" |
+    tee "$BACKUP_LOG"
+
+GENERATION="$(
+    awk -F': ' \
+        '/^Generation: / { value=$2 } END { print value }' \
+        "$BACKUP_LOG"
+)"
+
+if [ -z "$GENERATION" ]; then
+    echo "ERROR: unable to determine fresh Restic generation" >&2
+    exit 1
+fi
+
+echo "PASS: fresh Restic generation: $GENERATION"
+
+echo
+echo "===== CREATE FRESH PORTABLE RECOVERY SET ====="
+
+"$RUNTIME_ROOT/portable-backup" "$PORTABLE_CONFIG" |
+    tee "$PORTABLE_LOG"
+
+RECOVERY_SET="$(
+    awk -F': ' \
+        '/^Recovery set: \// { value=$2 } END { print value }' \
+        "$PORTABLE_LOG"
+)"
+
+if [ -z "$RECOVERY_SET" ] || [ ! -d "$RECOVERY_SET" ]; then
+    echo "ERROR: unable to determine fresh portable recovery set" >&2
+    exit 1
+fi
+
+echo "PASS: fresh portable recovery set: $RECOVERY_SET"
+
+echo
+echo "===== REPOSITORY CHECK ====="
+
+"$RUNTIME_ROOT/maintain-repository" \
+    check \
+    "$REPO_CONFIG"
+
+echo
+echo "===== VERIFY PORTABLE INTEGRITY ====="
+
+(
+    cd "$RECOVERY_SET"
+
+    sha256sum -c SHA256SUMS
+    gzip -t database.sql.gz
+    tar -tzf app-state.tar.gz >/dev/null
+)
+
+echo "PASS: portable recovery-set integrity"
+
+echo
+echo "===== RESOLVE EXACT RESTIC COMPONENTS ====="
+
+RESTIC_JSON="$(
+    env \
+        RESTIC_PASSWORD_FILE="$PASSWORD_FILE" \
+        restic \
+        -r "$REPOSITORY" \
+        snapshots \
+        --json
+)"
+
+REPO_TAG="${REPO_NAME#"${APP_NAME}"-}"
+
+DB_SNAPSHOT="$(
+    printf '%s\n' "$RESTIC_JSON" |
+    "$RUNTIME_ROOT/resolve-snapshot" \
+        "app:$APP_NAME" \
+        "repo:$REPO_TAG" \
+        "generation:$GENERATION" \
+        "component:db" \
+        "state:complete"
+)"
+
+FILES_SNAPSHOT="$(
+    printf '%s\n' "$RESTIC_JSON" |
+    "$RUNTIME_ROOT/resolve-snapshot" \
+        "app:$APP_NAME" \
+        "repo:$REPO_TAG" \
+        "generation:$GENERATION" \
+        "component:files" \
+        "state:complete"
+)"
+
+echo "DB snapshot:    $DB_SNAPSHOT"
+echo "Files snapshot: $FILES_SNAPSHOT"
+
+echo
+echo "===== RESTORE RESTIC FILESYSTEM COMPONENT ====="
+
+env \
+    RESTIC_PASSWORD_FILE="$PASSWORD_FILE" \
+    restic \
+    -r "$REPOSITORY" \
+    restore "$FILES_SNAPSHOT" \
+    --target "$RESTIC_FILES"
+
+echo
+echo "===== RESTORE PORTABLE FILESYSTEM COMPONENT ====="
+
+tar \
+    -xzf "$RECOVERY_SET/app-state.tar.gz" \
+    -C "$PORTABLE_FILES"
+
+validate_paths() {
+    root="$1"
+    label="$2"
+
+    for path in "${BACKUP_PATHS[@]}"; do
+        relative="${path#/}"
+
+        if [ ! -e "$root/$relative" ]; then
+            echo "ERROR: $label missing expected path: $path" >&2
+            return 1
+        fi
+
+        echo "PASS: $label contains $path"
+    done
+
+    if declare -p EXCLUDE_PATHS >/dev/null 2>&1; then
+        for path in "${EXCLUDE_PATHS[@]}"; do
+            relative="${path#/}"
+
+            if [ -e "$root/$relative" ]; then
+                echo "ERROR: $label contains excluded path: $path" >&2
+                return 1
+            fi
+
+            echo "PASS: $label excludes $path"
+        done
+    fi
+}
+
+echo
+echo "===== VALIDATE RESTIC FILESYSTEM ====="
+validate_paths "$RESTIC_FILES" "Restic"
+
+echo
+echo "===== VALIDATE PORTABLE FILESYSTEM ====="
+validate_paths "$PORTABLE_FILES" "Portable"
+
+echo
+echo "===== START DISPOSABLE MARIADB ====="
+
+docker run -d \
+    --name "$TEST_CONTAINER" \
+    --tmpfs /var/lib/mysql \
+    -e MARIADB_ROOT_PASSWORD="$TEST_ROOT_PASSWORD" \
+    -e MARIADB_DATABASE="$DB_NAME" \
+    "$DB_IMAGE" \
+    >/dev/null
+
+READY=false
+
+for _ in $(seq 1 60); do
+    if docker exec "$TEST_CONTAINER" \
+        mariadb \
+        --batch \
+        --skip-column-names \
+        -uroot \
+        -p"$TEST_ROOT_PASSWORD" \
+        -e 'SELECT 1;' \
+        2>/dev/null |
+       grep -Fxq 1
+    then
+        READY=true
+        break
+    fi
+
+    sleep 1
+done
+
+if [ "$READY" != true ]; then
+    echo "ERROR: disposable MariaDB did not become authenticated-ready" >&2
+    docker logs "$TEST_CONTAINER" >&2
+    exit 1
+fi
+
+echo "PASS: disposable MariaDB authenticated readiness"
+
+reset_test_database() {
+    docker exec "$TEST_CONTAINER" \
+        mariadb \
+        -uroot \
+        -p"$TEST_ROOT_PASSWORD" \
+        -e "
+          DROP DATABASE IF EXISTS \`$DB_NAME\`;
+          CREATE DATABASE \`$DB_NAME\`;
+        "
+}
+
+validate_restored_database() {
+    label="$1"
+
+    RESTORED_METRICS="$(schema_metrics_test)"
+
+    echo "$label metrics:"
+    printf '%s\n' "$RESTORED_METRICS"
+
+    if [ "$RESTORED_METRICS" != "$LIVE_METRICS" ]; then
+        echo "ERROR: $label schema metrics differ from live database" >&2
+        echo "Live:" >&2
+        printf '%s\n' "$LIVE_METRICS" >&2
+        echo "Restored:" >&2
+        printf '%s\n' "$RESTORED_METRICS" >&2
+        return 1
+    fi
+
+    if [ -n "$LIVE_ALEMBIC" ]; then
+        RESTORED_ALEMBIC="$(
+            db_query_test \
+                "SELECT version_num FROM alembic_version LIMIT 1;"
+        )"
+
+        if [ "$RESTORED_ALEMBIC" != "$LIVE_ALEMBIC" ]; then
+            echo \
+                "ERROR: $label Alembic marker differs from live database" \
+                >&2
+            return 1
+        fi
+
+        echo "PASS: $label Alembic marker matches: $RESTORED_ALEMBIC"
+    fi
+
+    echo "PASS: $label database metrics match live database"
+}
+
+echo
+echo "===== IMPORT PORTABLE DATABASE ====="
+
+gzip -dc "$RECOVERY_SET/database.sql.gz" |
+    docker exec -i "$TEST_CONTAINER" \
+        mariadb \
+        -uroot \
+        -p"$TEST_ROOT_PASSWORD" \
+        "$DB_NAME"
+
+validate_restored_database "Portable"
+
+echo
+echo "===== RESTORE EXACT RESTIC DATABASE COMPONENT ====="
+
+env \
+    RESTIC_PASSWORD_FILE="$PASSWORD_FILE" \
+    restic \
+    -r "$REPOSITORY" \
+    restore "$DB_SNAPSHOT" \
+    --target "$RESTIC_DB"
+
+if [ ! -s "$RESTIC_DB/database.sql" ]; then
+    echo "ERROR: Restic database.sql missing or empty" >&2
+    exit 1
+fi
+
+echo "PASS: Restic database.sql restored"
+
+echo
+echo "===== IMPORT RESTIC DATABASE ====="
+
+reset_test_database
+
+docker exec -i "$TEST_CONTAINER" \
+        mariadb \
+        -uroot \
+        -p"$TEST_ROOT_PASSWORD" \
+        "$DB_NAME" \
+        < "$RESTIC_DB/database.sql"
+
+validate_restored_database "Restic"
+
+echo
+echo "===== ACCEPTANCE RESULT ====="
+echo "Framework acceptance PASSED"
+echo "Application:       $APP_NAME"
+echo "Restic generation: $GENERATION"
+echo "Portable set:      $RECOVERY_SET"
+echo "DB snapshot:       $DB_SNAPSHOT"
+echo "Files snapshot:    $FILES_SNAPSHOT"

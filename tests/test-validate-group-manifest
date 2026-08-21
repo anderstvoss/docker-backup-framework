@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VALIDATOR="${ROOT}/scripts/validate-group-manifest"
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+run_pass() {
+    local name="$1"
+    local file="$2"
+
+    echo "TEST: $name"
+
+    if ! output="$("$VALIDATOR" "$file" 2>&1)"; then
+        echo "$output"
+        echo "FAIL: expected success"
+        exit 1
+    fi
+
+    echo "$output"
+}
+
+run_fail() {
+    local name="$1"
+    local expected="$2"
+    local file="$3"
+
+    echo "TEST: $name"
+
+    if output="$("$VALIDATOR" "$file" 2>&1)"; then
+        echo "$output"
+        echo "FAIL: expected failure"
+        exit 1
+    fi
+
+    if ! grep -Fq "$expected" <<<"$output"; then
+        echo "$output"
+        echo "FAIL: expected error containing: $expected"
+        exit 1
+    fi
+
+    echo "PASS: rejected as expected"
+}
+
+cat > "$TMP/valid.json" <<'EOF_JSON'
+{
+  "schema_version": 1,
+  "group": "test-group",
+  "group_generation": "20260821T180000Z-12345",
+  "consistency": "coordinated-non-atomic",
+  "result": "PASS",
+  "started_at": "2026-08-21T18:00:00Z",
+  "completed_at": "2026-08-21T18:05:00Z",
+  "members": [
+    {
+      "application": "app-one",
+      "repository": "app-one-operational",
+      "portable_target": "app-one",
+      "result": "PASS",
+      "restic_generation": "20260821T180001Z-111",
+      "db_snapshot": "1111111111111111111111111111111111111111111111111111111111111111",
+      "files_snapshot": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "portable_set": "/mock/portable/app-one/set-one"
+    },
+    {
+      "application": "app-two",
+      "repository": "app-two-operational",
+      "portable_target": "app-two",
+      "result": "PASS",
+      "restic_generation": "20260821T180101Z-222",
+      "db_snapshot": null,
+      "files_snapshot": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "portable_set": "/mock/portable/app-two/set-two"
+    }
+  ]
+}
+EOF_JSON
+
+run_pass \
+    "valid two-member manifest" \
+    "$TMP/valid.json"
+
+python3 - "$TMP/valid.json" "$TMP/fail-result.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    d = json.load(f)
+
+d["result"] = "FAIL"
+
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    json.dump(d, f)
+PY
+
+run_fail \
+    "failed group manifest" \
+    "manifest is not a complete PASS recovery point" \
+    "$TMP/fail-result.json"
+
+python3 - "$TMP/valid.json" "$TMP/failed-member.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    d = json.load(f)
+
+d["members"][1]["result"] = "FAIL"
+
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    json.dump(d, f)
+PY
+
+run_fail \
+    "failed member" \
+    "member[1] is not a complete PASS member" \
+    "$TMP/failed-member.json"
+
+python3 - "$TMP/valid.json" "$TMP/bad-files-id.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    d = json.load(f)
+
+d["members"][0]["files_snapshot"] = "not-a-snapshot"
+
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    json.dump(d, f)
+PY
+
+run_fail \
+    "invalid files snapshot ID" \
+    "member[0] has invalid files_snapshot" \
+    "$TMP/bad-files-id.json"
+
+python3 - "$TMP/valid.json" "$TMP/bad-db-id.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    d = json.load(f)
+
+d["members"][0]["db_snapshot"] = "1234"
+
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    json.dump(d, f)
+PY
+
+run_fail \
+    "invalid DB snapshot ID" \
+    "member[0] has invalid db_snapshot" \
+    "$TMP/bad-db-id.json"
+
+python3 - "$TMP/valid.json" "$TMP/relative-portable.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    d = json.load(f)
+
+d["members"][0]["portable_set"] = "relative/path"
+
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    json.dump(d, f)
+PY
+
+run_fail \
+    "relative portable path" \
+    "member[0] has invalid portable_set" \
+    "$TMP/relative-portable.json"
+
+python3 - "$TMP/valid.json" "$TMP/duplicate-app.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    d = json.load(f)
+
+d["members"][1]["application"] = "app-one"
+
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    json.dump(d, f)
+PY
+
+run_fail \
+    "duplicate application" \
+    "duplicate application in manifest: app-one" \
+    "$TMP/duplicate-app.json"
+
+python3 - "$TMP/valid.json" "$TMP/duplicate-repo.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    d = json.load(f)
+
+d["members"][1]["repository"] = "app-one-operational"
+
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    json.dump(d, f)
+PY
+
+run_fail \
+    "duplicate repository" \
+    "duplicate repository in manifest: app-one-operational" \
+    "$TMP/duplicate-repo.json"
+
+python3 - "$TMP/valid.json" "$TMP/duplicate-portable.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    d = json.load(f)
+
+d["members"][1]["portable_target"] = "app-one"
+
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    json.dump(d, f)
+PY
+
+run_fail \
+    "duplicate portable target" \
+    "duplicate portable target in manifest: app-one" \
+    "$TMP/duplicate-portable.json"
+
+python3 - "$TMP/valid.json" "$TMP/bad-schema.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    d = json.load(f)
+
+d["schema_version"] = 2
+
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    json.dump(d, f)
+PY
+
+run_fail \
+    "unsupported schema" \
+    "unsupported or missing schema_version" \
+    "$TMP/bad-schema.json"
+
+python3 - "$TMP/valid.json" "$TMP/bad-consistency.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    d = json.load(f)
+
+d["consistency"] = "atomic"
+
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    json.dump(d, f)
+PY
+
+run_fail \
+    "unsupported consistency mode" \
+    "unsupported or missing consistency mode" \
+    "$TMP/bad-consistency.json"
+
+echo
+echo "PASS: validate-group-manifest regression suite"

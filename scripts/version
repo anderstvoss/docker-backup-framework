@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VERSION_FILE="$SOURCE_ROOT/VERSION"
+
+if [ ! -f "$VERSION_FILE" ]; then
+    echo "ERROR: VERSION file not found: $VERSION_FILE" >&2
+    exit 1
+fi
+
+FRAMEWORK_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
+
+if ! [[ "$FRAMEWORK_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "ERROR: invalid framework version: $FRAMEWORK_VERSION" >&2
+    exit 1
+fi
+
+GIT_COMMIT="unknown"
+GIT_DESCRIBE="v${FRAMEWORK_VERSION}"
+
+if git -C "$SOURCE_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    GIT_COMMIT="$(git -C "$SOURCE_ROOT" rev-parse HEAD)"
+    GIT_DESCRIBE="$(
+        git -C "$SOURCE_ROOT" describe \
+            --tags \
+            --always \
+            --dirty \
+            2>/dev/null ||
+        printf '%s\n' "$GIT_COMMIT"
+    )"
+fi
+
+case "${1:-}" in
+    "")
+        printf 'FRAMEWORK_VERSION=%s\n' "$FRAMEWORK_VERSION"
+        printf 'GIT_COMMIT=%s\n' "$GIT_COMMIT"
+        printf 'GIT_DESCRIBE=%s\n' "$GIT_DESCRIBE"
+        ;;
+    --version)
+        printf '%s\n' "$FRAMEWORK_VERSION"
+        ;;
+    --commit)
+        printf '%s\n' "$GIT_COMMIT"
+        ;;
+    --describe)
+        printf '%s\n' "$GIT_DESCRIBE"
+        ;;
+    -h|--help)
+        cat <<'HELP'
+Usage: version [--version|--commit|--describe]
+
+Without arguments, prints shell-compatible framework identity fields.
+HELP
+        ;;
+    *)
+        echo "ERROR: unknown argument: $1" >&2
+        exit 2
+        ;;
+esac

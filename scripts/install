@@ -52,14 +52,19 @@ VERSION_DEST="/etc/docker-backup/DEPLOYED_VERSION"
 
 echo "===== INSTALL DOCKER BACKUP FRAMEWORK ====="
 
-if git -C "$SOURCE_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    VERSION="$(git -C "$SOURCE_ROOT" rev-parse HEAD)"
-else
-    VERSION="unknown"
+if [ ! -x "$SOURCE_ROOT/scripts/version" ]; then
+    echo "ERROR: version helper missing or not executable" >&2
+    exit 1
 fi
 
-echo "Source:  $SOURCE_ROOT"
-echo "Version: $VERSION"
+FRAMEWORK_VERSION="$("$SOURCE_ROOT/scripts/version" --version)"
+GIT_COMMIT="$("$SOURCE_ROOT/scripts/version" --commit)"
+GIT_DESCRIBE="$("$SOURCE_ROOT/scripts/version" --describe)"
+
+echo "Source:            $SOURCE_ROOT"
+echo "Framework version: $FRAMEWORK_VERSION"
+echo "Git commit:        $GIT_COMMIT"
+echo "Git describe:      $GIT_DESCRIBE"
 echo "Preserve production config: $PRESERVE_CONFIG"
 
 echo
@@ -70,7 +75,9 @@ for file in \
     "$SOURCE_ROOT/src/retention-repository" \
     "$SOURCE_ROOT/src/maintain-repository" \
     "$SOURCE_ROOT/src/portable-backup" \
-    "$SOURCE_ROOT/src/portable-retention"
+    "$SOURCE_ROOT/src/portable-retention" \
+    "$SOURCE_ROOT/scripts/acceptance-test" \
+    "$SOURCE_ROOT/scripts/resolve-snapshot"
 do
     if [ ! -f "$file" ]; then
         echo "ERROR: missing source file: $file" >&2
@@ -83,6 +90,8 @@ bash -n "$SOURCE_ROOT/src/retention-repository"
 bash -n "$SOURCE_ROOT/src/maintain-repository"
 bash -n "$SOURCE_ROOT/src/portable-backup"
 bash -n "$SOURCE_ROOT/src/portable-retention"
+bash -n "$SOURCE_ROOT/scripts/acceptance-test"
+bash -n "$SOURCE_ROOT/scripts/resolve-snapshot"
 
 if [ "$PRESERVE_CONFIG" = false ]; then
     for config_dir in \
@@ -158,6 +167,14 @@ install -o root -g root -m 0750 \
     "$SOURCE_ROOT/src/portable-retention" \
     "$ENGINE_DEST/portable-retention"
 
+install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/scripts/acceptance-test" \
+    "$ENGINE_DEST/acceptance-test"
+
+install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/scripts/resolve-snapshot" \
+    "$ENGINE_DEST/resolve-snapshot"
+
 echo
 echo "===== INSTALL CONFIGURATION ====="
 
@@ -183,7 +200,12 @@ else
     done
 fi
 
-printf '%s\n' "$VERSION" > "$VERSION_DEST"
+cat > "$VERSION_DEST" <<EOF
+FRAMEWORK_VERSION=$FRAMEWORK_VERSION
+GIT_COMMIT=$GIT_COMMIT
+GIT_DESCRIBE=$GIT_DESCRIBE
+EOF
+
 chown root:root "$VERSION_DEST"
 chmod 0644 "$VERSION_DEST"
 
@@ -227,6 +249,12 @@ cmp "$SOURCE_ROOT/src/portable-backup" \
 
 cmp "$SOURCE_ROOT/src/portable-retention" \
     "$ENGINE_DEST/portable-retention"
+
+cmp "$SOURCE_ROOT/scripts/acceptance-test" \
+    "$ENGINE_DEST/acceptance-test"
+
+cmp "$SOURCE_ROOT/scripts/resolve-snapshot" \
+    "$ENGINE_DEST/resolve-snapshot"
 
 if [ "$PRESERVE_CONFIG" = false ]; then
     for config in "$SOURCE_ROOT"/config/apps/*.conf; do

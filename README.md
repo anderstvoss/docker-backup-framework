@@ -22,6 +22,7 @@ Primary documentation:
 - `docs/ONBOARDING.md` — procedure for adding an application
 - `docs/RESTORE.md` — non-destructive validation and production recovery
 - `docs/VALIDATION.md` — implementation and validation history
+- `docs/VERSIONING.md` — release identity, version policy, and release procedure
 
 ## Source of truth
 
@@ -61,6 +62,13 @@ Deployment:
 - `scripts/install`
 - `scripts/render-timers`
 - `scripts/render-portable-timers`
+
+Revisioning and acceptance:
+
+- `VERSION`
+- `scripts/version`
+- `/usr/local/lib/docker-backup/acceptance-test`
+- `/usr/local/lib/docker-backup/resolve-snapshot`
 
 Systemd service templates are stored under:
 
@@ -227,7 +235,10 @@ The installer:
 - renders timer instances
 - applies timer enablement policy
 - verifies installed copies
-- writes the deployed Git revision
+- writes the semantic framework version, exact Git commit, and Git description
+  to `/etc/docker-backup/DEPLOYED_VERSION`
+- installs the acceptance-test and exact-snapshot-resolution tools into the
+  independent production runtime
 - verifies runtime independence from the source checkout
 
 ## Secrets
@@ -260,9 +271,18 @@ installation, or repository checks pass. After deployment, create fresh Restic
 and portable backups using the newly deployed framework revision and restore
 those newly created artifacts non-destructively.
 
+Post-change acceptance can be executed with:
+
+    sudo /usr/local/lib/docker-backup/acceptance-test \
+      /etc/docker-backup/repos/<repository>.conf \
+      /etc/docker-backup/portable/<target>.conf
+
+The current automated acceptance harness supports `mariadb:logical`
+applications.
+
 Post-change acceptance should prove:
 
-- the deployed revision is the intended Git commit
+- the deployed framework version and Git revision are the intended identities
 - host-local production configuration and secrets were preserved
 - a fresh Restic generation completes
 - a fresh portable recovery set completes
@@ -311,7 +331,8 @@ The reference deployment validated:
 - cross-mechanism capture locking
 - non-destructive database and filesystem restore
 
-See `docs/VALIDATION.md` for detailed validation history.
+See `docs/VALIDATION.md` for detailed validation history and
+`docs/VERSIONING.md` for release/version policy.
 
 ## Example configuration values
 

@@ -31,6 +31,9 @@ jobs:
           xargs -0 shellcheck
 
           shellcheck tests/test-install-preserve-config
+          shellcheck tests/test-version
+          shellcheck tests/test-resolve-snapshot
+          shellcheck scripts/acceptance-test
 
       - name: Shell syntax
         shell: bash
@@ -56,6 +59,12 @@ jobs:
 
       - name: Installer regression tests
         run: tests/test-install-preserve-config
+
+      - name: Version regression tests
+        run: tests/test-version
+
+      - name: Snapshot resolver regression tests
+        run: tests/test-resolve-snapshot
 
       - name: Check disclosure patterns
         run: scripts/ci/check-disclosures

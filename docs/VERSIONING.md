@@ -1,0 +1,147 @@
+# Framework Versioning
+
+The Docker Backup Framework uses semantic release versions together with the
+exact Git commit identity of the deployed source.
+
+## Version sources
+
+The repository contains:
+
+`VERSION`
+
+This file contains the framework release version in:
+
+`MAJOR.MINOR.PATCH`
+
+format.
+
+Published releases are identified by Git tags:
+
+`vMAJOR.MINOR.PATCH`
+
+The release tag and `VERSION` value must agree.
+
+## Version meaning
+
+Increment:
+
+- MAJOR for incompatible framework, configuration, backup-format, or recovery
+  behavior changes.
+- MINOR for backward-compatible framework capabilities or substantial new
+  operational features.
+- PATCH for backward-compatible fixes, validation improvements, and minor
+  operational corrections.
+
+Version changes are made through the normal protected-main pull-request
+workflow.
+
+## Development identity
+
+`scripts/version` reports:
+
+- `FRAMEWORK_VERSION`
+- `GIT_COMMIT`
+- `GIT_DESCRIBE`
+
+For a Git checkout, the exact commit is always recorded.
+
+For an exported source tree without Git metadata:
+
+- `GIT_COMMIT=unknown`
+- `GIT_DESCRIBE=v<FRAMEWORK_VERSION>`
+
+An uncommitted working tree is reported as dirty by `git describe`.
+
+## Deployed identity
+
+The installer writes:
+
+`/etc/docker-backup/DEPLOYED_VERSION`
+
+as shell-compatible metadata:
+
+    FRAMEWORK_VERSION=1.0.0
+    GIT_COMMIT=<full Git SHA>
+    GIT_DESCRIBE=<Git description>
+
+The exact Git commit is the authoritative identity of the deployed source.
+The semantic framework version identifies the release compatibility level.
+
+Deployment and recovery validation records should preserve both.
+
+## Release procedure
+
+A release is produced from protected `main`.
+
+1. Update `VERSION` when required.
+2. Implement and review the change through a feature branch and pull request.
+3. Require all repository validation and secret-scanning checks to pass.
+4. Merge to `main`.
+5. Deploy the exact merged commit using the configuration-preserving installer
+   on an existing production host.
+6. Run the post-change acceptance test against the deployed runtime.
+7. Confirm the fresh Restic and portable artifacts created by that revision
+   restore successfully.
+8. Confirm the deployed version marker identifies the intended release and
+   commit.
+9. Tag the validated `main` commit with `vMAJOR.MINOR.PATCH`.
+10. Push the release tag.
+
+A release tag must not be created before the corresponding deployed revision
+has passed the required post-change acceptance test.
+
+## Post-change acceptance
+
+For a MariaDB logical-backup deployment, the installed acceptance harness is:
+
+    sudo /usr/local/lib/docker-backup/acceptance-test \
+      /etc/docker-backup/repos/<repository>.conf \
+      /etc/docker-backup/portable/<target>.conf
+
+The acceptance test creates fresh backup artifacts and then validates recovery
+from those exact artifacts.
+
+It verifies:
+
+- deployed framework identity
+- live database accessibility
+- fresh Restic backup generation
+- fresh portable recovery set
+- Restic repository integrity
+- portable checksums and archive integrity
+- exact Restic snapshot selection from the complete required tag set
+- filesystem restoration from both backup mechanisms
+- required path inclusion
+- configured exclusion absence
+- authenticated disposable MariaDB readiness
+- portable logical database restoration
+- Restic logical database restoration
+- restored table and trigger counts against the live database
+- Alembic migration identity when the application uses `alembic_version`
+- disposable local test-resource cleanup
+
+The fresh backup artifacts remain in backup storage as valid recovery points.
+Temporary restore directories and the disposable database container are
+removed automatically.
+
+## Exact Restic component selection
+
+Acceptance and recovery operations must not rely on ambiguous combinations of
+`latest` and repeated `--tag` options.
+
+The framework resolves snapshots from:
+
+`restic snapshots --json`
+
+and requires that a snapshot contain the complete tag set for the intended:
+
+- application
+- repository
+- generation
+- component
+- completed state
+
+Exactly one snapshot must match.
+
+The resulting immutable snapshot ID is then supplied directly to `restic
+restore`.

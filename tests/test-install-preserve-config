@@ -213,6 +213,29 @@ do
         "$ROOT/usr/local/lib/docker-backup/$engine"
 done
 
+for tool in \
+    acceptance-test \
+    resolve-snapshot
+do
+    cmp \
+        "$SOURCE/scripts/$tool" \
+        "$ROOT/usr/local/lib/docker-backup/$tool"
+done
+
+echo "=== deployed version marker ==="
+
+cat > "$PRESERVE/expected-version" <<'EOF_VERSION'
+FRAMEWORK_VERSION=1.0.0
+GIT_COMMIT=unknown
+GIT_DESCRIBE=v1.0.0
+EOF_VERSION
+
+cmp \
+    "$PRESERVE/expected-version" \
+    "$ROOT/etc/docker-backup/DEPLOYED_VERSION"
+
+echo "PASS: structured deployed version marker"
+
 grep -Fx \
     "$ROOT/etc/docker-backup/repos/production-operational.conf" \
     "$ROOT/repository-render.log"
@@ -255,6 +278,17 @@ cmp \
     "$SOURCE/config/portable/example-app.conf" \
     "$ROOT/etc/docker-backup/portable/example-app.conf"
 
+cat > "$STANDARD/expected-version" <<'EOF_VERSION'
+FRAMEWORK_VERSION=1.0.0
+GIT_COMMIT=unknown
+GIT_DESCRIBE=v1.0.0
+EOF_VERSION
+
+cmp \
+    "$STANDARD/expected-version" \
+    "$ROOT/etc/docker-backup/DEPLOYED_VERSION"
+
+echo "PASS: standard installation wrote structured deployed version marker"
 echo "PASS: standard installation still deploys source configuration"
 
 echo

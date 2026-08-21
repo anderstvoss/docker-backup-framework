@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+echo "=== version file ==="
+
+VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
+
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "ERROR: VERSION is not MAJOR.MINOR.PATCH" >&2
+    exit 1
+fi
+
+echo "PASS: VERSION=$VERSION"
+
+echo
+echo "=== version helper ==="
+
+OUTPUT="$("$REPO_ROOT/scripts/version")"
+
+grep -Fx "FRAMEWORK_VERSION=$VERSION" <<<"$OUTPUT"
+grep -Eq '^GIT_COMMIT=([0-9a-f]{40}|unknown)$' <<<"$OUTPUT"
+grep -Eq '^GIT_DESCRIBE=.+$' <<<"$OUTPUT"
+
+test "$("$REPO_ROOT/scripts/version" --version)" = "$VERSION"
+
+echo "PASS: version helper identity valid"
+
+echo
+echo "=== exported-source fallback ==="
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+mkdir -p "$TMP/scripts"
+cp "$REPO_ROOT/VERSION" "$TMP/VERSION"
+cp "$REPO_ROOT/scripts/version" "$TMP/scripts/version"
+
+OUTPUT="$("$TMP/scripts/version")"
+
+grep -Fx "FRAMEWORK_VERSION=$VERSION" <<<"$OUTPUT"
+grep -Fx 'GIT_COMMIT=unknown' <<<"$OUTPUT"
+grep -Fx "GIT_DESCRIBE=v$VERSION" <<<"$OUTPUT"
+
+echo "PASS: version helper works without Git metadata"

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [ "$#" -lt 1 ]; then
+    echo "Usage: resolve-snapshot <required-tag> [...]" >&2
+    exit 2
+fi
+
+python3 -c '
+import json
+import sys
+
+required = set(sys.argv[1:])
+matches = []
+
+for snapshot in json.load(sys.stdin):
+    tags = set(snapshot.get("tags") or [])
+    if required.issubset(tags):
+        matches.append(snapshot["id"])
+
+if len(matches) != 1:
+    raise SystemExit(
+        f"ERROR: expected exactly one matching snapshot; found {len(matches)}"
+    )
+
+print(matches[0])
+' "$@"

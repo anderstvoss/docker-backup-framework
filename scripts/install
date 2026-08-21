@@ -1,6 +1,42 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+PRESERVE_CONFIG=false
+
+usage() {
+    cat <<'EOF'
+Usage: install [--preserve-config]
+
+Options:
+  --preserve-config
+      Install framework engines and systemd templates while preserving the
+      existing /etc/docker-backup application, repository, portable, and
+      secrets configuration. Timers are regenerated from the retained
+      production configuration.
+
+Without --preserve-config, configuration files included in the source tree
+are deployed normally.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --preserve-config)
+            PRESERVE_CONFIG=true
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "ERROR: unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
 if [ "$EUID" -ne 0 ]; then
     echo "ERROR: installer must run as root" >&2
     exit 1
@@ -24,6 +60,7 @@ fi
 
 echo "Source:  $SOURCE_ROOT"
 echo "Version: $VERSION"
+echo "Preserve production config: $PRESERVE_CONFIG"
 
 echo
 echo "===== PREFLIGHT ====="
@@ -47,21 +84,39 @@ bash -n "$SOURCE_ROOT/src/maintain-repository"
 bash -n "$SOURCE_ROOT/src/portable-backup"
 bash -n "$SOURCE_ROOT/src/portable-retention"
 
-for config_dir in \
-    "$SOURCE_ROOT/config/apps" \
-    "$SOURCE_ROOT/config/repos" \
-    "$SOURCE_ROOT/config/portable"
-do
-    if [ ! -d "$config_dir" ]; then
-        echo "ERROR: missing configuration directory: $config_dir" >&2
-        exit 1
-    fi
+if [ "$PRESERVE_CONFIG" = false ]; then
+    for config_dir in \
+        "$SOURCE_ROOT/config/apps" \
+        "$SOURCE_ROOT/config/repos" \
+        "$SOURCE_ROOT/config/portable"
+    do
+        if [ ! -d "$config_dir" ]; then
+            echo "ERROR: missing configuration directory: $config_dir" >&2
+            exit 1
+        fi
 
-    if ! compgen -G "$config_dir/*.conf" >/dev/null; then
-        echo "ERROR: no configuration files found in: $config_dir" >&2
-        exit 1
-    fi
-done
+        if ! compgen -G "$config_dir/*.conf" >/dev/null; then
+            echo "ERROR: no configuration files found in: $config_dir" >&2
+            exit 1
+        fi
+    done
+else
+    for config_dir in \
+        "$APP_DEST" \
+        "$REPO_DEST" \
+        "$PORTABLE_DEST"
+    do
+        if [ ! -d "$config_dir" ]; then
+            echo "ERROR: required production configuration directory missing: $config_dir" >&2
+            exit 1
+        fi
+
+        if ! compgen -G "$config_dir/*.conf" >/dev/null; then
+            echo "ERROR: no production configuration files found in: $config_dir" >&2
+            exit 1
+        fi
+    done
+fi
 
 echo "PASS: source validation"
 
@@ -106,23 +161,27 @@ install -o root -g root -m 0750 \
 echo
 echo "===== INSTALL CONFIGURATION ====="
 
-for config in "$SOURCE_ROOT"/config/apps/*.conf; do
-    install -o root -g root -m 0640 \
-        "$config" \
-        "$APP_DEST/$(basename "$config")"
-done
+if [ "$PRESERVE_CONFIG" = true ]; then
+    echo "PASS: preserving existing production configuration"
+else
+    for config in "$SOURCE_ROOT"/config/apps/*.conf; do
+        install -o root -g root -m 0640 \
+            "$config" \
+            "$APP_DEST/$(basename "$config")"
+    done
 
-for config in "$SOURCE_ROOT"/config/repos/*.conf; do
-    install -o root -g root -m 0640 \
-        "$config" \
-        "$REPO_DEST/$(basename "$config")"
-done
+    for config in "$SOURCE_ROOT"/config/repos/*.conf; do
+        install -o root -g root -m 0640 \
+            "$config" \
+            "$REPO_DEST/$(basename "$config")"
+    done
 
-for config in "$SOURCE_ROOT"/config/portable/*.conf; do
-    install -o root -g root -m 0640 \
-        "$config" \
-        "$PORTABLE_DEST/$(basename "$config")"
-done
+    for config in "$SOURCE_ROOT"/config/portable/*.conf; do
+        install -o root -g root -m 0640 \
+            "$config" \
+            "$PORTABLE_DEST/$(basename "$config")"
+    done
+fi
 
 printf '%s\n' "$VERSION" > "$VERSION_DEST"
 chown root:root "$VERSION_DEST"
@@ -169,19 +228,23 @@ cmp "$SOURCE_ROOT/src/portable-backup" \
 cmp "$SOURCE_ROOT/src/portable-retention" \
     "$ENGINE_DEST/portable-retention"
 
-for config in "$SOURCE_ROOT"/config/apps/*.conf; do
-    cmp "$config" "$APP_DEST/$(basename "$config")"
-done
+if [ "$PRESERVE_CONFIG" = false ]; then
+    for config in "$SOURCE_ROOT"/config/apps/*.conf; do
+        cmp "$config" "$APP_DEST/$(basename "$config")"
+    done
 
-for config in "$SOURCE_ROOT"/config/repos/*.conf; do
-    cmp "$config" "$REPO_DEST/$(basename "$config")"
-done
+    for config in "$SOURCE_ROOT"/config/repos/*.conf; do
+        cmp "$config" "$REPO_DEST/$(basename "$config")"
+    done
 
-for config in "$SOURCE_ROOT"/config/portable/*.conf; do
-    cmp "$config" "$PORTABLE_DEST/$(basename "$config")"
-done
+    for config in "$SOURCE_ROOT"/config/portable/*.conf; do
+        cmp "$config" "$PORTABLE_DEST/$(basename "$config")"
+    done
 
-echo "PASS: installed files match source"
+    echo "PASS: installed files and configuration match source"
+else
+    echo "PASS: installed engines match source; production configuration preserved"
+fi
 
 echo
 echo "===== RUNTIME INDEPENDENCE ====="

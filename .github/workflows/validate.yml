@@ -30,6 +30,8 @@ jobs:
             -print0 |
           xargs -0 shellcheck
 
+          shellcheck tests/test-install-preserve-config
+
       - name: Shell syntax
         shell: bash
         run: |
@@ -51,6 +53,9 @@ jobs:
               -name '*.conf' \
               -print0
           )
+
+      - name: Installer regression tests
+        run: tests/test-install-preserve-config
 
       - name: Check disclosure patterns
         run: scripts/ci/check-disclosures

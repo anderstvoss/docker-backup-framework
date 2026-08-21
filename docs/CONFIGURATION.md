@@ -1,10 +1,11 @@
 # Configuration Contract
 
-The Docker Backup Framework separates configuration into three classes:
+The Docker Backup Framework separates configuration into four classes:
 
 - application configuration
 - Restic repository configuration
 - portable backup configuration
+- multi-application group configuration
 
 ## Application configuration
 
@@ -95,6 +96,32 @@ A portable configuration declares:
 - timer enablement state
 
 Schedule values are complete systemd `OnCalendar` expressions.
+
+## Multi-application group configuration
+
+Location in source:
+
+`config/groups/<group>.conf`
+
+Installed location:
+
+`/etc/docker-backup/groups/<group>.conf`
+
+A group configuration declares:
+
+- group identity
+- ordered application membership
+- the repository configuration used by each member
+- the portable backup configuration used by each member
+
+Groups are orchestration metadata only.
+
+Each application retains its independent repository, credentials, storage
+verification, portable target, retention, and scheduling configuration.
+
+Group backups are coordinated and sequential but are not globally atomic.
+
+See `docs/GROUPS.md` for the complete contract.
 
 ## Locking model
 

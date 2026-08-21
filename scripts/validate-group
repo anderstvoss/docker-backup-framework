@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    echo "Usage: $0 <group-config>" >&2
+    exit 2
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+[[ $# -eq 1 ]] || usage
+
+GROUP_CONFIG="$1"
+
+[[ -f "$GROUP_CONFIG" ]] ||
+    die "group configuration not found: $GROUP_CONFIG"
+
+# shellcheck disable=SC1090
+source "$GROUP_CONFIG"
+
+[[ -n "${GROUP_NAME:-}" ]] ||
+    die "GROUP_NAME is required"
+
+declare -p GROUP_MEMBERS >/dev/null 2>&1 ||
+    die "GROUP_MEMBERS array is required"
+
+[[ ${#GROUP_MEMBERS[@]} -gt 0 ]] ||
+    die "GROUP_MEMBERS must not be empty"
+
+declare -A seen_apps=()
+declare -A seen_repos=()
+declare -A seen_portable=()
+
+for member in "${GROUP_MEMBERS[@]}"; do
+    IFS='|' read -r app repo portable extra <<<"$member"
+
+    [[ -n "$app" &&
+       -n "$repo" &&
+       -n "$portable" &&
+       -z "${extra:-}" ]] ||
+        die "malformed group member: $member"
+
+    [[ "$app" =~ ^[A-Za-z0-9._-]+$ ]] ||
+        die "invalid application name: $app"
+
+    [[ "$repo" =~ ^[A-Za-z0-9._-]+$ ]] ||
+        die "invalid repository name: $repo"
+
+    [[ "$portable" =~ ^[A-Za-z0-9._-]+$ ]] ||
+        die "invalid portable target name: $portable"
+
+    [[ -z "${seen_apps[$app]:-}" ]] ||
+        die "duplicate application member: $app"
+
+    [[ -z "${seen_repos[$repo]:-}" ]] ||
+        die "duplicate repository member: $repo"
+
+    [[ -z "${seen_portable[$portable]:-}" ]] ||
+        die "duplicate portable target member: $portable"
+
+    seen_apps["$app"]=1
+    seen_repos["$repo"]=1
+    seen_portable["$portable"]=1
+
+    CONFIG_ROOT="${DOCKER_BACKUP_CONFIG_ROOT:-/etc/docker-backup}"
+
+    app_config="${CONFIG_ROOT}/apps/${app}.conf"
+    repo_config="${CONFIG_ROOT}/repos/${repo}.conf"
+    portable_config="${CONFIG_ROOT}/portable/${portable}.conf"
+
+    [[ -f "$app_config" ]] ||
+        die "application configuration not found: $app_config"
+
+    [[ -f "$repo_config" ]] ||
+        die "repository configuration not found: $repo_config"
+
+    [[ -f "$portable_config" ]] ||
+        die "portable configuration not found: $portable_config"
+
+    app_name="$(
+        bash -c '
+            set -euo pipefail
+            source "$1"
+            printf "%s\n" "${APP_NAME:-}"
+        ' _ "$app_config"
+    )"
+
+    repo_app="$(
+        bash -c '
+            set -euo pipefail
+            source "$1"
+            printf "%s\n" "${APP_NAME:-}"
+        ' _ "$repo_config"
+    )"
+
+    portable_app="$(
+        bash -c '
+            set -euo pipefail
+            source "$1"
+            printf "%s\n" "${APP_NAME:-}"
+        ' _ "$portable_config"
+    )"
+
+    [[ "$app_name" == "$app" ]] ||
+        die "application identity mismatch: member=$app config=$app_name"
+
+    [[ "$repo_app" == "$app" ]] ||
+        die "repository/application identity mismatch: repository=$repo app=$repo_app expected=$app"
+
+    [[ "$portable_app" == "$app" ]] ||
+        die "portable/application identity mismatch: portable=$portable app=$portable_app expected=$app"
+done
+
+echo "PASS: group configuration valid"
+echo "Group:   $GROUP_NAME"
+echo "Members: ${#GROUP_MEMBERS[@]}"

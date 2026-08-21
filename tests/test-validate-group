@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VALIDATOR="${ROOT}/scripts/validate-group"
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+CONFIG_ROOT="${TMP}/etc/docker-backup"
+mkdir -p \
+    "${CONFIG_ROOT}/apps" \
+    "${CONFIG_ROOT}/repos" \
+    "${CONFIG_ROOT}/portable" \
+    "${TMP}/groups"
+
+run_pass() {
+    local name="$1"
+    shift
+
+    echo "TEST: $name"
+
+    if ! output="$("$@" 2>&1)"; then
+        echo "$output"
+        echo "FAIL: expected success"
+        exit 1
+    fi
+
+    echo "$output"
+}
+
+run_fail() {
+    local name="$1"
+    local expected="$2"
+    shift 2
+
+    echo "TEST: $name"
+
+    if output="$("$@" 2>&1)"; then
+        echo "$output"
+        echo "FAIL: expected failure"
+        exit 1
+    fi
+
+    if ! grep -Fq "$expected" <<<"$output"; then
+        echo "$output"
+        echo "FAIL: expected error containing: $expected"
+        exit 1
+    fi
+
+    echo "PASS: rejected as expected"
+}
+
+write_app() {
+    local app="$1"
+
+    cat > "${CONFIG_ROOT}/apps/${app}.conf" <<EOF_APP
+APP_NAME="${app}"
+EOF_APP
+}
+
+write_repo() {
+    local repo="$1"
+    local app="$2"
+
+    cat > "${CONFIG_ROOT}/repos/${repo}.conf" <<EOF_REPO
+REPO_NAME="${repo}"
+APP_NAME="${app}"
+EOF_REPO
+}
+
+write_portable() {
+    local portable="$1"
+    local app="$2"
+
+    cat > "${CONFIG_ROOT}/portable/${portable}.conf" <<EOF_PORTABLE
+PORTABLE_NAME="${portable}"
+APP_NAME="${app}"
+EOF_PORTABLE
+}
+
+write_app app-one
+write_repo app-one-operational app-one
+write_portable app-one app-one
+
+write_app app-two
+write_repo app-two-operational app-two
+write_portable app-two app-two
+
+cat > "${TMP}/groups/valid.conf" <<'EOF_GROUP'
+GROUP_NAME="test-group"
+GROUP_MEMBERS=(
+    "app-one|app-one-operational|app-one"
+    "app-two|app-two-operational|app-two"
+)
+EOF_GROUP
+
+run_pass \
+    "valid two-member group" \
+    env DOCKER_BACKUP_CONFIG_ROOT="$CONFIG_ROOT" \
+    "$VALIDATOR" "${TMP}/groups/valid.conf"
+
+cat > "${TMP}/groups/malformed.conf" <<'EOF_GROUP'
+GROUP_NAME="test-group"
+GROUP_MEMBERS=(
+    "app-one|app-one-operational"
+)
+EOF_GROUP
+
+run_fail \
+    "malformed member" \
+    "malformed group member" \
+    env DOCKER_BACKUP_CONFIG_ROOT="$CONFIG_ROOT" \
+    "$VALIDATOR" "${TMP}/groups/malformed.conf"
+
+cat > "${TMP}/groups/duplicate-app.conf" <<'EOF_GROUP'
+GROUP_NAME="test-group"
+GROUP_MEMBERS=(
+    "app-one|app-one-operational|app-one"
+    "app-one|app-two-operational|app-two"
+)
+EOF_GROUP
+
+run_fail \
+    "duplicate application" \
+    "duplicate application member" \
+    env DOCKER_BACKUP_CONFIG_ROOT="$CONFIG_ROOT" \
+    "$VALIDATOR" "${TMP}/groups/duplicate-app.conf"
+
+cat > "${TMP}/groups/missing-config.conf" <<'EOF_GROUP'
+GROUP_NAME="test-group"
+GROUP_MEMBERS=(
+    "missing-app|missing-repo|missing-portable"
+)
+EOF_GROUP
+
+run_fail \
+    "missing application configuration" \
+    "application configuration not found" \
+    env DOCKER_BACKUP_CONFIG_ROOT="$CONFIG_ROOT" \
+    "$VALIDATOR" "${TMP}/groups/missing-config.conf"
+
+write_repo bad-repo app-two
+
+cat > "${TMP}/groups/repo-mismatch.conf" <<'EOF_GROUP'
+GROUP_NAME="test-group"
+GROUP_MEMBERS=(
+    "app-one|bad-repo|app-one"
+)
+EOF_GROUP
+
+run_fail \
+    "repository identity mismatch" \
+    "repository/application identity mismatch" \
+    env DOCKER_BACKUP_CONFIG_ROOT="$CONFIG_ROOT" \
+    "$VALIDATOR" "${TMP}/groups/repo-mismatch.conf"
+
+write_portable bad-portable app-two
+
+cat > "${TMP}/groups/portable-mismatch.conf" <<'EOF_GROUP'
+GROUP_NAME="test-group"
+GROUP_MEMBERS=(
+    "app-one|app-one-operational|bad-portable"
+)
+EOF_GROUP
+
+run_fail \
+    "portable identity mismatch" \
+    "portable/application identity mismatch" \
+    env DOCKER_BACKUP_CONFIG_ROOT="$CONFIG_ROOT" \
+    "$VALIDATOR" "${TMP}/groups/portable-mismatch.conf"
+
+echo
+echo "PASS: validate-group regression suite"

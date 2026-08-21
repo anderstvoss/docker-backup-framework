@@ -146,14 +146,15 @@ SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_ROOT="${TEST_ROOT:?}/usr/local/lib/docker-backup"
 ETC_ROOT="${TEST_ROOT:?}/etc/docker-backup"
 
-mkdir -p "$RUNTIME_ROOT" "$ETC_ROOT"
+mkdir -p "$RUNTIME_ROOT" "$ETC_ROOT/groups"
 
 for engine in \
     backup-repository \
     retention-repository \
     maintain-repository \
     portable-backup \
-    portable-retention
+    portable-retention \
+    backup-group
 do
     cp "$SOURCE_ROOT/src/$engine" "$RUNTIME_ROOT/$engine"
     chmod 0750 "$RUNTIME_ROOT/$engine"
@@ -161,7 +162,8 @@ done
 
 for tool in \
     acceptance-test \
-    resolve-snapshot
+    resolve-snapshot \
+    validate-group
 do
     cp "$SOURCE_ROOT/scripts/$tool" "$RUNTIME_ROOT/$tool"
     chmod 0750 "$RUNTIME_ROOT/$tool"
@@ -177,6 +179,8 @@ STUB
         "$source/scripts/install" \
         "$source/scripts/acceptance-test" \
         "$source/scripts/resolve-snapshot" \
+        "$source/scripts/validate-group" \
+        "$source/src/backup-group" \
         "$source/src/maintain-repository"
 
     # Create a real disposable Git repository so clean/dirty and exact commit
@@ -357,7 +361,55 @@ grep -Fx 'ACCEPTANCE=PASS' "$LOG_FILE"
 grep -Fx 'SOURCE_INDEPENDENCE=PASS' "$LOG_FILE"
 grep -Fx 'LAST_STAGE=completed' "$LOG_FILE"
 
+# This fixture starts without a production groups directory. A
+# preserve-config deployment must create it without populating source examples.
+test -d "$CASE_ROOT/root/etc/docker-backup/groups"
+test -z "$(
+    find "$CASE_ROOT/root/etc/docker-backup/groups"         -mindepth 1         -type f         -print -quit
+)"
+
 echo "PASS: successful drill recorded exact candidate and recovery identities"
+echo "PASS: v1.0-style host received an empty groups directory"
+
+echo
+echo "=== existing group configuration preservation ==="
+
+CASE_ROOT="$(prepare_case group-preservation)"
+EXPECTED_COMMIT="$(git -C "$CASE_ROOT/source" rev-parse HEAD)"
+
+mkdir -p "$CASE_ROOT/root/etc/docker-backup/groups"
+
+cat > "$CASE_ROOT/root/etc/docker-backup/groups/production-group.conf" <<'EOF_GROUP'
+GROUP_NAME="production-group"
+GROUP_MEMBERS=(
+    "test-app|test-app-operational|test-app"
+)
+EOF_GROUP
+
+GROUP_HASH="$(
+    sha256sum         "$CASE_ROOT/root/etc/docker-backup/groups/production-group.conf"         | awk '{print $1}'
+)"
+
+run_drill "$CASE_ROOT"     > "$CASE_ROOT/output.log" 2>&1
+
+test -d "$CASE_ROOT/source"
+test "$(git -C "$CASE_ROOT/source" rev-parse HEAD)" = "$EXPECTED_COMMIT"
+test -z "$(git -C "$CASE_ROOT/source" status --porcelain)"
+
+test "$GROUP_HASH" = "$(
+    sha256sum         "$CASE_ROOT/root/etc/docker-backup/groups/production-group.conf"         | awk '{print $1}'
+)"
+
+test ! -e     "$CASE_ROOT/root/etc/docker-backup/groups/example.conf"
+
+LOG_FILE="$(latest_log "$CASE_ROOT")"
+
+grep -Fx 'RESULT=PASS' "$LOG_FILE"
+grep -Fx 'CONFIG_PRESERVED=PASS' "$LOG_FILE"
+grep -Fx 'RUNTIME_PARITY=PASS' "$LOG_FILE"
+grep -Fx 'LAST_STAGE=completed' "$LOG_FILE"
+
+echo "PASS: existing production group configuration preserved"
 
 echo
 echo "PASS: deployment-drill regression suite"

@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+    echo "Usage: $0 <group-config>" >&2
+    exit 2
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+[[ $# -eq 1 ]] || usage
+
+GROUP_CONFIG="$1"
+
+CONFIG_ROOT="${DOCKER_BACKUP_CONFIG_ROOT:-/etc/docker-backup}"
+ENGINE_ROOT="${DOCKER_BACKUP_ENGINE_ROOT:-/usr/local/lib/docker-backup}"
+GROUP_ROOT="${DOCKER_BACKUP_GROUP_ROOT:-/var/lib/docker-backup/groups}"
+
+VALIDATOR="${ENGINE_ROOT}/validate-group"
+REPO_BACKUP="${ENGINE_ROOT}/backup-repository"
+PORTABLE_BACKUP="${ENGINE_ROOT}/portable-backup"
+
+[[ -x "$VALIDATOR" ]] ||
+    die "group validator not executable: $VALIDATOR"
+
+[[ -x "$REPO_BACKUP" ]] ||
+    die "repository backup engine not executable: $REPO_BACKUP"
+
+[[ -x "$PORTABLE_BACKUP" ]] ||
+    die "portable backup engine not executable: $PORTABLE_BACKUP"
+
+DOCKER_BACKUP_CONFIG_ROOT="$CONFIG_ROOT" \
+    "$VALIDATOR" "$GROUP_CONFIG"
+
+# shellcheck disable=SC1090
+source "$GROUP_CONFIG"
+
+GROUP_GENERATION="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+GROUP_DIR="${GROUP_ROOT}/${GROUP_NAME}"
+MANIFEST="${GROUP_DIR}/${GROUP_GENERATION}.json"
+
+WORK_DIR="$(mktemp -d)"
+MEMBERS_NDJSON="${WORK_DIR}/members.ndjson"
+
+mkdir -p "$GROUP_DIR"
+chmod 0750 "$GROUP_DIR"
+
+CURRENT_APPLICATION=""
+CURRENT_STAGE="preflight"
+FINALIZED=false
+
+result_value() {
+    local file="$1"
+    local key="$2"
+
+    awk -v key="$key" '
+        index($0, key "=") == 1 {
+            value = substr($0, length(key) + 2)
+            count++
+        }
+        END {
+            if (count != 1) {
+                exit 1
+            }
+            print value
+        }
+    ' "$file"
+}
+
+optional_result_value() {
+    local file="$1"
+    local key="$2"
+
+    awk -v key="$key" '
+        index($0, key "=") == 1 {
+            value = substr($0, length(key) + 2)
+            count++
+        }
+        END {
+            if (count > 1) {
+                exit 1
+            }
+            if (count == 1) {
+                print value
+            }
+        }
+    ' "$file"
+}
+
+append_member() {
+    python3 - "$MEMBERS_NDJSON" "$@" <<'PY'
+import json
+import sys
+
+(
+    path,
+    application,
+    repository,
+    portable_target,
+    result,
+    restic_generation,
+    db_snapshot,
+    files_snapshot,
+    portable_set,
+) = sys.argv[1:]
+
+record = {
+    "application": application,
+    "repository": repository,
+    "portable_target": portable_target,
+    "result": result,
+    "restic_generation": restic_generation or None,
+    "db_snapshot": db_snapshot or None,
+    "files_snapshot": files_snapshot or None,
+    "portable_set": portable_set or None,
+}
+
+with open(path, "a", encoding="utf-8") as f:
+    f.write(json.dumps(record, separators=(",", ":")) + "\n")
+PY
+}
+
+write_manifest() {
+    local result="$1"
+    local completed_at
+
+    completed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    python3 - \
+        "$MEMBERS_NDJSON" \
+        "$MANIFEST" \
+        "$GROUP_NAME" \
+        "$GROUP_GENERATION" \
+        "$STARTED_AT" \
+        "$completed_at" \
+        "$result" \
+        "$CURRENT_APPLICATION" \
+        "$CURRENT_STAGE" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+(
+    members_path,
+    manifest_path,
+    group,
+    generation,
+    started_at,
+    completed_at,
+    result,
+    failure_application,
+    failure_stage,
+) = sys.argv[1:]
+
+members = []
+
+if os.path.exists(members_path):
+    with open(members_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                members.append(json.loads(line))
+
+document = {
+    "schema_version": 1,
+    "group": group,
+    "group_generation": generation,
+    "consistency": "coordinated-non-atomic",
+    "result": result,
+    "started_at": started_at,
+    "completed_at": completed_at,
+    "members": members,
+}
+
+if result != "PASS":
+    document["failure"] = {
+        "application": failure_application or None,
+        "stage": failure_stage or None,
+    }
+
+directory = os.path.dirname(manifest_path)
+fd, temporary = tempfile.mkstemp(
+    prefix=".manifest-",
+    suffix=".tmp",
+    dir=directory,
+    text=True,
+)
+
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.chmod(temporary, 0o640)
+    os.replace(temporary, manifest_path)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+}
+
+cleanup() {
+    local rc=$?
+
+    if [[ "$FINALIZED" != true ]]; then
+        write_manifest "FAIL" || true
+        echo >&2
+        echo "ERROR: group backup failed" >&2
+        echo "Manifest: $MANIFEST" >&2
+    fi
+
+    rm -rf "$WORK_DIR"
+    exit "$rc"
+}
+
+trap cleanup EXIT
+
+echo "===== DOCKER BACKUP GROUP ====="
+echo "Group:            $GROUP_NAME"
+echo "Group generation: $GROUP_GENERATION"
+echo "Consistency:      coordinated-non-atomic"
+echo "Members:          ${#GROUP_MEMBERS[@]}"
+
+for member in "${GROUP_MEMBERS[@]}"; do
+    IFS='|' read -r app repo portable <<<"$member"
+
+    CURRENT_APPLICATION="$app"
+
+    repo_config="${CONFIG_ROOT}/repos/${repo}.conf"
+    portable_config="${CONFIG_ROOT}/portable/${portable}.conf"
+
+    repo_result="${WORK_DIR}/${app}.restic.result"
+    portable_result="${WORK_DIR}/${app}.portable.result"
+
+    echo
+    echo "===== MEMBER: $app ====="
+
+    CURRENT_STAGE="repository-backup"
+
+    "$REPO_BACKUP" \
+        "$repo_config" \
+        --result-file "$repo_result"
+
+    [[ "$(result_value "$repo_result" RESULT)" == "PASS" ]] ||
+        die "repository backup did not report PASS: $app"
+
+    [[ "$(result_value "$repo_result" APPLICATION)" == "$app" ]] ||
+        die "repository result application mismatch: $app"
+
+    [[ "$(result_value "$repo_result" REPOSITORY)" == "$repo" ]] ||
+        die "repository result identity mismatch: $app"
+
+    restic_generation="$(
+        result_value "$repo_result" RESTIC_GENERATION
+    )"
+
+    files_snapshot="$(
+        result_value "$repo_result" FILES_SNAPSHOT
+    )"
+
+    db_snapshot="$(
+        optional_result_value "$repo_result" DB_SNAPSHOT
+    )"
+
+    CURRENT_STAGE="portable-backup"
+
+    "$PORTABLE_BACKUP" \
+        "$portable_config" \
+        --result-file "$portable_result"
+
+    [[ "$(result_value "$portable_result" RESULT)" == "PASS" ]] ||
+        die "portable backup did not report PASS: $app"
+
+    [[ "$(result_value "$portable_result" APPLICATION)" == "$app" ]] ||
+        die "portable result application mismatch: $app"
+
+    [[ "$(result_value "$portable_result" PORTABLE_TARGET)" == "$portable" ]] ||
+        die "portable result identity mismatch: $app"
+
+    portable_set="$(
+        result_value "$portable_result" PORTABLE_SET
+    )"
+
+    append_member \
+        "$app" \
+        "$repo" \
+        "$portable" \
+        "PASS" \
+        "$restic_generation" \
+        "$db_snapshot" \
+        "$files_snapshot" \
+        "$portable_set"
+
+    echo "PASS: member completed: $app"
+done
+
+CURRENT_APPLICATION=""
+CURRENT_STAGE="completed"
+
+write_manifest "PASS"
+FINALIZED=true
+
+trap - EXIT
+rm -rf "$WORK_DIR"
+
+echo
+echo "===== GROUP RESULT ====="
+echo "Group:            $GROUP_NAME"
+echo "Group generation: $GROUP_GENERATION"
+echo "Result:           PASS"
+echo "Manifest:         $MANIFEST"

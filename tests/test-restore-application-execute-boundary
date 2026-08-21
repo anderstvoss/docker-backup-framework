@@ -34,6 +34,10 @@ FILES="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 GEN="20260821T230000Z-12345"
 CP_FILES="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 
+PRODUCTION_FILE="$TMP/app/config/state.txt"
+printf '%s\n' "production-current-state" > "$PRODUCTION_FILE"
+PRODUCTION_HASH_BEFORE="$(sha256sum "$PRODUCTION_FILE" | awk '{print $1}')"
+
 cat > "$CONFIG/app.conf" <<EOF_APP
 APP_NAME="app-one"
 COMPOSE_DIR="$TMP/compose"
@@ -184,23 +188,131 @@ printf 'docker|%s\n' "$*" >> "$TEST_COMMAND_LOG"
 
 [[ "$1" == "compose" ]] || exit 1
 
+state_file="$TEST_APP_STATE_FILE"
+
 case "${2:-}" in
     config)
         exit 0
         ;;
+
     ps)
-        echo web
+        if [[ -f "$state_file" ]] &&
+           [[ "$(cat "$state_file")" == "running" ]]
+        then
+            echo web
+        fi
         exit 0
         ;;
-    down|up|stop|start|restart)
-        echo "ERROR: production container mutation invoked" >&2
+
+    down)
+        [[ "$*" == "compose down" ]] || {
+            echo "unexpected compose down arguments: $*" >&2
+            exit 1
+        }
+
+        if [[ "${FAIL_COMPOSE_DOWN:-0}" == "1" ]]; then
+            echo "injected compose down failure" >&2
+            exit 44
+        fi
+
+        printf '%s\n' stopped > "$state_file"
+        exit 0
+        ;;
+
+    up)
+        [[ "$*" == "compose up -d" ]] || {
+            echo "unexpected compose up arguments: $*" >&2
+            exit 1
+        }
+
+        if [[ "${FAIL_COMPOSE_UP:-0}" == "1" ]]; then
+            echo "injected compose up failure" >&2
+            exit 45
+        fi
+
+        printf '%s\n' running > "$state_file"
+        exit 0
+        ;;
+
+    stop|start|restart)
+        echo "ERROR: unexpected compose mutation: $*" >&2
         exit 90
         ;;
 esac
 
+echo "unexpected docker command: $*" >&2
 exit 1
 EOF_DOCKER
 chmod +x "$BIN/docker"
+
+cat > "$BIN/restic" <<'EOF_RESTIC'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'restic|%s\n' "$*" >> "$TEST_COMMAND_LOG"
+
+[[ "${1:-}" == "restore" ]] || {
+    echo "unexpected restic operation: $*" >&2
+    exit 1
+}
+
+snapshot="${2:-}"
+shift 2
+
+target=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --target)
+            shift
+            target="${1:-}"
+            ;;
+        *)
+            echo "unexpected restic argument: $1" >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+[[ "$snapshot" == "$TEST_EXPECTED_FILES_SNAPSHOT" ]] || {
+    echo "unexpected snapshot ID: $snapshot" >&2
+    exit 46
+}
+
+[[ -n "$target" ]] || {
+    echo "missing restic restore target" >&2
+    exit 1
+}
+
+case "$target" in
+    "$TEST_PRODUCTION_ROOT"|"$TEST_PRODUCTION_ROOT"/*)
+        echo "ERROR: restic target points at production tree" >&2
+        exit 92
+        ;;
+esac
+
+[[ "${FAIL_RESTIC_RESTORE:-0}" != "1" ]] || {
+    echo "injected restic restore failure" >&2
+    exit 47
+}
+
+relative="${TEST_BACKUP_PATH#/}"
+
+if [[ "${OMIT_STAGED_PATH:-0}" != "1" ]]; then
+    mkdir -p "$target/$relative"
+    printf '%s\n' "restored-backup-state" \
+        > "$target/$relative/state.txt"
+fi
+
+if [[ "${INCLUDE_EXCLUDED_PATH:-0}" == "1" ]]; then
+    excluded_relative="${TEST_EXCLUDED_PATH#/}"
+    mkdir -p "$target/$excluded_relative"
+    printf '%s\n' excluded \
+        > "$target/$excluded_relative/forbidden.txt"
+fi
+EOF_RESTIC
+chmod +x "$BIN/restic"
 
 cat > "$BIN/systemctl" <<'EOF_SYSTEMCTL'
 #!/usr/bin/env bash
@@ -241,9 +353,19 @@ run_execute() {
         "DOCKER_BACKUP_LOCK_ROOT=$LOCK_ROOT" \
         "DOCKER_BACKUP_RESTORE_RECORD_ROOT=$RECORD_ROOT" \
         "TEST_COMMAND_LOG=$LOG" \
+        "TEST_APP_STATE_FILE=$TMP/app-state" \
+        "TEST_EXPECTED_FILES_SNAPSHOT=$FILES" \
+        "TEST_PRODUCTION_ROOT=$TMP/app" \
+        "TEST_BACKUP_PATH=$TMP/app/config" \
+        "TEST_EXCLUDED_PATH=$TMP/app/excluded" \
         "FAIL_REPOSITORY_CHECKPOINT=${FAIL_REPOSITORY_CHECKPOINT:-0}" \
         "FAIL_PORTABLE_CHECKPOINT=${FAIL_PORTABLE_CHECKPOINT:-0}" \
         "FAIL_TIMER_STOP=${FAIL_TIMER_STOP:-}" \
+        "FAIL_COMPOSE_DOWN=${FAIL_COMPOSE_DOWN:-0}" \
+        "FAIL_COMPOSE_UP=${FAIL_COMPOSE_UP:-0}" \
+        "FAIL_RESTIC_RESTORE=${FAIL_RESTIC_RESTORE:-0}" \
+        "OMIT_STAGED_PATH=${OMIT_STAGED_PATH:-0}" \
+        "INCLUDE_EXCLUDED_PATH=${INCLUDE_EXCLUDED_PATH:-0}" \
         "$ENGINE" \
         "$CONFIG/app.conf" \
         "$CONFIG/repo.conf" \
@@ -255,34 +377,56 @@ run_execute() {
         --confirm app-one
 }
 
-echo "=== successful pre-mutation boundary ==="
+echo "=== successful shutdown/staging/restart ==="
 : > "$LOG"
+printf '%s\n' running > "$TMP/app-state"
 
 run_execute > "$TMP/success.log"
 
 grep -F \
-    'PASS: guarded execution reached the pre-mutation boundary' \
+    'PASS: application shutdown and immutable staging completed' \
+    "$TMP/success.log"
+
+grep -F \
+    'PASS: production filesystem and database were not modified' \
     "$TMP/success.log"
 
 grep -F 'backup-repository|' "$LOG" >/dev/null
 grep -F 'portable-backup|' "$LOG" >/dev/null
 grep -F 'systemctl|stop ' "$LOG" >/dev/null
 grep -F 'systemctl|start ' "$LOG" >/dev/null
+grep -F 'docker|compose down' "$LOG" >/dev/null
+grep -F 'docker|compose up -d' "$LOG" >/dev/null
+grep -F "restic|restore $FILES --target " "$LOG" >/dev/null
 
-if grep -E \
-    'docker\|compose (down|up|stop|start|restart)' \
-    "$LOG"
-then
-    echo "ERROR: application mutation occurred" >&2
+[[ "$(cat "$TMP/app-state")" == "running" ]] || {
+    echo "ERROR: application was not restored to running state" >&2
     exit 1
-fi
+}
+
+PRODUCTION_HASH_AFTER="$(
+    sha256sum "$PRODUCTION_FILE" |
+    awk '{print $1}'
+)"
+
+[[ "$PRODUCTION_HASH_AFTER" == "$PRODUCTION_HASH_BEFORE" ]] || {
+    echo "ERROR: production backup path changed during staging phase" >&2
+    exit 1
+}
+
+grep -Fx \
+    'production-current-state' \
+    "$PRODUCTION_FILE" >/dev/null
+
+echo "PASS: production file remained byte-for-byte unchanged"
 
 RECORD="$(
     find "$RECORD_ROOT/app-one" \
         -maxdepth 1 \
         -type f \
         -name '*.json' \
-        | head -1
+        | sort \
+        | tail -1
 )"
 
 sudo cat "$RECORD" |
@@ -292,13 +436,47 @@ import sys
 
 d = json.load(sys.stdin)
 
-assert d["result"] == "PRE_MUTATION_BOUNDARY"
-assert d["production_mutation_started"] is False
+assert d["result"] == "STAGING_VALIDATED"
+assert d["production_mutation_started"] is True
+assert d["application_shutdown"] == "PASS"
+assert d["filesystem_staging"] == "PASS"
+assert d["application_state_restored"] == "PASS"
 assert d["timer_state_restored"] is True
 assert d["pre_restore_checkpoint"]["files_snapshot"] == "c" * 64
 '
 
-echo "PASS: successful boundary records checkpoints and restores timers"
+echo "PASS: restore record captures shutdown/staging/restart state"
+
+# Verify operation ordering.
+python3 - "$LOG" <<'ORDERPY'
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    lines = [line.rstrip("\n") for line in f]
+
+def first(prefix):
+    for i, line in enumerate(lines):
+        if line.startswith(prefix):
+            return i
+    raise AssertionError(f"missing log entry: {prefix}")
+
+repo = first("backup-repository|")
+portable = first("portable-backup|")
+timer_stop = first("systemctl|stop ")
+down = first("docker|compose down")
+restore = first("restic|restore ")
+up = first("docker|compose up -d")
+timer_start = first("systemctl|start ")
+
+assert repo < portable
+assert portable < timer_stop
+assert timer_stop < down
+assert down < restore
+assert restore < up
+assert up < timer_start
+ORDERPY
+
+echo "PASS: checkpoint/suspend/shutdown/stage/restart/timer order correct"
 
 echo
 echo "=== repository checkpoint failure ==="
@@ -438,17 +616,129 @@ echo "Restarts observed: $START_COUNT"
 echo "PASS: partial timer-stop failure restores previously stopped timers"
 
 echo
-echo "=== mutation audit ==="
+echo "=== Restic restore failure restarts application and timers ==="
+: > "$LOG"
+printf '%s\n' running > "$TMP/app-state"
 
-if grep -E \
-    'docker\|compose (down|up|stop|start|restart)' \
-    "$LOG"
+if FAIL_RESTIC_RESTORE=1 \
+   run_execute > "$TMP/restic-fail.log" 2>&1
 then
-    echo "ERROR: production application mutation observed" >&2
+    echo "ERROR: Restic staging failure was accepted" >&2
     exit 1
 fi
 
-echo "PASS: execute boundary never mutates application state"
+grep -F \
+    'injected restic restore failure' \
+    "$TMP/restic-fail.log"
+
+[[ "$(cat "$TMP/app-state")" == "running" ]] || {
+    echo "ERROR: application remained stopped after Restic failure" >&2
+    exit 1
+}
+
+grep -F 'docker|compose down' "$LOG" >/dev/null
+grep -F 'docker|compose up -d' "$LOG" >/dev/null
+grep -F 'systemctl|start ' "$LOG" >/dev/null
+
+echo "PASS: Restic failure restored application and timers"
 
 echo
-echo "PASS: restore-application execute-boundary regression suite"
+echo "=== missing staged path fails closed ==="
+: > "$LOG"
+printf '%s\n' running > "$TMP/app-state"
+
+if OMIT_STAGED_PATH=1 \
+   run_execute > "$TMP/missing-path.log" 2>&1
+then
+    echo "ERROR: missing staged path was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'staged Restic restore missing expected path' \
+    "$TMP/missing-path.log"
+
+[[ "$(cat "$TMP/app-state")" == "running" ]] || {
+    echo "ERROR: application remained stopped after path validation failure" >&2
+    exit 1
+}
+
+echo "PASS: missing staged path fails closed and application restarts"
+
+echo
+echo "=== excluded staged path fails closed ==="
+: > "$LOG"
+printf '%s\n' running > "$TMP/app-state"
+
+if INCLUDE_EXCLUDED_PATH=1 \
+   run_execute > "$TMP/excluded-path.log" 2>&1
+then
+    echo "ERROR: excluded staged path was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'staged Restic restore contains excluded path' \
+    "$TMP/excluded-path.log"
+
+[[ "$(cat "$TMP/app-state")" == "running" ]] || {
+    echo "ERROR: application remained stopped after excluded-path failure" >&2
+    exit 1
+}
+
+echo "PASS: excluded staged path fails closed and application restarts"
+
+echo
+echo "=== shutdown failure occurs before staging ==="
+: > "$LOG"
+printf '%s\n' running > "$TMP/app-state"
+
+if FAIL_COMPOSE_DOWN=1 \
+   run_execute > "$TMP/down-fail.log" 2>&1
+then
+    echo "ERROR: shutdown failure was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'injected compose down failure' \
+    "$TMP/down-fail.log"
+
+if grep -F 'restic|restore ' "$LOG"; then
+    echo "ERROR: staging began after failed application shutdown" >&2
+    exit 1
+fi
+
+[[ "$(cat "$TMP/app-state")" == "running" ]] || {
+    echo "ERROR: application state changed after failed shutdown" >&2
+    exit 1
+}
+
+echo "PASS: failed shutdown prevents staging"
+
+echo
+echo "=== production-data mutation audit ==="
+
+PRODUCTION_HASH_FINAL="$(
+    sha256sum "$PRODUCTION_FILE" |
+    awk '{print $1}'
+)"
+
+[[ "$PRODUCTION_HASH_FINAL" == "$PRODUCTION_HASH_BEFORE" ]] || {
+    echo "ERROR: production filesystem changed during execute tests" >&2
+    exit 1
+}
+
+if grep -E \
+    'docker\|compose (stop|start|restart)' \
+    "$LOG"
+then
+    echo "ERROR: unexpected application mutation command observed" >&2
+    exit 1
+fi
+
+echo "PASS: only controlled compose down/up mutations are used"
+echo "PASS: configured production data remains unchanged"
+
+echo
+echo "PASS: restore-application shutdown/staging regression suite"

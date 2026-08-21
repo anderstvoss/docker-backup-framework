@@ -472,9 +472,16 @@ REPO_CHECKPOINT_RESULT="${WORK_ROOT}/repository.result"
 PORTABLE_CHECKPOINT_RESULT="${WORK_ROOT}/portable.result"
 
 TIMERS_NEED_RESTORE=0
+APPLICATION_NEEDS_RESTART=0
 
 cleanup_execute() {
     rc=$?
+
+    if [[ "$APPLICATION_NEEDS_RESTART" -eq 1 ]] &&
+       declare -F restore_application_state >/dev/null 2>&1
+    then
+        restore_application_state || true
+    fi
 
     if [[ "$TIMERS_NEED_RESTORE" -eq 1 ]] &&
        declare -F restore_timer_state >/dev/null 2>&1
@@ -789,28 +796,51 @@ echo "PASS: fresh portable checkpoint created"
 echo "PASS: scheduling state captured"
 echo "PASS: active timers suspended"
 echo "PASS: conflicting operation locks excluded"
-echo
-echo "Production mutation has NOT started."
-echo "Container shutdown, filesystem placement, and database import are"
-echo "intentionally not implemented in this checkpoint."
 
-restore_timer_state
+update_restore_record() {
+    local result="$1"
+    local stage="$2"
+    local mutation="$3"
+    local shutdown="$4"
+    local staging="$5"
+    local app_restored="$6"
+    local timers_restored="$7"
 
-python3 - "$RESTORE_RECORD" <<'FINALPY'
+    python3 - \
+        "$RESTORE_RECORD" \
+        "$result" \
+        "$stage" \
+        "$mutation" \
+        "$shutdown" \
+        "$staging" \
+        "$app_restored" \
+        "$timers_restored" <<'UPDATEPY'
 import json
 import os
 import sys
 import tempfile
 
-output = sys.argv[1]
+(
+    output,
+    result,
+    stage,
+    mutation,
+    shutdown,
+    staging,
+    app_restored,
+    timers_restored,
+) = sys.argv[1:]
 
 with open(output, encoding="utf-8") as f:
     document = json.load(f)
 
-document["result"] = "PRE_MUTATION_BOUNDARY"
-document["last_completed_stage"] = "guarded-pre-mutation-boundary"
-document["production_mutation_started"] = False
-document["timer_state_restored"] = True
+document["result"] = result
+document["last_completed_stage"] = stage
+document["production_mutation_started"] = mutation == "true"
+document["application_shutdown"] = shutdown
+document["filesystem_staging"] = staging
+document["application_state_restored"] = app_restored
+document["timer_state_restored"] = timers_restored == "true"
 
 directory = os.path.dirname(output)
 fd, temporary = tempfile.mkstemp(
@@ -831,13 +861,159 @@ try:
 finally:
     if os.path.exists(temporary):
         os.unlink(temporary)
-FINALPY
+UPDATEPY
+}
+
+restore_application_state() {
+    echo
+    echo "===== RESTORE APPLICATION STATE ====="
+
+    cd "$COMPOSE_DIR"
+
+    if docker compose up -d; then
+        APPLICATION_NEEDS_RESTART=0
+        echo "PASS: application stack restarted"
+        return 0
+    fi
+
+    echo "ERROR: failed to restart application stack" >&2
+    return 1
+}
+
+update_restore_record \
+    "IN_PROGRESS" \
+    "guarded-pre-mutation-boundary" \
+    "false" \
+    "NOT_STARTED" \
+    "NOT_STARTED" \
+    "NOT_NEEDED" \
+    "false"
+
+echo
+echo "===== STOP APPLICATION STACK ====="
+
+cd "$COMPOSE_DIR"
+
+# This is the first production-state mutation.
+update_restore_record \
+    "IN_PROGRESS" \
+    "starting-application-shutdown" \
+    "true" \
+    "IN_PROGRESS" \
+    "NOT_STARTED" \
+    "PENDING" \
+    "false"
+
+docker compose down
+
+APPLICATION_NEEDS_RESTART=1
+
+REMAINING_SERVICES="$(
+    docker compose ps \
+        --services \
+        --filter status=running
+)"
+
+[[ -z "$REMAINING_SERVICES" ]] || {
+    printf 'ERROR: application services still running after shutdown:\n%s\n' \
+        "$REMAINING_SERVICES" >&2
+    die "application shutdown verification failed"
+}
+
+echo "PASS: application stack stopped"
+
+update_restore_record \
+    "IN_PROGRESS" \
+    "application-shutdown" \
+    "true" \
+    "PASS" \
+    "NOT_STARTED" \
+    "PENDING" \
+    "false"
+
+echo
+echo "===== STAGE IMMUTABLE FILESYSTEM SNAPSHOT ====="
+
+STAGING_ROOT="${WORK_ROOT}/filesystem"
+mkdir -p "$STAGING_ROOT"
+
+export RESTIC_REPOSITORY="$REPO_PATH"
+export RESTIC_PASSWORD_FILE="$PASSWORD_PATH"
+
+restic restore \
+    "$FILES_SNAPSHOT" \
+    --target "$STAGING_ROOT"
+
+echo
+echo "===== VALIDATE STAGED FILESYSTEM ====="
+
+for path in "${BACKUP_PATHS[@]}"; do
+    relative="${path#/}"
+
+    [[ -e "$STAGING_ROOT/$relative" ]] ||
+        die "staged Restic restore missing expected path: $path"
+
+    echo "PASS: staged restore contains $path"
+done
+
+if declare -p EXCLUDE_PATHS >/dev/null 2>&1; then
+    for path in "${EXCLUDE_PATHS[@]}"; do
+        relative="${path#/}"
+
+        [[ ! -e "$STAGING_ROOT/$relative" ]] ||
+            die "staged Restic restore contains excluded path: $path"
+
+        echo "PASS: staged restore excludes $path"
+    done
+fi
+
+echo "PASS: immutable filesystem snapshot staged and validated"
+
+update_restore_record \
+    "IN_PROGRESS" \
+    "filesystem-staging" \
+    "true" \
+    "PASS" \
+    "PASS" \
+    "PENDING" \
+    "false"
+
+echo
+echo "===== PRODUCTION FILESYSTEM BOUNDARY ====="
+echo "Production application paths have NOT been replaced."
+echo "Database state has NOT been modified."
+
+restore_application_state
+
+RESTORED_SERVICES="$(
+    docker compose ps \
+        --services \
+        --filter status=running
+)"
+
+[[ -n "$RESTORED_SERVICES" ]] ||
+    die "application stack did not return to a running state"
+
+echo "PASS: application has running services after restart"
+
+restore_timer_state
+
+update_restore_record \
+    "STAGING_VALIDATED" \
+    "application-shutdown-filesystem-staging" \
+    "true" \
+    "PASS" \
+    "PASS" \
+    "PASS" \
+    "true"
 
 rm -f "$VALIDATION_RESULT"
 rm -rf "$WORK_ROOT"
 trap - EXIT
 
 echo
-echo "PASS: guarded execution reached the pre-mutation boundary"
+echo "PASS: application shutdown and immutable staging completed"
+echo "PASS: production filesystem and database were not modified"
+echo "PASS: application state restored"
 echo "PASS: timer state restored"
 echo "Restore record: $RESTORE_RECORD"

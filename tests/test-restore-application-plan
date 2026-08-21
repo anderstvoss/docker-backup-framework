@@ -298,8 +298,13 @@ assert d["mode"] == "plan"
 
 echo "PASS: MariaDB restore plan contains immutable DB coordinate"
 
+PLAN_INSPECTION_LOG="$TMP/plan-inspection.log"
+cp "$LOG" "$PLAN_INSPECTION_LOG"
+
 echo
-echo "=== destructive execution rejected ==="
+echo "=== guarded execute confirmation checks ==="
+
+: > "$LOG"
 
 if run_plan \
        "$CONFIG_ROOT/app-none.conf" \
@@ -309,17 +314,80 @@ if run_plan \
        --files-snapshot "$FILES_SNAPSHOT" \
        --portable-set "$TMP/portable/set-one" \
        --execute \
-       > "$TMP/execute.log" 2>&1
+       > "$TMP/execute-no-confirm.log" 2>&1
 then
-    echo "ERROR: --execute was accepted" >&2
+    echo "ERROR: --execute without --confirm was accepted" >&2
     exit 1
 fi
 
 grep -F \
-    'destructive execution is not implemented' \
-    "$TMP/execute.log"
+    -- '--confirm <application> is required with --execute' \
+    "$TMP/execute-no-confirm.log"
 
-echo "PASS: --execute rejected"
+[[ ! -s "$LOG" ]] || {
+    echo "ERROR: runtime inspection occurred before confirmation guard" >&2
+    cat "$LOG" >&2
+    exit 1
+}
+
+echo "PASS: --execute requires explicit application confirmation"
+
+: > "$LOG"
+
+if run_plan \
+       "$CONFIG_ROOT/app-none.conf" \
+       "$CONFIG_ROOT/repo.conf" \
+       "$CONFIG_ROOT/portable.conf" \
+       --generation "$GENERATION" \
+       --files-snapshot "$FILES_SNAPSHOT" \
+       --portable-set "$TMP/portable/set-one" \
+       --execute \
+       --confirm wrong-app \
+       > "$TMP/execute-wrong-confirm.log" 2>&1
+then
+    echo "ERROR: incorrect confirmation value was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'confirmation value does not match application: app-one' \
+    "$TMP/execute-wrong-confirm.log"
+
+[[ ! -s "$LOG" ]] || {
+    echo "ERROR: runtime inspection occurred before confirmation mismatch rejection" >&2
+    cat "$LOG" >&2
+    exit 1
+}
+
+echo "PASS: incorrect application confirmation rejected"
+
+: > "$LOG"
+
+if run_plan \
+       "$CONFIG_ROOT/app-none.conf" \
+       "$CONFIG_ROOT/repo.conf" \
+       "$CONFIG_ROOT/portable.conf" \
+       --generation "$GENERATION" \
+       --files-snapshot "$FILES_SNAPSHOT" \
+       --portable-set "$TMP/portable/set-one" \
+       --confirm app-one \
+       > "$TMP/confirm-without-execute.log" 2>&1
+then
+    echo "ERROR: --confirm without --execute was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    -- '--confirm is only valid with --execute' \
+    "$TMP/confirm-without-execute.log"
+
+[[ ! -s "$LOG" ]] || {
+    echo "ERROR: runtime inspection occurred before orphan confirmation rejection" >&2
+    cat "$LOG" >&2
+    exit 1
+}
+
+echo "PASS: --confirm without --execute rejected"
 
 echo
 echo "=== recovery-validation failure blocks planning ==="
@@ -349,16 +417,16 @@ echo "=== mutation audit ==="
 
 if grep -E \
     'systemctl\|(stop|start|disable|enable)|docker\|compose (down|up|stop|start|restart)' \
-    "$LOG"
+    "$PLAN_INSPECTION_LOG"
 then
     echo "ERROR: destructive command observed during plan mode" >&2
     exit 1
 fi
 
-grep -F 'systemctl|is-active' "$LOG" >/dev/null
-grep -F 'systemctl|is-enabled' "$LOG" >/dev/null
-grep -F 'docker|compose config --quiet' "$LOG" >/dev/null
-grep -F 'docker|compose ps --services --filter status=running' "$LOG" >/dev/null
+grep -F 'systemctl|is-active' "$PLAN_INSPECTION_LOG" >/dev/null
+grep -F 'systemctl|is-enabled' "$PLAN_INSPECTION_LOG" >/dev/null
+grep -F 'docker|compose config --quiet' "$PLAN_INSPECTION_LOG" >/dev/null
+grep -F 'docker|compose ps --services --filter status=running' "$PLAN_INSPECTION_LOG" >/dev/null
 
 echo "PASS: plan mode performed inspection only"
 

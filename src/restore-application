@@ -12,12 +12,13 @@ Usage:
     --files-snapshot <immutable-id> \
     [--db-snapshot <immutable-id>] \
     --portable-set <absolute-path> \
-    [--plan-file <path>]
+    [--plan-file <path>] \
+    [--execute --confirm <application>]
 
-Current implementation:
-  plan/preflight only
+Without --execute, the command is plan/preflight only.
 
-This version cannot modify production state.
+The current execute implementation stops at a guarded pre-mutation boundary.
+It does not stop containers, restore files, or modify a database.
 HELP
     exit 2
 }
@@ -28,7 +29,7 @@ die() {
 }
 
 [[ "$EUID" -eq 0 ]] ||
-    die "restore planning must run as root"
+    die "restore operations must run as root"
 
 [[ $# -ge 3 ]] || usage
 
@@ -42,6 +43,8 @@ FILES_SNAPSHOT=""
 DB_SNAPSHOT=""
 PORTABLE_SET=""
 PLAN_FILE=""
+EXECUTE=0
+CONFIRM=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -70,8 +73,13 @@ while [[ $# -gt 0 ]]; do
             [[ $# -gt 0 ]] || usage
             PLAN_FILE="$1"
             ;;
-        --execute|--confirm)
-            die "destructive execution is not implemented"
+        --execute)
+            EXECUTE=1
+            ;;
+        --confirm)
+            shift
+            [[ $# -gt 0 ]] || usage
+            CONFIRM="$1"
             ;;
         *)
             usage
@@ -146,6 +154,16 @@ APP_ID="${APP_NAME:-}"
 [[ -n "$APP_ID" ]] ||
     die "application config missing APP_NAME"
 
+if [[ "$EXECUTE" -eq 1 ]]; then
+    [[ -n "$CONFIRM" ]] ||
+        die "--confirm <application> is required with --execute"
+
+    [[ "$CONFIRM" == "$APP_ID" ]] ||
+        die "confirmation value does not match application: $APP_ID"
+elif [[ -n "$CONFIRM" ]]; then
+    die "--confirm is only valid with --execute"
+fi
+
 [[ "$REPO_APP_NAME" == "$APP_ID" ]] ||
     die "repository/application identity mismatch"
 
@@ -187,12 +205,27 @@ done
 
 RUNTIME_ROOT="${DOCKER_BACKUP_ENGINE_ROOT:-/usr/local/lib/docker-backup}"
 RECOVERY_VALIDATOR="${RUNTIME_ROOT}/validate-application-recovery"
+BACKUP_REPOSITORY="${RUNTIME_ROOT}/backup-repository"
+PORTABLE_BACKUP="${RUNTIME_ROOT}/portable-backup"
 
 [[ -x "$RECOVERY_VALIDATOR" ]] ||
     die "required executable missing: $RECOVERY_VALIDATOR"
 
+if [[ "$EXECUTE" -eq 1 ]]; then
+    [[ -x "$BACKUP_REPOSITORY" ]] ||
+        die "required executable missing: $BACKUP_REPOSITORY"
+
+    [[ -x "$PORTABLE_BACKUP" ]] ||
+        die "required executable missing: $PORTABLE_BACKUP"
+fi
+
 echo "===== PRODUCTION RESTORE PLAN ====="
-echo "Mode:              PLAN ONLY"
+
+if [[ "$EXECUTE" -eq 1 ]]; then
+    echo "Mode:              GUARDED EXECUTE"
+else
+    echo "Mode:              PLAN ONLY"
+fi
 echo "Application:       $APP_ID"
 echo "Repository:        $REPO_ID"
 echo "Portable target:   $PORTABLE_ID"
@@ -311,8 +344,14 @@ done
 
 echo
 echo "===== PRE-RESTORE CHECKPOINT ====="
-echo "Would create fresh repository and portable backups before mutation."
-echo "No checkpoint is created in plan mode."
+
+if [[ "$EXECUTE" -eq 1 ]]; then
+    echo "A fresh repository and portable checkpoint will be created"
+    echo "before any scheduling or production-state mutation."
+else
+    echo "Would create fresh repository and portable backups before mutation."
+    echo "No checkpoint is created in plan mode."
+fi
 
 echo
 echo "===== EXECUTION SEQUENCE ====="
@@ -414,9 +453,391 @@ PY
     echo "Plan file: $PLAN_FILE"
 fi
 
+if [[ "$EXECUTE" -eq 0 ]]; then
+    rm -f "$VALIDATION_RESULT"
+    trap - EXIT
+
+    echo
+    echo "PASS: production restore plan completed"
+    echo "PASS: no production state was modified"
+    exit 0
+fi
+
+echo
+echo "===== GUARDED EXECUTION PRE-MUTATION ====="
+echo "Confirmation:      $CONFIRM"
+
+WORK_ROOT="$(mktemp -d /tmp/docker-restore-execute.XXXXXX)"
+REPO_CHECKPOINT_RESULT="${WORK_ROOT}/repository.result"
+PORTABLE_CHECKPOINT_RESULT="${WORK_ROOT}/portable.result"
+
+TIMERS_NEED_RESTORE=0
+
+cleanup_execute() {
+    rc=$?
+
+    if [[ "$TIMERS_NEED_RESTORE" -eq 1 ]] &&
+       declare -F restore_timer_state >/dev/null 2>&1
+    then
+        restore_timer_state || true
+    fi
+
+    rm -f "$VALIDATION_RESULT" 2>/dev/null || true
+    rm -rf "$WORK_ROOT" 2>/dev/null || true
+
+    exit "$rc"
+}
+
+trap cleanup_execute EXIT
+
+result_value() {
+    local file="$1"
+    local key="$2"
+
+    awk -F= -v key="$key" '
+        $1 == key {
+            sub(/^[^=]*=/, "")
+            print
+            found = 1
+            exit
+        }
+        END {
+            if (!found) {
+                exit 1
+            }
+        }
+    ' "$file"
+}
+
+echo
+echo "===== CREATE PRE-RESTORE REPOSITORY CHECKPOINT ====="
+
+"$BACKUP_REPOSITORY" \
+    "$REPO_CONFIG" \
+    --result-file "$REPO_CHECKPOINT_RESULT"
+
+[[ -s "$REPO_CHECKPOINT_RESULT" ]] ||
+    die "repository checkpoint did not produce a result"
+
+REPO_CP_RESULT="$(result_value "$REPO_CHECKPOINT_RESULT" RESULT)"
+REPO_CP_APP="$(result_value "$REPO_CHECKPOINT_RESULT" APPLICATION)"
+REPO_CP_REPOSITORY="$(result_value "$REPO_CHECKPOINT_RESULT" REPOSITORY)"
+REPO_CP_GENERATION="$(
+    result_value "$REPO_CHECKPOINT_RESULT" RESTIC_GENERATION
+)"
+REPO_CP_FILES="$(result_value "$REPO_CHECKPOINT_RESULT" FILES_SNAPSHOT)"
+
+[[ "$REPO_CP_RESULT" == "PASS" ]] ||
+    die "repository checkpoint did not report PASS"
+
+[[ "$REPO_CP_APP" == "$APP_ID" ]] ||
+    die "repository checkpoint application identity mismatch"
+
+[[ "$REPO_CP_REPOSITORY" == "$REPO_ID" ]] ||
+    die "repository checkpoint repository identity mismatch"
+
+[[ -n "$REPO_CP_GENERATION" ]] ||
+    die "repository checkpoint returned empty generation"
+
+[[ "$REPO_CP_FILES" =~ ^[0-9a-f]{64}$ ]] ||
+    die "repository checkpoint returned invalid files snapshot"
+
+REPO_CP_DB=""
+
+if [[ "$DB_TYPE" != "none" ]]; then
+    REPO_CP_DB="$(
+        result_value "$REPO_CHECKPOINT_RESULT" DB_SNAPSHOT
+    )"
+
+    [[ "$REPO_CP_DB" =~ ^[0-9a-f]{64}$ ]] ||
+        die "repository checkpoint returned invalid database snapshot"
+fi
+
+echo "PASS: repository checkpoint created"
+echo "Generation:         $REPO_CP_GENERATION"
+echo "Files snapshot:     $REPO_CP_FILES"
+
+if [[ -n "$REPO_CP_DB" ]]; then
+    echo "DB snapshot:        $REPO_CP_DB"
+fi
+
+echo
+echo "===== CREATE PRE-RESTORE PORTABLE CHECKPOINT ====="
+
+"$PORTABLE_BACKUP" \
+    "$PORTABLE_CONFIG" \
+    --result-file "$PORTABLE_CHECKPOINT_RESULT"
+
+[[ -s "$PORTABLE_CHECKPOINT_RESULT" ]] ||
+    die "portable checkpoint did not produce a result"
+
+PORTABLE_CP_RESULT="$(
+    result_value "$PORTABLE_CHECKPOINT_RESULT" RESULT
+)"
+PORTABLE_CP_APP="$(
+    result_value "$PORTABLE_CHECKPOINT_RESULT" APPLICATION
+)"
+PORTABLE_CP_TARGET="$(
+    result_value "$PORTABLE_CHECKPOINT_RESULT" PORTABLE_TARGET
+)"
+PORTABLE_CP_SET="$(
+    result_value "$PORTABLE_CHECKPOINT_RESULT" PORTABLE_SET
+)"
+
+[[ "$PORTABLE_CP_RESULT" == "PASS" ]] ||
+    die "portable checkpoint did not report PASS"
+
+[[ "$PORTABLE_CP_APP" == "$APP_ID" ]] ||
+    die "portable checkpoint application identity mismatch"
+
+[[ "$PORTABLE_CP_TARGET" == "$PORTABLE_ID" ]] ||
+    die "portable checkpoint target identity mismatch"
+
+[[ "$PORTABLE_CP_SET" = /* ]] ||
+    die "portable checkpoint returned a non-absolute recovery set"
+
+echo "PASS: portable checkpoint created"
+echo "Portable set:       $PORTABLE_CP_SET"
+
+echo
+echo "===== CAPTURE SCHEDULING STATE ====="
+
+declare -a TIMER_ACTIVE_BEFORE=()
+declare -a TIMER_ENABLED_BEFORE=()
+declare -a TIMER_STOPPED=()
+
+for timer in "${TIMER_UNITS[@]}"; do
+    active="$(systemctl is-active "$timer" 2>/dev/null || true)"
+    enabled="$(systemctl is-enabled "$timer" 2>/dev/null || true)"
+
+    TIMER_ACTIVE_BEFORE+=("$active")
+    TIMER_ENABLED_BEFORE+=("$enabled")
+    TIMER_STOPPED+=(0)
+
+    echo "$timer"
+    echo "  active=$active"
+    echo "  enabled=$enabled"
+done
+
+RESTORE_RECORD_ROOT="${DOCKER_BACKUP_RESTORE_RECORD_ROOT:-/var/lib/docker-backup/restore-records}"
+
+mkdir -p "${RESTORE_RECORD_ROOT}/${APP_ID}"
+RESTORE_RECORD="${RESTORE_RECORD_ROOT}/${APP_ID}/${RESTORE_ID}.json"
+
+umask 077
+
+python3 - \
+    "$RESTORE_RECORD" \
+    "$APP_ID" \
+    "$REPO_ID" \
+    "$PORTABLE_ID" \
+    "$GENERATION" \
+    "$FILES_SNAPSHOT" \
+    "$DB_SNAPSHOT" \
+    "$PORTABLE_SET" \
+    "$REPO_CP_GENERATION" \
+    "$REPO_CP_FILES" \
+    "$REPO_CP_DB" \
+    "$PORTABLE_CP_SET" <<'RECORDPY'
+import json
+import os
+import sys
+import tempfile
+
+(
+    output,
+    application,
+    repository,
+    portable_target,
+    generation,
+    files_snapshot,
+    db_snapshot,
+    portable_set,
+    checkpoint_generation,
+    checkpoint_files,
+    checkpoint_db,
+    checkpoint_portable,
+) = sys.argv[1:]
+
+document = {
+    "schema_version": 1,
+    "result": "IN_PROGRESS",
+    "last_completed_stage": "pre-restore-checkpoint",
+    "production_mutation_started": False,
+    "application": application,
+    "repository": repository,
+    "portable_target": portable_target,
+    "selected_recovery": {
+        "restic_generation": generation,
+        "files_snapshot": files_snapshot,
+        "db_snapshot": db_snapshot or None,
+        "portable_set": portable_set,
+    },
+    "pre_restore_checkpoint": {
+        "restic_generation": checkpoint_generation,
+        "files_snapshot": checkpoint_files,
+        "db_snapshot": checkpoint_db or None,
+        "portable_set": checkpoint_portable,
+    },
+}
+
+directory = os.path.dirname(output)
+fd, temporary = tempfile.mkstemp(
+    prefix=".restore-record.",
+    dir=directory,
+    text=True,
+)
+
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, output)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+RECORDPY
+
+echo "Restore record:     $RESTORE_RECORD"
+
+restore_timer_state() {
+    local restore_failed=0
+
+    echo
+    echo "===== RESTORE TIMER STATE ====="
+
+    for i in "${!TIMER_UNITS[@]}"; do
+        timer="${TIMER_UNITS[$i]}"
+
+        if [[ "${TIMER_STOPPED[$i]}" -eq 1 ]]; then
+            if systemctl start "$timer"; then
+                TIMER_STOPPED[i]=0
+                echo "Restored active: $timer"
+            else
+                echo "ERROR: failed to restart timer: $timer" >&2
+                restore_failed=1
+            fi
+        fi
+    done
+
+    if [[ "$restore_failed" -eq 0 ]]; then
+        TIMERS_NEED_RESTORE=0
+        return 0
+    fi
+
+    return 1
+}
+
+echo
+echo "===== SUSPEND ACTIVE TIMERS ====="
+
+for i in "${!TIMER_UNITS[@]}"; do
+    timer="${TIMER_UNITS[$i]}"
+
+    if [[ "${TIMER_ACTIVE_BEFORE[$i]}" == "active" ]]; then
+        systemctl stop "$timer"
+        TIMER_STOPPED[i]=1
+        TIMERS_NEED_RESTORE=1
+        echo "Stopped: $timer"
+    else
+        echo "Already inactive: $timer"
+    fi
+done
+
+echo
+echo "===== ACQUIRE RESTORE LOCKS ====="
+
+LOCK_ROOT="${DOCKER_BACKUP_LOCK_ROOT:-/run/lock}"
+mkdir -p "$LOCK_ROOT"
+
+APP_LOCK="${LOCK_ROOT}/docker-backup-app-${APP_ID}.lock"
+REPO_LOCK="${LOCK_ROOT}/docker-backup-${REPO_ID}.lock"
+PORTABLE_LOCK="${LOCK_ROOT}/docker-portable-${PORTABLE_ID}.lock"
+
+exec 6>"$APP_LOCK"
+
+if ! flock -n 6; then
+    restore_timer_state
+    die "application operation lock is busy: $APP_ID"
+fi
+
+exec 7>"$REPO_LOCK"
+
+if ! flock -n 7; then
+    restore_timer_state
+    die "repository operation lock is busy: $REPO_ID"
+fi
+
+exec 8>"$PORTABLE_LOCK"
+
+if ! flock -n 8; then
+    restore_timer_state
+    die "portable operation lock is busy: $PORTABLE_ID"
+fi
+
+echo "PASS: application, repository, and portable locks acquired"
+
+echo
+echo "===== PRE-MUTATION BOUNDARY ====="
+echo "PASS: selected recovery point validated"
+echo "PASS: fresh repository checkpoint created"
+echo "PASS: fresh portable checkpoint created"
+echo "PASS: scheduling state captured"
+echo "PASS: active timers suspended"
+echo "PASS: conflicting operation locks excluded"
+echo
+echo "Production mutation has NOT started."
+echo "Container shutdown, filesystem placement, and database import are"
+echo "intentionally not implemented in this checkpoint."
+
+restore_timer_state
+
+python3 - "$RESTORE_RECORD" <<'FINALPY'
+import json
+import os
+import sys
+import tempfile
+
+output = sys.argv[1]
+
+with open(output, encoding="utf-8") as f:
+    document = json.load(f)
+
+document["result"] = "PRE_MUTATION_BOUNDARY"
+document["last_completed_stage"] = "guarded-pre-mutation-boundary"
+document["production_mutation_started"] = False
+document["timer_state_restored"] = True
+
+directory = os.path.dirname(output)
+fd, temporary = tempfile.mkstemp(
+    prefix=".restore-record.",
+    dir=directory,
+    text=True,
+)
+
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, output)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+FINALPY
+
 rm -f "$VALIDATION_RESULT"
+rm -rf "$WORK_ROOT"
 trap - EXIT
 
 echo
-echo "PASS: production restore plan completed"
-echo "PASS: no production state was modified"
+echo "PASS: guarded execution reached the pre-mutation boundary"
+echo "PASS: timer state restored"
+echo "Restore record: $RESTORE_RECORD"

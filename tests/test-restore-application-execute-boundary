@@ -1,0 +1,454 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENGINE="$ROOT/src/restore-application"
+
+TMP="$(mktemp -d)"
+
+cleanup_test() {
+    sudo rm -rf "$TMP"
+}
+
+trap cleanup_test EXIT
+
+CONFIG="$TMP/config"
+RUNTIME="$TMP/runtime"
+BIN="$TMP/bin"
+LOCK_ROOT="$TMP/locks"
+RECORD_ROOT="$TMP/records"
+LOG="$TMP/commands.log"
+
+mkdir -p \
+    "$CONFIG" \
+    "$RUNTIME" \
+    "$BIN" \
+    "$LOCK_ROOT" \
+    "$RECORD_ROOT" \
+    "$TMP/compose" \
+    "$TMP/repository" \
+    "$TMP/portable/original-set" \
+    "$TMP/app/config"
+
+FILES="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+GEN="20260821T230000Z-12345"
+CP_FILES="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+cat > "$CONFIG/app.conf" <<EOF_APP
+APP_NAME="app-one"
+COMPOSE_DIR="$TMP/compose"
+DB_TYPE="none"
+DB_BACKUP_MODE="none"
+BACKUP_PATHS=(
+    "$TMP/app/config"
+)
+EXCLUDE_PATHS=(
+    "$TMP/app/excluded"
+)
+EOF_APP
+
+cat > "$CONFIG/repo.conf" <<EOF_REPO
+REPO_NAME="app-one-operational"
+APP_NAME="app-one"
+REPOSITORY="$TMP/repository"
+PASSWORD_FILE="$TMP/restic.password"
+STORAGE_TYPE="local"
+EOF_REPO
+
+cat > "$CONFIG/portable.conf" <<EOF_PORTABLE
+PORTABLE_NAME="app-one"
+APP_NAME="app-one"
+BACKUP_ROOT="$TMP/portable"
+STORAGE_TYPE="local"
+EOF_PORTABLE
+
+printf '%s\n' password > "$TMP/restic.password"
+
+cat > "$RUNTIME/validate-application-recovery" <<'EOF_VALIDATOR'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+app="$1"
+repo="$2"
+portable="$3"
+shift 3
+
+result_file=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --result-file)
+            shift
+            result_file="$1"
+            ;;
+    esac
+    shift
+done
+
+# shellcheck disable=SC1090
+source "$app"
+app_name="$APP_NAME"
+
+# shellcheck disable=SC1090
+source "$repo"
+repo_name="$REPO_NAME"
+
+# shellcheck disable=SC1090
+source "$portable"
+portable_name="$PORTABLE_NAME"
+
+{
+    echo "RESULT=PASS"
+    echo "APPLICATION=$app_name"
+    echo "REPOSITORY=$repo_name"
+    echo "PORTABLE_TARGET=$portable_name"
+} > "$result_file"
+
+chmod 0600 "$result_file"
+echo "PASS: mock recovery validation"
+EOF_VALIDATOR
+chmod +x "$RUNTIME/validate-application-recovery"
+
+cat > "$RUNTIME/backup-repository" <<EOF_REPO_ENGINE
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'backup-repository|%s\n' "\$*" >> "\$TEST_COMMAND_LOG"
+
+[[ "\${FAIL_REPOSITORY_CHECKPOINT:-0}" != "1" ]] || {
+    echo "injected repository checkpoint failure" >&2
+    exit 41
+}
+
+result_file=""
+while [[ \$# -gt 0 ]]; do
+    case "\$1" in
+        --result-file)
+            shift
+            result_file="\$1"
+            ;;
+    esac
+    shift
+done
+
+{
+    echo "RESULT=PASS"
+    echo "APPLICATION=app-one"
+    echo "REPOSITORY=app-one-operational"
+    echo "RESTIC_GENERATION=checkpoint-generation"
+    echo "FILES_SNAPSHOT=$CP_FILES"
+} > "\$result_file"
+
+chmod 0600 "\$result_file"
+EOF_REPO_ENGINE
+chmod +x "$RUNTIME/backup-repository"
+
+cat > "$RUNTIME/portable-backup" <<EOF_PORTABLE_ENGINE
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'portable-backup|%s\n' "\$*" >> "\$TEST_COMMAND_LOG"
+
+[[ "\${FAIL_PORTABLE_CHECKPOINT:-0}" != "1" ]] || {
+    echo "injected portable checkpoint failure" >&2
+    exit 42
+}
+
+result_file=""
+while [[ \$# -gt 0 ]]; do
+    case "\$1" in
+        --result-file)
+            shift
+            result_file="\$1"
+            ;;
+    esac
+    shift
+done
+
+{
+    echo "RESULT=PASS"
+    echo "APPLICATION=app-one"
+    echo "PORTABLE_TARGET=app-one"
+    echo "PORTABLE_SET=$TMP/portable/pre-restore-checkpoint"
+} > "\$result_file"
+
+chmod 0600 "\$result_file"
+EOF_PORTABLE_ENGINE
+chmod +x "$RUNTIME/portable-backup"
+
+cat > "$BIN/docker" <<'EOF_DOCKER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'docker|%s\n' "$*" >> "$TEST_COMMAND_LOG"
+
+[[ "$1" == "compose" ]] || exit 1
+
+case "${2:-}" in
+    config)
+        exit 0
+        ;;
+    ps)
+        echo web
+        exit 0
+        ;;
+    down|up|stop|start|restart)
+        echo "ERROR: production container mutation invoked" >&2
+        exit 90
+        ;;
+esac
+
+exit 1
+EOF_DOCKER
+chmod +x "$BIN/docker"
+
+cat > "$BIN/systemctl" <<'EOF_SYSTEMCTL'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'systemctl|%s\n' "$*" >> "$TEST_COMMAND_LOG"
+
+case "$1" in
+    is-active)
+        echo active
+        ;;
+    is-enabled)
+        echo enabled
+        ;;
+    stop)
+        if [[ "${FAIL_TIMER_STOP:-}" == "$2" ]]; then
+            echo "injected timer stop failure" >&2
+            exit 43
+        fi
+        ;;
+    start)
+        ;;
+    disable|enable)
+        echo "ERROR: timer enablement mutation not expected" >&2
+        exit 91
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+EOF_SYSTEMCTL
+chmod +x "$BIN/systemctl"
+
+run_execute() {
+    sudo env \
+        "PATH=$BIN:$PATH" \
+        "DOCKER_BACKUP_ENGINE_ROOT=$RUNTIME" \
+        "DOCKER_BACKUP_LOCK_ROOT=$LOCK_ROOT" \
+        "DOCKER_BACKUP_RESTORE_RECORD_ROOT=$RECORD_ROOT" \
+        "TEST_COMMAND_LOG=$LOG" \
+        "FAIL_REPOSITORY_CHECKPOINT=${FAIL_REPOSITORY_CHECKPOINT:-0}" \
+        "FAIL_PORTABLE_CHECKPOINT=${FAIL_PORTABLE_CHECKPOINT:-0}" \
+        "FAIL_TIMER_STOP=${FAIL_TIMER_STOP:-}" \
+        "$ENGINE" \
+        "$CONFIG/app.conf" \
+        "$CONFIG/repo.conf" \
+        "$CONFIG/portable.conf" \
+        --generation "$GEN" \
+        --files-snapshot "$FILES" \
+        --portable-set "$TMP/portable/original-set" \
+        --execute \
+        --confirm app-one
+}
+
+echo "=== successful pre-mutation boundary ==="
+: > "$LOG"
+
+run_execute > "$TMP/success.log"
+
+grep -F \
+    'PASS: guarded execution reached the pre-mutation boundary' \
+    "$TMP/success.log"
+
+grep -F 'backup-repository|' "$LOG" >/dev/null
+grep -F 'portable-backup|' "$LOG" >/dev/null
+grep -F 'systemctl|stop ' "$LOG" >/dev/null
+grep -F 'systemctl|start ' "$LOG" >/dev/null
+
+if grep -E \
+    'docker\|compose (down|up|stop|start|restart)' \
+    "$LOG"
+then
+    echo "ERROR: application mutation occurred" >&2
+    exit 1
+fi
+
+RECORD="$(
+    find "$RECORD_ROOT/app-one" \
+        -maxdepth 1 \
+        -type f \
+        -name '*.json' \
+        | head -1
+)"
+
+sudo cat "$RECORD" |
+python3 -c '
+import json
+import sys
+
+d = json.load(sys.stdin)
+
+assert d["result"] == "PRE_MUTATION_BOUNDARY"
+assert d["production_mutation_started"] is False
+assert d["timer_state_restored"] is True
+assert d["pre_restore_checkpoint"]["files_snapshot"] == "c" * 64
+'
+
+echo "PASS: successful boundary records checkpoints and restores timers"
+
+echo
+echo "=== repository checkpoint failure ==="
+: > "$LOG"
+
+if FAIL_REPOSITORY_CHECKPOINT=1 \
+   run_execute > "$TMP/repo-fail.log" 2>&1
+then
+    echo "ERROR: repository checkpoint failure was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'injected repository checkpoint failure' \
+    "$TMP/repo-fail.log"
+
+if grep -F 'systemctl|stop ' "$LOG"; then
+    echo "ERROR: timers stopped after repository checkpoint failure" >&2
+    exit 1
+fi
+
+echo "PASS: repository checkpoint failure occurs before timer suspension"
+
+echo
+echo "=== portable checkpoint failure ==="
+: > "$LOG"
+
+if FAIL_PORTABLE_CHECKPOINT=1 \
+   run_execute > "$TMP/portable-fail.log" 2>&1
+then
+    echo "ERROR: portable checkpoint failure was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'injected portable checkpoint failure' \
+    "$TMP/portable-fail.log"
+
+if grep -F 'systemctl|stop ' "$LOG"; then
+    echo "ERROR: timers stopped after portable checkpoint failure" >&2
+    exit 1
+fi
+
+echo "PASS: portable checkpoint failure occurs before timer suspension"
+
+echo
+echo "=== busy application lock ==="
+: > "$LOG"
+
+APP_LOCK="$LOCK_ROOT/docker-backup-app-app-one.lock"
+
+sudo env     APP_LOCK="$APP_LOCK"     READY_FILE="$TMP/lock-ready"     bash -c '
+        exec 9>"$APP_LOCK"
+        flock 9
+        printf "%s\n" locked > "$READY_FILE"
+        sleep 30
+    ' &
+LOCK_PID=$!
+
+for _ in $(seq 1 100); do
+    [[ -f "$TMP/lock-ready" ]] && break
+    sleep 0.05
+done
+
+[[ -f "$TMP/lock-ready" ]] || {
+    sudo kill "$LOCK_PID" 2>/dev/null || true
+    wait "$LOCK_PID" 2>/dev/null || true
+    echo "ERROR: lock-holder process did not become ready" >&2
+    exit 1
+}
+
+if run_execute > "$TMP/lock-fail.log" 2>&1; then
+    sudo kill "$LOCK_PID" 2>/dev/null || true
+    wait "$LOCK_PID" 2>/dev/null || true
+    echo "ERROR: busy application lock was accepted" >&2
+    exit 1
+fi
+
+sudo kill "$LOCK_PID" 2>/dev/null || true
+wait "$LOCK_PID" 2>/dev/null || true
+
+grep -F \
+    'application operation lock is busy: app-one' \
+    "$TMP/lock-fail.log"
+
+STOP_COUNT="$(
+    grep -c '^systemctl|stop ' "$LOG" || true
+)"
+START_COUNT="$(
+    grep -c '^systemctl|start ' "$LOG" || true
+)"
+
+[[ "$STOP_COUNT" -eq 5 ]] || {
+    echo "ERROR: expected 5 timer stops, got $STOP_COUNT" >&2
+    exit 1
+}
+
+[[ "$START_COUNT" -eq 5 ]] || {
+    echo "ERROR: expected 5 timer restarts after lock failure, got $START_COUNT" >&2
+    exit 1
+}
+
+echo "PASS: busy lock fails closed and restores timers"
+
+echo
+echo "=== partial timer-stop failure ==="
+: > "$LOG"
+
+FAIL_UNIT="docker-maintenance@app-one-operational.timer"
+
+if FAIL_TIMER_STOP="$FAIL_UNIT" \
+   run_execute > "$TMP/timer-fail.log" 2>&1
+then
+    echo "ERROR: injected timer-stop failure was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'injected timer stop failure' \
+    "$TMP/timer-fail.log"
+
+STOP_COUNT="$(
+    grep -c '^systemctl|stop ' "$LOG" || true
+)"
+START_COUNT="$(
+    grep -c '^systemctl|start ' "$LOG" || true
+)"
+
+echo "Stops attempted:   $STOP_COUNT"
+echo "Restarts observed: $START_COUNT"
+
+[[ "$START_COUNT" -ge 2 ]] || {
+    echo "ERROR: previously stopped timers were not restored after stop failure" >&2
+    exit 1
+}
+
+echo "PASS: partial timer-stop failure restores previously stopped timers"
+
+echo
+echo "=== mutation audit ==="
+
+if grep -E \
+    'docker\|compose (down|up|stop|start|restart)' \
+    "$LOG"
+then
+    echo "ERROR: production application mutation observed" >&2
+    exit 1
+fi
+
+echo "PASS: execute boundary never mutates application state"
+
+echo
+echo "PASS: restore-application execute-boundary regression suite"

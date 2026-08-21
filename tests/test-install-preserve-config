@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TMP_ROOT"' EXIT
+
+prepare_source() {
+    local dest="$1"
+
+    mkdir -p "$dest"
+    cp -a "$REPO_ROOT/." "$dest/"
+    rm -rf "$dest/.git"
+
+    # Modify only the disposable test copy so installation is redirected
+    # away from the host filesystem and the root requirement can be bypassed.
+    python3 - "$dest/scripts/install" <<'PY'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text()
+
+replacements = {
+    'if [ "$EUID" -ne 0 ]; then':
+        'if [ "${INSTALL_TEST_MODE:-0}" != "1" ] && [ "$EUID" -ne 0 ]; then',
+
+    'ENGINE_DEST="/usr/local/lib/docker-backup"':
+        'ENGINE_DEST="${TEST_ROOT:?}/usr/local/lib/docker-backup"',
+
+    'APP_DEST="/etc/docker-backup/apps"':
+        'APP_DEST="${TEST_ROOT:?}/etc/docker-backup/apps"',
+
+    'REPO_DEST="/etc/docker-backup/repos"':
+        'REPO_DEST="${TEST_ROOT:?}/etc/docker-backup/repos"',
+
+    'PORTABLE_DEST="/etc/docker-backup/portable"':
+        'PORTABLE_DEST="${TEST_ROOT:?}/etc/docker-backup/portable"',
+
+    'VERSION_DEST="/etc/docker-backup/DEPLOYED_VERSION"':
+        'VERSION_DEST="${TEST_ROOT:?}/etc/docker-backup/DEPLOYED_VERSION"',
+
+    '/etc/docker-backup/secrets':
+        '${TEST_ROOT:?}/etc/docker-backup/secrets',
+
+    '"/etc/systemd/system/$(basename "$unit")"':
+        '"${TEST_ROOT:?}/etc/systemd/system/$(basename "$unit")"',
+}
+
+for old, new in replacements.items():
+    if old not in s:
+        raise SystemExit(f"test patch target not found: {old}")
+    s = s.replace(old, new)
+
+p.write_text(s)
+PY
+
+    # Timer rendering is tested for invocation and input selection here.
+    # The renderers themselves have their own framework validation.
+    cat > "$dest/scripts/render-timers" <<'STUB'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s\n' "$1" >> "${TEST_ROOT:?}/repository-render.log"
+STUB
+
+    cat > "$dest/scripts/render-portable-timers" <<'STUB'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s\n' "$1" >> "${TEST_ROOT:?}/portable-render.log"
+STUB
+
+    chmod +x \
+        "$dest/scripts/install" \
+        "$dest/scripts/render-timers" \
+        "$dest/scripts/render-portable-timers"
+}
+
+prepare_mock_systemctl() {
+    local bindir="$1"
+
+    mkdir -p "$bindir"
+
+    cat > "$bindir/systemctl" <<'STUB'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s\n' "$*" >> "${TEST_ROOT:?}/systemctl.log"
+STUB
+
+    cat > "$bindir/install" <<'STUB'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+args=()
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o|-g)
+            shift
+            [ "$#" -gt 0 ] || exit 2
+            shift
+            ;;
+        *)
+            args+=("$1")
+            shift
+            ;;
+    esac
+done
+
+exec /usr/bin/install "${args[@]}"
+STUB
+
+    cat > "$bindir/chown" <<'STUB'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exit 0
+STUB
+
+    chmod +x         "$bindir/systemctl"         "$bindir/install"         "$bindir/chown"
+}
+
+echo "=== preserve-config installation ==="
+
+PRESERVE="$TMP_ROOT/preserve"
+SOURCE="$PRESERVE/source"
+ROOT="$PRESERVE/root"
+BIN="$PRESERVE/bin"
+
+prepare_source "$SOURCE"
+prepare_mock_systemctl "$BIN"
+
+mkdir -p \
+    "$ROOT/etc/docker-backup/apps" \
+    "$ROOT/etc/docker-backup/repos" \
+    "$ROOT/etc/docker-backup/portable" \
+    "$ROOT/etc/docker-backup/secrets" \
+    "$ROOT/etc/systemd/system"
+
+cat > "$ROOT/etc/docker-backup/apps/production-app.conf" <<'EOF_APP'
+APP_NAME="production-app"
+SENTINEL="preserve-app"
+EOF_APP
+
+cat > "$ROOT/etc/docker-backup/repos/production-operational.conf" <<'EOF_REPO'
+REPO_NAME="production-operational"
+APP_NAME="production-app"
+SENTINEL="preserve-repository"
+EOF_REPO
+
+cat > "$ROOT/etc/docker-backup/portable/production-app.conf" <<'EOF_PORTABLE'
+PORTABLE_NAME="production-app"
+APP_NAME="production-app"
+SENTINEL="preserve-portable"
+EOF_PORTABLE
+
+printf '%s\n' 'preserve-secret' \
+    > "$ROOT/etc/docker-backup/secrets/production.password"
+
+APP_HASH="$(
+    sha256sum "$ROOT/etc/docker-backup/apps/production-app.conf" |
+    awk '{print $1}'
+)"
+REPO_HASH="$(
+    sha256sum "$ROOT/etc/docker-backup/repos/production-operational.conf" |
+    awk '{print $1}'
+)"
+PORTABLE_HASH="$(
+    sha256sum "$ROOT/etc/docker-backup/portable/production-app.conf" |
+    awk '{print $1}'
+)"
+SECRET_HASH="$(
+    sha256sum "$ROOT/etc/docker-backup/secrets/production.password" |
+    awk '{print $1}'
+)"
+
+INSTALL_TEST_MODE=1 \
+TEST_ROOT="$ROOT" \
+PATH="$BIN:$PATH" \
+    "$SOURCE/scripts/install" --preserve-config
+
+test "$APP_HASH" = "$(
+    sha256sum "$ROOT/etc/docker-backup/apps/production-app.conf" |
+    awk '{print $1}'
+)"
+
+test "$REPO_HASH" = "$(
+    sha256sum "$ROOT/etc/docker-backup/repos/production-operational.conf" |
+    awk '{print $1}'
+)"
+
+test "$PORTABLE_HASH" = "$(
+    sha256sum "$ROOT/etc/docker-backup/portable/production-app.conf" |
+    awk '{print $1}'
+)"
+
+test "$SECRET_HASH" = "$(
+    sha256sum "$ROOT/etc/docker-backup/secrets/production.password" |
+    awk '{print $1}'
+)"
+
+test ! -e "$ROOT/etc/docker-backup/apps/example-app.conf"
+test ! -e "$ROOT/etc/docker-backup/repos/example-app-operational.conf"
+test ! -e "$ROOT/etc/docker-backup/portable/example-app.conf"
+
+for engine in \
+    backup-repository \
+    retention-repository \
+    maintain-repository \
+    portable-backup \
+    portable-retention
+do
+    cmp \
+        "$SOURCE/src/$engine" \
+        "$ROOT/usr/local/lib/docker-backup/$engine"
+done
+
+grep -Fx \
+    "$ROOT/etc/docker-backup/repos/production-operational.conf" \
+    "$ROOT/repository-render.log"
+
+grep -Fx \
+    "$ROOT/etc/docker-backup/portable/production-app.conf" \
+    "$ROOT/portable-render.log"
+
+grep -Fx 'daemon-reload' "$ROOT/systemctl.log"
+
+echo "PASS: preserve-config retained production configuration"
+
+echo
+echo "=== standard installation ==="
+
+STANDARD="$TMP_ROOT/standard"
+SOURCE="$STANDARD/source"
+ROOT="$STANDARD/root"
+BIN="$STANDARD/bin"
+
+prepare_source "$SOURCE"
+prepare_mock_systemctl "$BIN"
+
+mkdir -p "$ROOT/etc/systemd/system"
+
+INSTALL_TEST_MODE=1 \
+TEST_ROOT="$ROOT" \
+PATH="$BIN:$PATH" \
+    "$SOURCE/scripts/install"
+
+cmp \
+    "$SOURCE/config/apps/example-app.conf" \
+    "$ROOT/etc/docker-backup/apps/example-app.conf"
+
+cmp \
+    "$SOURCE/config/repos/example-app-operational.conf" \
+    "$ROOT/etc/docker-backup/repos/example-app-operational.conf"
+
+cmp \
+    "$SOURCE/config/portable/example-app.conf" \
+    "$ROOT/etc/docker-backup/portable/example-app.conf"
+
+echo "PASS: standard installation still deploys source configuration"
+
+echo
+echo "=== missing production configuration rejection ==="
+
+MISSING="$TMP_ROOT/missing"
+SOURCE="$MISSING/source"
+ROOT="$MISSING/root"
+BIN="$MISSING/bin"
+
+prepare_source "$SOURCE"
+prepare_mock_systemctl "$BIN"
+
+mkdir -p \
+    "$ROOT/etc/docker-backup/apps" \
+    "$ROOT/etc/docker-backup/repos" \
+    "$ROOT/etc/docker-backup/portable" \
+    "$ROOT/etc/systemd/system"
+
+printf '%s\n' 'APP_NAME="production-app"' \
+    > "$ROOT/etc/docker-backup/apps/production-app.conf"
+
+printf '%s\n' 'REPO_NAME="production-operational"' \
+    > "$ROOT/etc/docker-backup/repos/production-operational.conf"
+
+# Intentionally leave portable/ empty.
+if INSTALL_TEST_MODE=1 \
+   TEST_ROOT="$ROOT" \
+   PATH="$BIN:$PATH" \
+       "$SOURCE/scripts/install" --preserve-config \
+       >"$MISSING/output.log" 2>&1
+then
+    echo "ERROR: preserve-config accepted incomplete production configuration" >&2
+    exit 1
+fi
+
+grep -F \
+    'ERROR: no production configuration files found' \
+    "$MISSING/output.log"
+
+test ! -e "$ROOT/usr/local/lib/docker-backup/backup-repository"
+
+echo "PASS: incomplete production configuration rejected before deployment"
+
+echo
+echo "PASS: installer preserve-config regression suite"

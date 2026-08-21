@@ -81,6 +81,7 @@ for file in \
     "$SOURCE_ROOT/src/validate-application-recovery" \
     "$SOURCE_ROOT/src/validate-group-recovery" \
     "$SOURCE_ROOT/src/restore-application" \
+    "$SOURCE_ROOT/src/restore-group" \
     "$SOURCE_ROOT/scripts/acceptance-test" \
     "$SOURCE_ROOT/scripts/resolve-snapshot" \
     "$SOURCE_ROOT/scripts/validate-group" \
@@ -101,6 +102,7 @@ bash -n "$SOURCE_ROOT/src/backup-group"
 bash -n "$SOURCE_ROOT/src/validate-application-recovery"
 bash -n "$SOURCE_ROOT/src/validate-group-recovery"
 bash -n "$SOURCE_ROOT/src/restore-application"
+bash -n "$SOURCE_ROOT/src/restore-group"
 bash -n "$SOURCE_ROOT/scripts/acceptance-test"
 bash -n "$SOURCE_ROOT/scripts/resolve-snapshot"
 bash -n "$SOURCE_ROOT/scripts/validate-group"
@@ -197,6 +199,10 @@ install -o root -g root -m 0750 \
 install -o root -g root -m 0750 \
     "$SOURCE_ROOT/src/restore-application" \
     "$ENGINE_DEST/restore-application"
+
+install -o root -g root -m 0750 \
+    "$SOURCE_ROOT/src/restore-group" \
+    "$ENGINE_DEST/restore-group"
 
 install -o root -g root -m 0750 \
     "$SOURCE_ROOT/scripts/acceptance-test" \
@@ -306,6 +312,9 @@ cmp "$SOURCE_ROOT/src/validate-group-recovery" \
 
 cmp "$SOURCE_ROOT/src/restore-application" \
     "$ENGINE_DEST/restore-application"
+
+cmp "$SOURCE_ROOT/src/restore-group" \
+    "$ENGINE_DEST/restore-group"
 
 cmp "$SOURCE_ROOT/scripts/acceptance-test" \
     "$ENGINE_DEST/acceptance-test"

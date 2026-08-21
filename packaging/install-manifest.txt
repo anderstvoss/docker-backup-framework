@@ -3,6 +3,17 @@
 src/backup-repository -> /usr/local/lib/docker-backup/backup-repository
 src/retention-repository -> /usr/local/lib/docker-backup/retention-repository
 src/maintain-repository -> /usr/local/lib/docker-backup/maintain-repository
+src/portable-backup -> /usr/local/lib/docker-backup/portable-backup
+src/portable-retention -> /usr/local/lib/docker-backup/portable-retention
+src/backup-group -> /usr/local/lib/docker-backup/backup-group
+src/validate-application-recovery -> /usr/local/lib/docker-backup/validate-application-recovery
+src/validate-group-recovery -> /usr/local/lib/docker-backup/validate-group-recovery
+src/restore-application -> /usr/local/lib/docker-backup/restore-application
+src/restore-group -> /usr/local/lib/docker-backup/restore-group
+scripts/acceptance-test -> /usr/local/lib/docker-backup/acceptance-test
+scripts/resolve-snapshot -> /usr/local/lib/docker-backup/resolve-snapshot
+scripts/validate-group -> /usr/local/lib/docker-backup/validate-group
+scripts/validate-group-manifest -> /usr/local/lib/docker-backup/validate-group-manifest
 
 config/apps/example-app.conf -> /etc/docker-backup/apps/example-app.conf
 config/repos/example-app-operational.conf -> /etc/docker-backup/repos/example-app-operational.conf
@@ -23,9 +34,7 @@ scripts/render-timers -> deployment helper; not required by runtime after instal
 # Concrete timer instances are generated from repository configuration
 # and installed under /etc/systemd/system/.
 
-src/portable-backup -> /usr/local/lib/docker-backup/portable-backup
 config/portable/example-app.conf -> /etc/docker-backup/portable/example-app.conf
-src/portable-retention -> /usr/local/lib/docker-backup/portable-retention
 packaging/systemd/docker-portable-backup@.service -> /etc/systemd/system/docker-portable-backup@.service
 packaging/systemd/docker-portable-retention@.service -> /etc/systemd/system/docker-portable-retention@.service
 scripts/render-portable-timers -> deployment helper; not required by runtime after install

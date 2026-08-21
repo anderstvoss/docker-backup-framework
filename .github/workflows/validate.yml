@@ -74,7 +74,8 @@ jobs:
             tests/test-validate-group-recovery \
             tests/test-restore-application-plan \
             tests/test-restore-application-execute-boundary \
-            tests/test-restore-application-execute-mariadb
+            tests/test-restore-application-execute-mariadb \
+            tests/test-restore-group
           do
             echo "===== $test ====="
             "$test"

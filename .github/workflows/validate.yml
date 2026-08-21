@@ -25,17 +25,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          find scripts src \
+          find scripts src tests \
             -type f \
+            -perm -u+x \
             -print0 |
+          sort -z |
           xargs -0 shellcheck
-
-          shellcheck tests/test-install-preserve-config
-          shellcheck tests/test-version
-          shellcheck tests/test-resolve-snapshot
-          shellcheck tests/test-deployment-drill
-          shellcheck scripts/acceptance-test
-          shellcheck scripts/deployment-drill
 
       - name: Shell syntax
         shell: bash
@@ -45,8 +40,9 @@ jobs:
           while IFS= read -r -d '' file; do
             bash -n "$file"
           done < <(
-            find scripts src \
+            find scripts src tests \
               -type f \
+              -perm -u+x \
               -print0
           )
 
@@ -59,17 +55,30 @@ jobs:
               -print0
           )
 
-      - name: Installer regression tests
-        run: tests/test-install-preserve-config
+      - name: Regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Version regression tests
-        run: tests/test-version
-
-      - name: Snapshot resolver regression tests
-        run: tests/test-resolve-snapshot
-
-      - name: Deployment drill regression tests
-        run: tests/test-deployment-drill
+          for test in \
+            tests/test-version \
+            tests/test-resolve-snapshot \
+            tests/test-install-preserve-config \
+            tests/test-deployment-drill \
+            tests/test-validate-group \
+            tests/test-validate-group-manifest \
+            tests/test-backup-result-files \
+            tests/test-backup-group \
+            tests/test-validate-application-recovery \
+            tests/test-validate-application-recovery-mariadb \
+            tests/test-validate-group-recovery \
+            tests/test-restore-application-plan \
+            tests/test-restore-application-execute-boundary \
+            tests/test-restore-application-execute-mariadb
+          do
+            echo "===== $test ====="
+            "$test"
+          done
 
       - name: Check disclosure patterns
         run: scripts/ci/check-disclosures

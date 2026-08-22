@@ -319,8 +319,8 @@ grep -F 'postgresql-logical-test' "$RESTIC_DB_CAPTURE"
 
 grep -F 'postgres-db' "$DOCKER_TEST_LOG"
 grep -F 'pg_dump' "$DOCKER_TEST_LOG"
-grep -F -- '--username="$POSTGRES_USER"' "$DOCKER_TEST_LOG"
-grep -F -- '--dbname="$POSTGRES_DB"' "$DOCKER_TEST_LOG"
+grep -F -- "--username=\"\$POSTGRES_USER\"" "$DOCKER_TEST_LOG"
+grep -F -- "--dbname=\"\$POSTGRES_DB\"" "$DOCKER_TEST_LOG"
 grep -F -- '--format=plain' "$DOCKER_TEST_LOG"
 grep -F -- '--no-password' "$DOCKER_TEST_LOG"
 

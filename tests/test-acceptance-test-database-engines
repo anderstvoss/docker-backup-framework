@@ -406,6 +406,7 @@ EOF_DOCKER
     echo
     echo "=== acceptance test: $engine ==="
 
+    # shellcheck disable=SC2024
     sudo env \
         "PATH=$bin:$PATH" \
         "DOCKER_BACKUP_RUNTIME_ROOT=$runtime" \

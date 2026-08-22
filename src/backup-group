@@ -2,8 +2,14 @@
 set -Eeuo pipefail
 
 usage() {
-    echo "Usage: $0 <group-config>" >&2
-    exit 2
+    cat <<EOF
+Usage: $0 <group-config>
+
+Create a coordinated non-atomic backup for all members of a configured group.
+
+Options:
+  -h, --help  Show this help and exit.
+EOF
 }
 
 die() {
@@ -11,7 +17,17 @@ die() {
     exit 1
 }
 
-[[ $# -eq 1 ]] || usage
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
+if [[ $# -ne 1 ]]; then
+    usage >&2
+    exit 2
+fi
 
 GROUP_CONFIG="$1"
 

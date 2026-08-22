@@ -156,7 +156,7 @@ It verifies:
 - portable logical database restoration
 - Restic logical database restoration
 - restored table and trigger counts against the live database
-- Alembic migration identity when the application uses `alembic_version`
+- configured application-specific schema/migration identity when present
 - disposable local test-resource cleanup
 
 The fresh backup artifacts remain in backup storage as valid recovery points.

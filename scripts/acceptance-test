@@ -251,19 +251,32 @@ echo "===== LIVE DATABASE METRICS ====="
 LIVE_METRICS="$(schema_metrics_live)"
 printf '%s\n' "$LIVE_METRICS"
 
-LIVE_ALEMBIC=""
+DB_VALIDATION_LABEL="${DB_VALIDATION_LABEL:-}"
+DB_VALIDATION_QUERY="${DB_VALIDATION_QUERY:-}"
 
-if db_query_live \
-    "SELECT COUNT(*) FROM information_schema.tables
-     WHERE table_schema='$DB_NAME'
-       AND table_name='alembic_version';" |
-   grep -Fxq 1
+if [[ -n "$DB_VALIDATION_LABEL" && -z "$DB_VALIDATION_QUERY" ]] ||
+   [[ -z "$DB_VALIDATION_LABEL" && -n "$DB_VALIDATION_QUERY" ]]
 then
-    LIVE_ALEMBIC="$(
-        db_query_live \
-            "SELECT version_num FROM alembic_version LIMIT 1;"
-    )"
-    echo "alembic=$LIVE_ALEMBIC"
+    echo "ERROR: DB_VALIDATION_LABEL and DB_VALIDATION_QUERY must be configured together" >&2
+    exit 1
+fi
+
+LIVE_DB_MARKER=""
+
+if [[ -n "$DB_VALIDATION_QUERY" ]]; then
+    LIVE_DB_MARKER="$(db_query_live "$DB_VALIDATION_QUERY")"
+
+    [[ -n "$LIVE_DB_MARKER" ]] || {
+        echo "ERROR: application-specific live database validation returned no value" >&2
+        exit 1
+    }
+
+    [[ "$LIVE_DB_MARKER" != *$'\n'* ]] || {
+        echo "ERROR: application-specific database validation must return one row and one column" >&2
+        exit 1
+    }
+
+    echo "${DB_VALIDATION_LABEL}=${LIVE_DB_MARKER}"
 fi
 
 echo
@@ -482,20 +495,19 @@ validate_restored_database() {
         return 1
     fi
 
-    if [ -n "$LIVE_ALEMBIC" ]; then
-        RESTORED_ALEMBIC="$(
-            db_query_test \
-                "SELECT version_num FROM alembic_version LIMIT 1;"
+    if [[ -n "$DB_VALIDATION_QUERY" ]]; then
+        RESTORED_DB_MARKER="$(
+            db_query_test "$DB_VALIDATION_QUERY"
         )"
 
-        if [ "$RESTORED_ALEMBIC" != "$LIVE_ALEMBIC" ]; then
+        if [[ "$RESTORED_DB_MARKER" != "$LIVE_DB_MARKER" ]]; then
             echo \
-                "ERROR: $label Alembic marker differs from live database" \
+                "ERROR: $label ${DB_VALIDATION_LABEL} marker differs from live database" \
                 >&2
             return 1
         fi
 
-        echo "PASS: $label Alembic marker matches: $RESTORED_ALEMBIC"
+        echo "PASS: $label ${DB_VALIDATION_LABEL} marker matches: $RESTORED_DB_MARKER"
     fi
 
     echo "PASS: $label database metrics match live database"

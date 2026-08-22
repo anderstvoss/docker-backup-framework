@@ -252,8 +252,12 @@ Non-destructive restore validation:
 - database dump imported successfully into an isolated temporary MariaDB container
 - restored database contained 32 tables
 - restored database contained 4 triggers
-- `alembic_version` was readable
+- the application's configured Alembic migration marker was readable
 - restored schema marker was `0103_roms_facets_provider_ids`
+
+The Alembic marker above is specific to the reference application. Generic
+MariaDB validation does not require Alembic; applications may define their own
+single-value semantic validation query.
 
 The initial restore harness used `mariadb-admin ping`, which could succeed
 before authenticated SQL access was ready. Validation was repeated using an

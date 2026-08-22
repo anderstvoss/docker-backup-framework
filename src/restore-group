@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 usage() {
-    cat >&2 <<'HELP'
+    cat <<'HELP'
 Usage:
   restore-group <group-manifest> [--execute --confirm <group>]
 
@@ -17,7 +17,6 @@ Group restore is coordinated-non-atomic. If a member restore fails, processing
 stops immediately. Previously completed member restores remain completed and
 are not automatically rolled back as a group.
 HELP
-    exit 2
 }
 
 die() {
@@ -25,10 +24,20 @@ die() {
     exit 1
 }
 
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
+if [[ $# -lt 1 ]]; then
+    usage >&2
+    exit 2
+fi
+
 [[ "$EUID" -eq 0 ]] ||
     die "group restore must run as root"
-
-[[ $# -ge 1 ]] || usage
 
 MANIFEST="$1"
 shift
@@ -43,11 +52,15 @@ while [[ $# -gt 0 ]]; do
             ;;
         --confirm)
             shift
-            [[ $# -gt 0 ]] || usage
+            if [[ $# -eq 0 ]]; then
+                usage >&2
+                exit 2
+            fi
             CONFIRM="$1"
             ;;
         *)
-            usage
+            usage >&2
+            exit 2
             ;;
     esac
 

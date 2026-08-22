@@ -1,6 +1,25 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+usage() {
+    cat <<EOF
+Usage: $0 [--apply] <repository-config>
+
+Evaluate Restic generation retention policy. Defaults to dry-run.
+
+Options:
+  --apply      Forget expired managed snapshots.
+  -h, --help  Show this help and exit.
+EOF
+}
+
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
 MODE="dry-run"
 
 if [ "${1:-}" = "--apply" ]; then
@@ -9,7 +28,7 @@ if [ "${1:-}" = "--apply" ]; then
 fi
 
 if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 [--apply] <repository-config>" >&2
+    usage >&2
     exit 2
 fi
 

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 usage() {
-    cat >&2 <<'HELP'
+    cat <<'HELP'
 Usage:
   validate-group-recovery <group-manifest> [--result-file <path>]
 
@@ -22,7 +22,6 @@ The selected manifest is authoritative for:
 
 The current group configuration is not used to select or reorder members.
 HELP
-    exit 2
 }
 
 die() {
@@ -30,10 +29,20 @@ die() {
     exit 1
 }
 
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
+if [[ $# -lt 1 ]]; then
+    usage >&2
+    exit 2
+fi
+
 [[ "$EUID" -eq 0 ]] ||
     die "group recovery validation must run as root"
-
-[[ $# -ge 1 ]] || usage
 
 MANIFEST="$1"
 shift
@@ -44,11 +53,15 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --result-file)
             shift
-            [[ $# -gt 0 ]] || usage
+            if [[ $# -eq 0 ]]; then
+                usage >&2
+                exit 2
+            fi
             RESULT_FILE="$1"
             ;;
         *)
-            usage
+            usage >&2
+            exit 2
             ;;
     esac
 

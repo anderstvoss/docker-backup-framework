@@ -66,15 +66,30 @@ Use `EXCLUDE_PATHS` to document paths intentionally outside the backup set.
 
 Provision the application's backup destination before enabling the framework.
 
-For NFS-backed storage, determine:
+For isolated NFS-backed application storage, establish as applicable:
 
-- local mount path
-- expected remote NFS source
-- permissions required by the Docker host
+- dedicated backup dataset or directory
+- dedicated service identity and ownership
+- restricted read/write NFS export
+- authorized Docker-host address
+- expected NFS source
+- stable local mount path
 - Restic repository location
 - portable recovery-set location
 
-Verify the mount independently before configuring backup execution.
+Configure the Docker host mount before creating backup artifacts.
+
+Verify both:
+
+- the local path resolves to the expected NFS source
+- a test write reaches the remote storage with the intended ownership
+
+Do not treat a successful write to the local mount directory as proof that NFS
+is active. Verify the mounted filesystem explicitly with `findmnt`,
+`mountpoint`, or equivalent.
+
+The framework verifies the configured source during normal operations, but
+storage provisioning itself remains an onboarding prerequisite.
 
 ## 4. Create Restic repository configuration
 
@@ -128,11 +143,25 @@ unrecoverable.
 
 ## 6. Initialize the Restic repository
 
+Create the repository parent directory if required.
+
 Initialize the configured repository using the same repository path and
 password file declared in its configuration.
 
+For example:
+
+    mkdir -p "$(dirname "<repository-path>")"
+
+    restic \
+      --repo "<repository-path>" \
+      --password-file "<password-file>" \
+      init
+
 Verify that the repository opens successfully before running the framework
 backup engine.
+
+`backup-repository` does not initialize a missing Restic repository
+automatically.
 
 ## 7. Create portable backup configuration
 
@@ -162,6 +191,15 @@ Example:
     KEEP_YEARLY=0
 
 Keep timers disabled during initial validation.
+
+Create `BACKUP_ROOT` before the first portable backup:
+
+    mkdir -p "<portable-backup-root>"
+
+Verify that the directory is on the intended backup storage and is writable.
+
+`portable-backup` intentionally fails if `BACKUP_ROOT` does not already exist;
+it does not create the root automatically.
 
 ## 8. Validate source configuration
 

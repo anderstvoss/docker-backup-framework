@@ -46,6 +46,31 @@ For database-backed applications, the live database data directory must not be
 included when `DB_BACKUP_MODE="logical"` is used. Database state is captured
 through the database dump mechanism instead.
 
+### Optional semantic database validation
+
+MariaDB logical recovery validation always compares generic restored structure:
+
+- table count
+- trigger count
+
+Applications may additionally configure one semantic schema or migration
+marker:
+
+    DB_VALIDATION_LABEL="migration"
+    DB_VALIDATION_QUERY="SELECT migration FROM migrations ORDER BY id DESC LIMIT 1;"
+
+Both fields must be configured together.
+
+`DB_VALIDATION_QUERY` must return exactly one row and one column.
+
+Examples include:
+
+- Alembic migration version
+- Laravel migration identity
+- application schema version
+
+The framework does not assume a particular application migration system.
+
 ## Restic repository configuration
 
 Location in source:

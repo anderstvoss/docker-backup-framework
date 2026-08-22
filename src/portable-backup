@@ -4,11 +4,28 @@ set -Eeuo pipefail
 RESULT_FILE=""
 
 usage() {
-    echo "Usage: $0 <portable-config> [--result-file <path>]" >&2
-    exit 2
+    cat <<EOF
+Usage: $0 <portable-config> [--result-file <path>]
+
+Create one conventional portable recovery set for an application.
+
+Options:
+  --result-file <path>  Write machine-readable backup coordinates.
+  -h, --help            Show this help and exit.
+EOF
 }
 
-[[ $# -ge 1 ]] || usage
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
+if [[ $# -lt 1 ]]; then
+    usage >&2
+    exit 2
+fi
 
 PORTABLE_CONFIG="$1"
 shift
@@ -17,11 +34,15 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --result-file)
             shift
-            [[ "$#" -gt 0 ]] || usage
+            if [[ "$#" -eq 0 ]]; then
+                usage >&2
+                exit 2
+            fi
             RESULT_FILE="$1"
             ;;
         *)
-            usage
+            usage >&2
+            exit 2
             ;;
     esac
     shift

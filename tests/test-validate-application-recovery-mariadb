@@ -35,6 +35,8 @@ COMPOSE_DIR="$TMP/compose"
 DB_TYPE="mariadb"
 DB_BACKUP_MODE="logical"
 DB_CONTAINER="db"
+DB_VALIDATION_LABEL="migration"
+DB_VALIDATION_QUERY="SELECT marker FROM schema_marker LIMIT 1;"
 BACKUP_PATHS=(
     "$APP_ROOT/config"
 )
@@ -230,8 +232,12 @@ if [[ "$1" == "exec" ]]; then
         cat <<'METRICS'
 tables=1
 triggers=0
-alembic=
 METRICS
+        exit 0
+    fi
+
+    if [[ "$*" == *"SELECT marker FROM schema_marker LIMIT 1;"* ]]; then
+        echo "migration-001"
         exit 0
     fi
 
@@ -276,6 +282,63 @@ grep -F 'docker-recovery-validation-app-one-' "$DOCKER_LOG"
 grep -F 'mariadb:11' "$DOCKER_LOG"
 
 echo "PASS: MariaDB recovery point validated"
+
+echo
+echo "=== generic MariaDB validation without semantic marker ==="
+
+GENERIC_APP_CONF="$TMP/app-generic.conf"
+
+grep -v '^DB_VALIDATION_LABEL=' "$TMP/app.conf" \
+    | grep -v '^DB_VALIDATION_QUERY=' \
+    > "$GENERIC_APP_CONF"
+
+run_validator \
+    "$GENERIC_APP_CONF" \
+    "$TMP/repo.conf" \
+    "$TMP/portable.conf" \
+    --generation "$GENERATION" \
+    --files-snapshot "$FILES_SNAPSHOT" \
+    --db-snapshot "$DB_SNAPSHOT" \
+    --portable-set "$PORTABLE_ROOT/set-one" \
+    > "$TMP/generic-db.log" 2>&1
+
+grep -Fx 'tables=1' "$TMP/generic-db.log"
+grep -Fx 'triggers=0' "$TMP/generic-db.log"
+
+if grep -Fq 'migration=' "$TMP/generic-db.log"; then
+    echo "ERROR: generic MariaDB validation unexpectedly emitted marker" >&2
+    exit 1
+fi
+
+grep -Fq     'PASS: Restic and portable database structure agree'     "$TMP/generic-db.log"
+
+echo "PASS: generic MariaDB validation does not require semantic marker"
+
+echo
+echo "=== incomplete semantic validation configuration rejection ==="
+
+BAD_MARKER_APP_CONF="$TMP/app-bad-marker.conf"
+
+grep -v '^DB_VALIDATION_QUERY=' "$TMP/app.conf" \
+    > "$BAD_MARKER_APP_CONF"
+
+if run_validator \
+       "$BAD_MARKER_APP_CONF" \
+       "$TMP/repo.conf" \
+       "$TMP/portable.conf" \
+       --generation "$GENERATION" \
+       --files-snapshot "$FILES_SNAPSHOT" \
+       --db-snapshot "$DB_SNAPSHOT" \
+       --portable-set "$PORTABLE_ROOT/set-one" \
+       > "$TMP/bad-marker.log" 2>&1
+then
+    echo "ERROR: incomplete semantic DB validation config was accepted" >&2
+    exit 1
+fi
+
+grep -F     'DB_VALIDATION_LABEL and DB_VALIDATION_QUERY must be configured together'     "$TMP/bad-marker.log"
+
+echo "PASS: incomplete semantic validation configuration rejected"
 
 echo
 echo "=== missing DB snapshot rejection ==="

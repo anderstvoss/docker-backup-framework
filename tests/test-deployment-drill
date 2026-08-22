@@ -337,6 +337,7 @@ echo "=== successful deployment drill ==="
 
 CASE_ROOT="$(prepare_case success)"
 EXPECTED_COMMIT="$(git -C "$CASE_ROOT/source" rev-parse HEAD)"
+EXPECTED_VERSION="$(cat "$CASE_ROOT/source/VERSION")"
 
 run_drill "$CASE_ROOT" \
     > "$CASE_ROOT/output.log" 2>&1
@@ -348,7 +349,7 @@ test -z "$(git -C "$CASE_ROOT/source" status --porcelain)"
 LOG_FILE="$(latest_log "$CASE_ROOT")"
 
 grep -Fx 'RESULT=PASS' "$LOG_FILE"
-grep -Fx 'FRAMEWORK_VERSION=1.1.0' "$LOG_FILE"
+grep -Fx "FRAMEWORK_VERSION=$EXPECTED_VERSION" "$LOG_FILE"
 grep -Fx "GIT_COMMIT=$EXPECTED_COMMIT" "$LOG_FILE"
 grep -Fx 'APPLICATION=test-app' "$LOG_FILE"
 grep -Fx 'REPOSITORY=test-app-operational' "$LOG_FILE"

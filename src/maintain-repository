@@ -1,6 +1,32 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+usage() {
+    cat <<EOF
+Usage:
+  $0 <check|read-data|prune-dry-run> <repository-config>
+  $0 prune --apply <repository-config>
+
+Run Restic repository integrity and maintenance operations.
+
+Actions:
+  check          Run standard repository integrity check.
+  read-data      Run full repository data read.
+  prune-dry-run  Preview prune operation without mutation.
+  prune --apply  Execute prune; explicit --apply is required.
+
+Options:
+  -h, --help     Show this help and exit.
+EOF
+}
+
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
 APPLY=0
 
 if [ "${1:-}" = "prune" ]; then
@@ -9,7 +35,7 @@ if [ "${1:-}" = "prune" ]; then
 
     if [ "${1:-}" != "--apply" ]; then
         echo "ERROR: prune requires explicit --apply" >&2
-        echo "Usage: $0 prune --apply <repository-config>" >&2
+        usage >&2
         exit 2
     fi
 
@@ -17,8 +43,7 @@ if [ "${1:-}" = "prune" ]; then
     shift
 else
     if [ "$#" -ne 2 ]; then
-        echo "Usage: $0 <check|read-data|prune-dry-run> <repository-config>" >&2
-        echo "       $0 prune --apply <repository-config>" >&2
+        usage >&2
         exit 2
     fi
 

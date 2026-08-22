@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 usage() {
-    cat >&2 <<'HELP'
+    cat <<'HELP'
 Usage:
   restore-application \
     <application-config> \
@@ -28,7 +28,6 @@ For mariadb:logical applications, database failure handling uses the fresh
 pre-restore database checkpoint for rollback. The application is not restarted
 if database rollback fails.
 HELP
-    exit 2
 }
 
 die() {
@@ -36,10 +35,20 @@ die() {
     exit 1
 }
 
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
+if [[ $# -lt 3 ]]; then
+    usage >&2
+    exit 2
+fi
+
 [[ "$EUID" -eq 0 ]] ||
     die "restore operations must run as root"
-
-[[ $# -ge 3 ]] || usage
 
 APP_CONFIG="$1"
 REPO_CONFIG="$2"
@@ -58,27 +67,42 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --generation)
             shift
-            [[ $# -gt 0 ]] || usage
+            if [[ $# -eq 0 ]]; then
+                usage >&2
+                exit 2
+            fi
             GENERATION="$1"
             ;;
         --files-snapshot)
             shift
-            [[ $# -gt 0 ]] || usage
+            if [[ $# -eq 0 ]]; then
+                usage >&2
+                exit 2
+            fi
             FILES_SNAPSHOT="$1"
             ;;
         --db-snapshot)
             shift
-            [[ $# -gt 0 ]] || usage
+            if [[ $# -eq 0 ]]; then
+                usage >&2
+                exit 2
+            fi
             DB_SNAPSHOT="$1"
             ;;
         --portable-set)
             shift
-            [[ $# -gt 0 ]] || usage
+            if [[ $# -eq 0 ]]; then
+                usage >&2
+                exit 2
+            fi
             PORTABLE_SET="$1"
             ;;
         --plan-file)
             shift
-            [[ $# -gt 0 ]] || usage
+            if [[ $# -eq 0 ]]; then
+                usage >&2
+                exit 2
+            fi
             PLAN_FILE="$1"
             ;;
         --execute)
@@ -86,11 +110,15 @@ while [[ $# -gt 0 ]]; do
             ;;
         --confirm)
             shift
-            [[ $# -gt 0 ]] || usage
+            if [[ $# -eq 0 ]]; then
+                usage >&2
+                exit 2
+            fi
             CONFIRM="$1"
             ;;
         *)
-            usage
+            usage >&2
+            exit 2
             ;;
     esac
 

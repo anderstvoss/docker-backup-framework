@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 usage() {
-    cat >&2 <<'HELP'
+    cat <<'HELP'
 Usage:
   validate-application-recovery \
     <application-config> \
@@ -19,7 +19,6 @@ recovery point.
 
 The command never selects "latest" and never modifies production data.
 HELP
-    exit 2
 }
 
 die() {
@@ -27,10 +26,20 @@ die() {
     exit 1
 }
 
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
+if [[ $# -lt 3 ]]; then
+    usage >&2
+    exit 2
+fi
+
 [[ "$EUID" -eq 0 ]] ||
     die "recovery validation must run as root"
-
-[[ $# -ge 3 ]] || usage
 
 APP_CONFIG="$1"
 REPO_CONFIG="$2"
@@ -47,31 +56,47 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --generation)
             shift
-            [[ $# -gt 0 ]] || usage
+            if [[ $# -eq 0 ]]; then
+                usage >&2
+                exit 2
+            fi
             GENERATION="$1"
             ;;
         --files-snapshot)
             shift
-            [[ $# -gt 0 ]] || usage
+            if [[ $# -eq 0 ]]; then
+                usage >&2
+                exit 2
+            fi
             FILES_SNAPSHOT="$1"
             ;;
         --db-snapshot)
             shift
-            [[ $# -gt 0 ]] || usage
+            if [[ $# -eq 0 ]]; then
+                usage >&2
+                exit 2
+            fi
             DB_SNAPSHOT="$1"
             ;;
         --portable-set)
             shift
-            [[ $# -gt 0 ]] || usage
+            if [[ $# -eq 0 ]]; then
+                usage >&2
+                exit 2
+            fi
             PORTABLE_SET="$1"
             ;;
         --result-file)
             shift
-            [[ $# -gt 0 ]] || usage
+            if [[ $# -eq 0 ]]; then
+                usage >&2
+                exit 2
+            fi
             RESULT_FILE="$1"
             ;;
         *)
-            usage
+            usage >&2
+            exit 2
             ;;
     esac
 
@@ -175,6 +200,21 @@ APP_ID="${APP_NAME:-}"
 : "${COMPOSE_DIR:?Missing COMPOSE_DIR}"
 : "${DB_TYPE:?Missing DB_TYPE}"
 : "${DB_BACKUP_MODE:?Missing DB_BACKUP_MODE}"
+
+DB_VALIDATION_LABEL="${DB_VALIDATION_LABEL:-}"
+DB_VALIDATION_QUERY="${DB_VALIDATION_QUERY:-}"
+
+if [[ -n "$DB_VALIDATION_LABEL" && -z "$DB_VALIDATION_QUERY" ]] ||
+   [[ -z "$DB_VALIDATION_LABEL" && -n "$DB_VALIDATION_QUERY" ]]
+then
+    die "DB_VALIDATION_LABEL and DB_VALIDATION_QUERY must be configured together"
+fi
+
+if [[ -n "$DB_VALIDATION_LABEL" ]] &&
+   [[ ! "$DB_VALIDATION_LABEL" =~ ^[A-Za-z0-9_.-]+$ ]]
+then
+    die "DB_VALIDATION_LABEL contains unsupported characters"
+fi
 
 declare -p BACKUP_PATHS >/dev/null 2>&1 ||
     die "BACKUP_PATHS is not defined"
@@ -595,25 +635,28 @@ if [[ "$DB_TYPE" != "none" ]]; then
               )
               FROM information_schema.triggers
               WHERE trigger_schema='$DB_NAME';
-
-              SELECT IF(
-                EXISTS(
-                  SELECT 1
-                  FROM information_schema.tables
-                  WHERE table_schema='$DB_NAME'
-                    AND table_name='alembic_version'
-                ),
-                CONCAT(
-                  'alembic=',
-                  (
-                    SELECT version_num
-                    FROM \`$DB_NAME\`.alembic_version
-                    LIMIT 1
-                  )
-                ),
-                'alembic='
-              );
             "
+
+        if [[ -n "$DB_VALIDATION_QUERY" ]]; then
+            marker="$(
+                docker exec "$TEST_CONTAINER" \
+                    mariadb \
+                    --batch \
+                    --skip-column-names \
+                    -uroot \
+                    -p"$TEST_ROOT_PASSWORD" \
+                    "$DB_NAME" \
+                    -e "$DB_VALIDATION_QUERY"
+            )"
+
+            [[ -n "$marker" ]] ||
+                die "application-specific database validation returned no value"
+
+            [[ "$marker" != *$'\n'* ]] ||
+                die "application-specific database validation must return one row and one column"
+
+            printf '%s=%s\n' "$DB_VALIDATION_LABEL" "$marker"
+        fi
     }
 
     echo

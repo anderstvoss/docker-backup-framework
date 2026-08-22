@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+commands=(
+    "$ROOT/src/backup-group"
+    "$ROOT/src/backup-repository"
+    "$ROOT/src/maintain-repository"
+    "$ROOT/src/portable-backup"
+    "$ROOT/src/portable-retention"
+    "$ROOT/src/restore-application"
+    "$ROOT/src/restore-group"
+    "$ROOT/src/retention-repository"
+    "$ROOT/src/validate-application-recovery"
+    "$ROOT/src/validate-group-recovery"
+)
+
+for command in "${commands[@]}"; do
+    echo "=== $(basename "$command") --help ==="
+
+    output="$("$command" --help)"
+
+    grep -Fq 'Usage:' <<<"$output"
+
+    echo "PASS: --help exits successfully"
+
+    echo "=== $(basename "$command") -h ==="
+
+    output="$("$command" -h)"
+
+    grep -Fq 'Usage:' <<<"$output"
+
+    echo "PASS: -h exits successfully"
+done
+
+echo
+echo "PASS: public help-option regression suite"

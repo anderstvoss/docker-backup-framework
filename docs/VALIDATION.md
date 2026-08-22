@@ -636,3 +636,45 @@ non-destructive restore of that fresh backup.
 
 Static validation, CI, installer success, and repository integrity checks
 remain required, but they do not replace end-to-end backup/restore acceptance.
+
+## PostgreSQL logical-backup development validation for v1.2.0
+
+PostgreSQL logical-backup support was validated on the
+`feature/postgresql-logical-backup` development branch before release.
+
+The implementation and regression coverage include:
+
+- PostgreSQL logical capture for Restic using `pg_dump`
+- PostgreSQL logical capture for portable recovery sets
+- dumps created with `--no-owner` and `--no-acl`
+- non-destructive PostgreSQL recovery validation
+- base-table, view, and trigger comparison
+- optional application-specific semantic database validation
+- PostgreSQL production restore execution
+- pre-restore logical database checkpoint staging
+- database rollback after selected-import failure
+- application restart suppression when database rollback fails
+- PostgreSQL operation through the installed acceptance-test logic
+- regression coverage of both MariaDB and PostgreSQL acceptance paths
+
+After acceptance-harness support was added, the complete executable framework
+regression suite passed:
+
+- total tests: 21
+- passed: 21
+- failed: 0
+- `git diff --check`: PASS
+
+The PostgreSQL recovery-validation fixture reported:
+
+- tables: 37
+- views: 0
+- triggers: 0
+- semantic migration marker: `20260802162816`
+
+This is development validation only.
+
+Production validation requires the released framework to be installed through
+the normal deployment path and then exercised against a real PostgreSQL-backed
+application using fresh Restic and portable recovery artifacts. Vikunja is the
+planned production acceptance application for this release.

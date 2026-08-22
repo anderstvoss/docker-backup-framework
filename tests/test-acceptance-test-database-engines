@@ -1,0 +1,495 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENGINE="${ROOT}/scripts/acceptance-test"
+
+TMP="$(mktemp -d)"
+
+cleanup() {
+    sudo rm -rf "$TMP"
+}
+
+trap cleanup EXIT
+
+FILES_SNAPSHOT="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+DB_SNAPSHOT="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+GENERATION="20260822T083000Z-acceptance"
+
+run_case() {
+    local engine="$1"
+    local case_root="$TMP/$engine"
+    local runtime="$case_root/runtime"
+    local config="$case_root/config"
+    local bin="$case_root/bin"
+    local app_root="$case_root/app"
+    local repository="$case_root/repository"
+    local portable_root="$case_root/portable"
+    local log="$case_root/docker.log"
+    local output="$case_root/output.log"
+    local app_name="${engine}-app"
+
+    mkdir -p \
+        "$runtime" \
+        "$config/apps" \
+        "$bin" \
+        "$app_root/files" \
+        "$repository" \
+        "$portable_root"
+
+    printf '%s\n' live-file > "$app_root/files/state.txt"
+    printf '%s\n' test-password > "$case_root/restic.password"
+
+    case "$engine" in
+        mariadb)
+            db_type="mariadb"
+            db_name="appdb"
+            db_image="mariadb:11.8"
+            ;;
+        postgresql)
+            db_type="postgresql"
+            db_name="vikunja"
+            db_image="postgres:18"
+            ;;
+        *)
+            echo "unsupported test engine: $engine" >&2
+            return 1
+            ;;
+    esac
+
+    cat > "$config/apps/$app_name.conf" <<EOF_APP
+APP_NAME="$app_name"
+COMPOSE_DIR="$case_root/compose"
+DB_TYPE="$db_type"
+DB_BACKUP_MODE="logical"
+DB_CONTAINER="db"
+DB_VALIDATION_LABEL="migration"
+DB_VALIDATION_QUERY="SELECT marker FROM schema_marker LIMIT 1;"
+BACKUP_PATHS=(
+    "$app_root/files"
+)
+EXCLUDE_PATHS=(
+    "$app_root/db"
+)
+EOF_APP
+
+    mkdir -p "$case_root/compose"
+
+    cat > "$case_root/repo.conf" <<EOF_REPO
+REPO_NAME="${app_name}-operational"
+APP_NAME="$app_name"
+REPOSITORY="$repository"
+PASSWORD_FILE="$case_root/restic.password"
+STORAGE_TYPE="local"
+EOF_REPO
+
+    cat > "$case_root/portable.conf" <<EOF_PORTABLE
+PORTABLE_NAME="$app_name"
+APP_NAME="$app_name"
+BACKUP_ROOT="$portable_root"
+STORAGE_TYPE="local"
+EOF_PORTABLE
+
+    cat > "$case_root/version" <<'EOF_VERSION'
+FRAMEWORK_VERSION=1.2.0-test
+GIT_COMMIT=acceptance-test
+GIT_DESCRIBE=v1.2.0-test
+EOF_VERSION
+
+    # ------------------------------------------------------------
+    # Mock deployed framework executables.
+    # ------------------------------------------------------------
+
+    cat > "$runtime/backup-repository" <<'EOF_BACKUP'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+echo "Generation: $TEST_GENERATION"
+echo "DB snapshot: $TEST_DB_SNAPSHOT"
+echo "Files snapshot: $TEST_FILES_SNAPSHOT"
+EOF_BACKUP
+    chmod +x "$runtime/backup-repository"
+
+    cat > "$runtime/portable-backup" <<'EOF_PORTABLE_BACKUP'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+set_root="${TEST_PORTABLE_ROOT}/fresh-set"
+stage="${TEST_CASE_ROOT}/portable-stage"
+
+rm -rf "$set_root" "$stage"
+
+mkdir -p \
+    "$set_root" \
+    "$stage${TEST_BACKUP_PATH}"
+
+printf '%s\n' portable-file \
+    > "$stage${TEST_BACKUP_PATH}/state.txt"
+
+tar \
+    -C "$stage" \
+    -czf "$set_root/app-state.tar.gz" \
+    .
+
+cat > "${TEST_CASE_ROOT}/portable.sql" <<'SQL'
+CREATE TABLE example (id INTEGER);
+INSERT INTO example VALUES (1);
+SQL
+
+gzip -c "${TEST_CASE_ROOT}/portable.sql" \
+    > "$set_root/database.sql.gz"
+
+(
+    cd "$set_root"
+    sha256sum \
+        database.sql.gz \
+        app-state.tar.gz \
+        > SHA256SUMS
+)
+
+echo "Recovery set: $set_root"
+EOF_PORTABLE_BACKUP
+    chmod +x "$runtime/portable-backup"
+
+    cat > "$runtime/maintain-repository" <<'EOF_MAINTAIN'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+[[ "$1" == "check" ]]
+echo "PASS: mock repository check"
+EOF_MAINTAIN
+    chmod +x "$runtime/maintain-repository"
+
+    cat > "$runtime/resolve-snapshot" <<'EOF_RESOLVE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+cat >/dev/null
+
+case " $* " in
+    *" component:db "*)
+        echo "$TEST_DB_SNAPSHOT"
+        ;;
+    *" component:files "*)
+        echo "$TEST_FILES_SNAPSHOT"
+        ;;
+    *)
+        echo "unexpected snapshot query: $*" >&2
+        exit 1
+        ;;
+esac
+EOF_RESOLVE
+    chmod +x "$runtime/resolve-snapshot"
+
+    # ------------------------------------------------------------
+    # Mock Restic.
+    # ------------------------------------------------------------
+
+    cat > "$bin/restic" <<'EOF_RESTIC'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+args="$*"
+
+if [[ "$args" == *" snapshots --json"* ]]; then
+    cat <<JSON
+[
+  {
+    "id": "$TEST_FILES_SNAPSHOT",
+    "tags": [
+      "app:$TEST_APP_NAME",
+      "repo:operational",
+      "generation:$TEST_GENERATION",
+      "component:files",
+      "state:complete"
+    ]
+  },
+  {
+    "id": "$TEST_DB_SNAPSHOT",
+    "tags": [
+      "app:$TEST_APP_NAME",
+      "repo:operational",
+      "generation:$TEST_GENERATION",
+      "component:db",
+      "state:complete"
+    ]
+  }
+]
+JSON
+    exit 0
+fi
+
+if [[ "$args" == *" restore "* ]]; then
+    snapshot=""
+    target=""
+    previous=""
+
+    for arg in "$@"; do
+        if [[ "$previous" == "restore" ]]; then
+            snapshot="$arg"
+        elif [[ "$previous" == "--target" ]]; then
+            target="$arg"
+        fi
+
+        previous="$arg"
+    done
+
+    [[ -n "$snapshot" ]]
+    [[ -n "$target" ]]
+
+    case "$snapshot" in
+        "$TEST_FILES_SNAPSHOT")
+            mkdir -p "$target${TEST_BACKUP_PATH}"
+            printf '%s\n' restic-file \
+                > "$target${TEST_BACKUP_PATH}/state.txt"
+            ;;
+
+        "$TEST_DB_SNAPSHOT")
+            mkdir -p "$target"
+            cat > "$target/database.sql" <<'SQL'
+CREATE TABLE example (id INTEGER);
+INSERT INTO example VALUES (1);
+SQL
+            ;;
+
+        *)
+            echo "unexpected restore snapshot: $snapshot" >&2
+            exit 1
+            ;;
+    esac
+
+    exit 0
+fi
+
+echo "unexpected restic invocation: $*" >&2
+exit 1
+EOF_RESTIC
+    chmod +x "$bin/restic"
+
+    # ------------------------------------------------------------
+    # Mock Docker / Compose.
+    # ------------------------------------------------------------
+
+    cat > "$bin/docker" <<'EOF_DOCKER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf '%s\n' "$*" >> "$TEST_DOCKER_LOG"
+
+query_result() {
+    local all="$1"
+
+    if [[ "$all" == *"SELECT 1;"* ]]; then
+        echo "1"
+        return 0
+    fi
+
+    if [[ "$all" == *"information_schema.tables"* ]]; then
+        echo "37"
+        return 0
+    fi
+
+    if [[ "$all" == *"information_schema.views"* ]]; then
+        echo "0"
+        return 0
+    fi
+
+    if [[ "$all" == *"information_schema.triggers"* ]]; then
+        echo "0"
+        return 0
+    fi
+
+    if [[ "$all" == *"SELECT marker FROM schema_marker LIMIT 1;"* ]]; then
+        echo "migration-001"
+        return 0
+    fi
+
+    return 1
+}
+
+if [[ "$1" == "compose" ]]; then
+    shift
+
+    case "${1:-}" in
+        ps)
+            shift
+            [[ "${1:-}" == "-q" ]]
+            echo live-db-container
+            exit 0
+            ;;
+
+        exec)
+            all="$*"
+
+            if query_result "$all"; then
+                exit 0
+            fi
+
+            echo "unexpected compose exec: $*" >&2
+            exit 1
+            ;;
+
+        *)
+            echo "unexpected compose command: $*" >&2
+            exit 1
+            ;;
+    esac
+fi
+
+if [[ "$1" == "inspect" ]]; then
+    if [[ "$*" == *"{{.Config.Image}}"* ]]; then
+        echo "$TEST_DB_IMAGE"
+        exit 0
+    fi
+
+    if [[ "$*" == *"{{range .Config.Env}}"* ]]; then
+        case "$TEST_ENGINE" in
+            mariadb)
+                echo "MARIADB_DATABASE=$TEST_DB_NAME"
+                echo "MARIADB_USER=app"
+                echo "MARIADB_PASSWORD=secret"
+                ;;
+            postgresql)
+                echo "POSTGRES_DB=$TEST_DB_NAME"
+                echo "POSTGRES_USER=app"
+                echo "POSTGRES_PASSWORD=secret"
+                ;;
+        esac
+
+        exit 0
+    fi
+fi
+
+if [[ "$1" == "run" ]]; then
+    echo mock-disposable-container
+    exit 0
+fi
+
+if [[ "$1" == "rm" ]]; then
+    exit 0
+fi
+
+if [[ "$1" == "logs" ]]; then
+    exit 0
+fi
+
+if [[ "$1" == "exec" ]]; then
+    all="$*"
+
+    # Imports use stdin.
+    if [[ " $all " == *" -i "* ]]; then
+        payload="$(cat)"
+        printf 'import|%s|%s\n' "$TEST_ENGINE" "$payload" \
+            >> "$TEST_DOCKER_LOG"
+        exit 0
+    fi
+
+    if query_result "$all"; then
+        exit 0
+    fi
+
+    if [[ "$all" == *"DROP DATABASE IF EXISTS"* ]] ||
+       [[ "$all" == *" dropdb "* ]] ||
+       [[ "$all" == *" createdb "* ]]
+    then
+        exit 0
+    fi
+
+    echo "unexpected docker exec: $*" >&2
+    exit 1
+fi
+
+echo "unexpected docker invocation: $*" >&2
+exit 1
+EOF_DOCKER
+    chmod +x "$bin/docker"
+
+    echo
+    echo "=== acceptance test: $engine ==="
+
+    # shellcheck disable=SC2024
+    sudo env \
+        "PATH=$bin:$PATH" \
+        "DOCKER_BACKUP_RUNTIME_ROOT=$runtime" \
+        "DOCKER_BACKUP_VERSION_FILE=$case_root/version" \
+        "DOCKER_BACKUP_APP_CONFIG_ROOT=$config/apps" \
+        "TEST_ENGINE=$engine" \
+        "TEST_CASE_ROOT=$case_root" \
+        "TEST_APP_NAME=$app_name" \
+        "TEST_DB_NAME=$db_name" \
+        "TEST_DB_IMAGE=$db_image" \
+        "TEST_BACKUP_PATH=$app_root/files" \
+        "TEST_PORTABLE_ROOT=$portable_root" \
+        "TEST_GENERATION=$GENERATION" \
+        "TEST_FILES_SNAPSHOT=$FILES_SNAPSHOT" \
+        "TEST_DB_SNAPSHOT=$DB_SNAPSHOT" \
+        "TEST_DOCKER_LOG=$log" \
+        "$ENGINE" \
+        "$case_root/repo.conf" \
+        "$case_root/portable.conf" \
+        > "$output" 2>&1
+
+    cat "$output"
+
+    grep -F 'Framework acceptance PASSED' "$output" >/dev/null
+    grep -Fx 'tables=37' "$output" >/dev/null
+    grep -Fx 'views=0' "$output" >/dev/null
+    grep -Fx 'triggers=0' "$output" >/dev/null
+    grep -Fx 'migration=migration-001' "$output" >/dev/null
+
+    grep -F \
+        'PASS: Portable migration marker matches: migration-001' \
+        "$output" >/dev/null
+
+    grep -F \
+        'PASS: Restic migration marker matches: migration-001' \
+        "$output" >/dev/null
+
+    grep -F \
+        "PASS: Restic contains $app_root/files" \
+        "$output" >/dev/null
+
+    grep -F \
+        "PASS: Portable contains $app_root/files" \
+        "$output" >/dev/null
+
+    grep -F \
+        "PASS: Restic excludes $app_root/db" \
+        "$output" >/dev/null
+
+    grep -F \
+        "PASS: Portable excludes $app_root/db" \
+        "$output" >/dev/null
+
+    grep -F "run -d --name docker-backup-acceptance-${app_name}-" \
+        "$log" >/dev/null
+
+    grep -F "$db_image" "$log" >/dev/null
+
+    IMPORT_COUNT="$(
+        grep -c "^import|$engine|" "$log" || true
+    )"
+
+    [[ "$IMPORT_COUNT" -eq 2 ]]
+
+    case "$engine" in
+        mariadb)
+            grep -F -- '--tmpfs /var/lib/mysql' "$log" >/dev/null
+            grep -F 'MARIADB_DATABASE=' "$log" >/dev/null
+            ;;
+
+        postgresql)
+            grep -F -- '--tmpfs /var/lib/postgresql' "$log" >/dev/null
+            grep -F 'POSTGRES_USER=validation' "$log" >/dev/null
+            grep -F 'POSTGRES_DB=' "$log" >/dev/null
+            grep -F -- '--set=ON_ERROR_STOP=1' "$log" >/dev/null
+            ;;
+    esac
+
+    echo "PASS: $engine acceptance harness regression"
+}
+
+run_case mariadb
+run_case postgresql
+
+echo
+echo "PASS: acceptance-test database-engine regression suite"

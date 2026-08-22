@@ -290,8 +290,11 @@ The installed acceptance harness can also be run independently:
       /etc/docker-backup/repos/<repository>.conf \
       /etc/docker-backup/portable/<target>.conf
 
-The current automated acceptance harness supports `mariadb:logical`
-applications.
+The automated backup, recovery-validation, production-restore, and
+acceptance paths support:
+
+- `mariadb:logical`
+- `postgresql:logical`
 
 Post-change acceptance should prove:
 
@@ -329,7 +332,11 @@ validated non-destructively where practical.
 
 The framework was validated against a reference application using the configuration patterns represented by the included examples.
 
-The reference deployment validated:
+The framework has regression coverage for both MariaDB and PostgreSQL
+logical backup/recovery paths. Production releases additionally require
+application-specific end-to-end acceptance after deployment.
+
+The original reference deployment validated:
 
 - MariaDB logical backup
 - multi-path application-state capture

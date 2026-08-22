@@ -40,9 +40,19 @@ Example structure:
 
     COMPOSE_DIR="/opt/docker/<app>"
 
+    # MariaDB example:
     DB_TYPE="mariadb"
     DB_BACKUP_MODE="logical"
-    DB_CONTAINER="<database-container>"
+    DB_CONTAINER="<database-compose-service>"
+
+For PostgreSQL use:
+
+    DB_TYPE="postgresql"
+    DB_BACKUP_MODE="logical"
+    DB_CONTAINER="<database-compose-service>"
+
+See `config/apps/example-postgresql-app.conf` for a complete PostgreSQL
+application example.
 
     BACKUP_PATHS=(
       "/opt/docker/<app>"

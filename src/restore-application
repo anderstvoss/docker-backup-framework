@@ -24,7 +24,7 @@ locks, stages and validates recovery data, preserves current filesystem state
 to fallback storage, restores configured application paths, and restores
 supported logical databases.
 
-For mariadb:logical applications, database failure handling uses the fresh
+For logical database applications, database failure handling uses the fresh
 pre-restore database checkpoint for rollback. The application is not restarted
 if database rollback fails.
 HELP
@@ -224,6 +224,11 @@ case "${DB_TYPE}:${DB_BACKUP_MODE}" in
     mariadb:logical)
         [[ "$DB_SNAPSHOT" =~ ^[0-9a-f]{64}$ ]] ||
             die "--db-snapshot is required for mariadb:logical"
+        : "${DB_CONTAINER:?Missing DB_CONTAINER}"
+        ;;
+    postgresql:logical)
+        [[ "$DB_SNAPSHOT" =~ ^[0-9a-f]{64}$ ]] ||
+            die "--db-snapshot is required for postgresql:logical"
         : "${DB_CONTAINER:?Missing DB_CONTAINER}"
         ;;
     *)
@@ -528,7 +533,7 @@ echo "5. Restore selected filesystem snapshot to staging"
 echo "6. Validate staged filesystem"
 echo "7. Preserve existing production paths to fallback storage"
 echo "8. Place restored application filesystem state"
-if [[ "$DB_TYPE" == "mariadb" ]]; then
+if [[ "$DB_TYPE" != "none" ]]; then
     echo "9. Start database service and import selected logical DB snapshot"
     echo "10. Start complete application stack"
     echo "11. Validate application health"
@@ -1396,7 +1401,7 @@ update_restore_record \
 SELECTED_DB_SQL=""
 CHECKPOINT_DB_SQL=""
 
-if [[ "$DB_TYPE" == "mariadb" ]]; then
+if [[ "$DB_TYPE" != "none" ]]; then
     echo
     EXECUTION_STAGE="database-staging"
     echo "===== STAGE DATABASE SNAPSHOTS ====="
@@ -1547,6 +1552,135 @@ mariadb_import_sql() {
         < "$sql_file"
 }
 
+postgresql_wait_ready() {
+    local ready=0
+
+    for _ in $(seq 1 60); do
+        if docker compose exec -T "$DB_CONTAINER" \
+            sh -c '
+                user="${POSTGRES_USER:-}"
+                database="${POSTGRES_DB:-}"
+
+                [ -n "$user" ] || exit 2
+                [ -n "$database" ] || exit 2
+
+                exec psql \
+                    --username="$user" \
+                    --dbname="$database" \
+                    --no-align \
+                    --tuples-only \
+                    --command="SELECT 1;"
+            ' \
+            2>/dev/null |
+            grep -Fxq 1
+        then
+            ready=1
+            break
+        fi
+
+        sleep 1
+    done
+
+    [[ "$ready" -eq 1 ]]
+}
+
+postgresql_reset_database() {
+    docker compose exec -T "$DB_CONTAINER" \
+        sh -c '
+            user="${POSTGRES_USER:-}"
+            database="${POSTGRES_DB:-}"
+
+            [ -n "$user" ] || {
+                echo "PostgreSQL user is not available" >&2
+                exit 2
+            }
+
+            [ -n "$database" ] || {
+                echo "PostgreSQL database name is not available" >&2
+                exit 2
+            }
+
+            dropdb \
+                --username="$user" \
+                --if-exists \
+                --force \
+                "$database" &&
+
+            exec createdb \
+                --username="$user" \
+                "$database"
+        '
+}
+
+postgresql_import_sql() {
+    local sql_file="$1"
+
+    [[ -s "$sql_file" ]] ||
+        return 1
+
+    docker compose exec -T "$DB_CONTAINER" \
+        sh -c '
+            user="${POSTGRES_USER:-}"
+            database="${POSTGRES_DB:-}"
+
+            [ -n "$user" ] || exit 2
+            [ -n "$database" ] || exit 2
+
+            exec psql \
+                --username="$user" \
+                --dbname="$database" \
+                --set=ON_ERROR_STOP=1
+        ' \
+        < "$sql_file"
+}
+
+database_wait_ready() {
+    case "$DB_TYPE" in
+        mariadb)
+            mariadb_wait_ready
+            ;;
+        postgresql)
+            postgresql_wait_ready
+            ;;
+        *)
+            echo "ERROR: unsupported database readiness engine: $DB_TYPE" >&2
+            return 1
+            ;;
+    esac
+}
+
+database_reset() {
+    case "$DB_TYPE" in
+        mariadb)
+            mariadb_reset_database
+            ;;
+        postgresql)
+            postgresql_reset_database
+            ;;
+        *)
+            echo "ERROR: unsupported database reset engine: $DB_TYPE" >&2
+            return 1
+            ;;
+    esac
+}
+
+database_import_sql() {
+    local sql_file="$1"
+
+    case "$DB_TYPE" in
+        mariadb)
+            mariadb_import_sql "$sql_file"
+            ;;
+        postgresql)
+            postgresql_import_sql "$sql_file"
+            ;;
+        *)
+            echo "ERROR: unsupported database import engine: $DB_TYPE" >&2
+            return 1
+            ;;
+    esac
+}
+
 rollback_database_state() {
     echo
     echo "===== ROLLBACK PRODUCTION DATABASE ====="
@@ -1558,22 +1692,22 @@ rollback_database_state() {
         return 1
     fi
 
-    if ! mariadb_wait_ready; then
+    if ! database_wait_ready; then
         echo "ERROR: database did not become ready for rollback" >&2
         return 1
     fi
 
-    if ! mariadb_reset_database; then
+    if ! database_reset; then
         echo "ERROR: unable to reset database for rollback" >&2
         return 1
     fi
 
-    if ! mariadb_import_sql "$CHECKPOINT_DB_SQL"; then
+    if ! database_import_sql "$CHECKPOINT_DB_SQL"; then
         echo "ERROR: pre-restore database checkpoint import failed" >&2
         return 1
     fi
 
-    if ! mariadb_wait_ready; then
+    if ! database_wait_ready; then
         echo "ERROR: database failed readiness check after rollback" >&2
         return 1
     fi
@@ -1717,16 +1851,17 @@ echo
 echo "===== DATABASE BOUNDARY ====="
 echo "Production filesystem has been replaced."
 
-if [[ "$DB_TYPE" == "mariadb" ]]; then
+if [[ "$DB_TYPE" != "none" ]]; then
     echo
     EXECUTION_STAGE="database-restore"
-    echo "===== RESTORE MARIADB DATABASE ====="
+    echo "===== RESTORE LOGICAL DATABASE ====="
+    echo "Database engine: $DB_TYPE"
 
     cd "$COMPOSE_DIR"
 
     docker compose up -d "$DB_CONTAINER"
 
-    mariadb_wait_ready ||
+    database_wait_ready ||
         die "database service did not become ready"
 
     # From the first destructive database operation onward, EXIT cleanup
@@ -1734,13 +1869,13 @@ if [[ "$DB_TYPE" == "mariadb" ]]; then
     # application is allowed to restart.
     DATABASE_NEEDS_ROLLBACK=1
 
-    mariadb_reset_database ||
+    database_reset ||
         die "unable to reset production database"
 
-    mariadb_import_sql "$SELECTED_DB_SQL" ||
+    database_import_sql "$SELECTED_DB_SQL" ||
         die "selected database import failed"
 
-    mariadb_wait_ready ||
+    database_wait_ready ||
         die "database failed readiness check after selected import"
 
     DATABASE_NEEDS_ROLLBACK=0

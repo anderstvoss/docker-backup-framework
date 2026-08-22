@@ -1,0 +1,664 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ENGINE="$(pwd)/src/restore-application"
+TMP="$(mktemp -d)"
+CONFIG="$TMP/config"
+RUNTIME="$TMP/runtime"
+BIN="$TMP/bin"
+LOCK_ROOT="$TMP/locks"
+RECORD_ROOT="$TMP/records"
+FALLBACK_ROOT="$TMP/fallback"
+LOG="$TMP/commands.log"
+
+cleanup() {
+    sudo rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+mkdir -p \
+    "$CONFIG" \
+    "$RUNTIME" \
+    "$BIN" \
+    "$LOCK_ROOT" \
+    "$RECORD_ROOT" \
+    "$TMP/compose" \
+    "$TMP/repository" \
+    "$TMP/portable/original-set" \
+    "$TMP/app/config"
+
+FILES="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+DB="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+CP_FILES="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+CP_DB="dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+GEN="20260822T081000Z-postgresql"
+
+PRODUCTION_FILE="$TMP/app/config/state.txt"
+printf '%s\n' original-filesystem > "$PRODUCTION_FILE"
+
+cat > "$CONFIG/app.conf" <<EOF_APP
+APP_NAME="app-one"
+COMPOSE_DIR="$TMP/compose"
+DB_TYPE="postgresql"
+DB_BACKUP_MODE="logical"
+DB_CONTAINER="db"
+BACKUP_PATHS=(
+    "$TMP/app/config"
+)
+EXCLUDE_PATHS=(
+    "$TMP/app/excluded"
+)
+EOF_APP
+
+cat > "$CONFIG/repo.conf" <<EOF_REPO
+REPO_NAME="app-one-operational"
+APP_NAME="app-one"
+REPOSITORY="$TMP/repository"
+PASSWORD_FILE="$TMP/restic.password"
+STORAGE_TYPE="local"
+EOF_REPO
+
+cat > "$CONFIG/portable.conf" <<EOF_PORTABLE
+PORTABLE_NAME="app-one"
+APP_NAME="app-one"
+BACKUP_ROOT="$TMP/portable"
+STORAGE_TYPE="local"
+EOF_PORTABLE
+
+printf '%s\n' password > "$TMP/restic.password"
+
+# Recovery point is assumed already validated by the dedicated recovery
+# validator regression; this stub verifies restore-application calls it.
+cat > "$RUNTIME/validate-application-recovery" <<'EOF_VALIDATOR'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'validator|%s\n' "$*" >> "$TEST_COMMAND_LOG"
+
+result_file=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --result-file)
+            shift
+            result_file="$1"
+            ;;
+    esac
+    shift
+done
+
+{
+    echo "RESULT=PASS"
+    echo "APPLICATION=app-one"
+    echo "REPOSITORY=app-one-operational"
+    echo "PORTABLE_TARGET=app-one"
+} > "$result_file"
+
+chmod 0600 "$result_file"
+EOF_VALIDATOR
+chmod +x "$RUNTIME/validate-application-recovery"
+
+cat > "$RUNTIME/backup-repository" <<EOF_REPOSITORY
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'backup-repository|%s\n' "\$*" >> "\$TEST_COMMAND_LOG"
+
+result_file=""
+
+while [[ \$# -gt 0 ]]; do
+    case "\$1" in
+        --result-file)
+            shift
+            result_file="\$1"
+            ;;
+    esac
+    shift
+done
+
+{
+    echo "RESULT=PASS"
+    echo "APPLICATION=app-one"
+    echo "REPOSITORY=app-one-operational"
+    echo "RESTIC_GENERATION=checkpoint-generation"
+    echo "FILES_SNAPSHOT=$CP_FILES"
+
+    if [[ "\${INVALID_CHECKPOINT_DB:-0}" == "1" ]]; then
+        echo "DB_SNAPSHOT=invalid"
+    else
+        echo "DB_SNAPSHOT=$CP_DB"
+    fi
+} > "\$result_file"
+
+chmod 0600 "\$result_file"
+EOF_REPOSITORY
+chmod +x "$RUNTIME/backup-repository"
+
+cat > "$RUNTIME/portable-backup" <<EOF_PORTABLE
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'portable-backup|%s\n' "\$*" >> "\$TEST_COMMAND_LOG"
+
+result_file=""
+
+while [[ \$# -gt 0 ]]; do
+    case "\$1" in
+        --result-file)
+            shift
+            result_file="\$1"
+            ;;
+    esac
+    shift
+done
+
+{
+    echo "RESULT=PASS"
+    echo "APPLICATION=app-one"
+    echo "PORTABLE_TARGET=app-one"
+    echo "PORTABLE_SET=$TMP/portable/pre-restore-checkpoint"
+} > "\$result_file"
+
+chmod 0600 "\$result_file"
+EOF_PORTABLE
+chmod +x "$RUNTIME/portable-backup"
+
+cat > "$BIN/restic" <<'EOF_RESTIC'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'restic|%s\n' "$*" >> "$TEST_COMMAND_LOG"
+
+[[ "$1" == "restore" ]] || exit 1
+
+snapshot="$2"
+shift 2
+target=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --target)
+            shift
+            target="$1"
+            ;;
+    esac
+    shift
+done
+
+[[ -n "$target" ]] || exit 1
+
+case "$snapshot" in
+    "$TEST_FILES")
+        relative="${TEST_BACKUP_PATH#/}"
+        mkdir -p "$target/$relative"
+        printf '%s\n' restored-filesystem \
+            > "$target/$relative/state.txt"
+        ;;
+
+    "$TEST_DB")
+        mkdir -p "$target"
+
+        if [[ "${FAIL_SELECTED_DB_STAGE:-0}" == "1" ]]; then
+            echo "injected selected DB staging failure" >&2
+            exit 51
+        fi
+
+        printf '%s\n' selected-database > "$target/database.sql"
+        ;;
+
+    "$TEST_CP_DB")
+        mkdir -p "$target"
+        printf '%s\n' checkpoint-database > "$target/database.sql"
+        ;;
+
+    *)
+        echo "unexpected Restic snapshot: $snapshot" >&2
+        exit 52
+        ;;
+esac
+EOF_RESTIC
+chmod +x "$BIN/restic"
+
+cat > "$BIN/systemctl" <<'EOF_SYSTEMCTL'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'systemctl|%s\n' "$*" >> "$TEST_COMMAND_LOG"
+
+case "$1" in
+    is-active)
+        echo active
+        ;;
+    is-enabled)
+        echo enabled
+        ;;
+    stop|start)
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+EOF_SYSTEMCTL
+chmod +x "$BIN/systemctl"
+
+cat > "$BIN/docker" <<'EOF_DOCKER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf 'docker|%s\n' "$*" >> "$TEST_COMMAND_LOG"
+
+[[ "$1" == "compose" ]] || exit 1
+
+shift
+
+case "${1:-}" in
+    config)
+        exit 0
+        ;;
+
+    down)
+        printf '%s\n' stopped > "$TEST_APP_STATE"
+        exit 0
+        ;;
+
+    up)
+        shift
+
+        [[ "${1:-}" == "-d" ]] || exit 1
+        shift
+
+        if [[ "${1:-}" == "db" ]]; then
+            printf '%s\n' db-running > "$TEST_APP_STATE"
+        else
+            printf '%s\n' running > "$TEST_APP_STATE"
+        fi
+
+        exit 0
+        ;;
+
+    ps)
+        shift
+
+        # compose ps -q db
+        if [[ "${1:-}" == "-q" ]]; then
+            echo db-container-id
+            exit 0
+        fi
+
+        if [[ -f "$TEST_APP_STATE" ]]; then
+            state="$(cat "$TEST_APP_STATE")"
+
+            if [[ "$state" == "running" ]]; then
+                echo web
+                echo db
+            elif [[ "$state" == "db-running" ]]; then
+                echo db
+            fi
+        fi
+
+        exit 0
+        ;;
+
+    exec)
+        shift
+
+        [[ "${1:-}" == "-T" ]] || exit 1
+        shift
+
+        [[ "${1:-}" == "db" ]] || exit 1
+        shift
+
+        # PostgreSQL readiness, reset, and import all arrive through `sh -c`.
+        if printf '%s\n' "$*" | grep -Fq 'SELECT 1;'; then
+            echo 1
+            exit 0
+        fi
+
+        if printf '%s\n' "$*" | grep -Fq 'dropdb'; then
+            if [[ "${FAIL_SELECTED_RESET:-0}" == "1" ]] &&
+               [[ ! -f "$TEST_DB_MUTATION_MARKER" ]]
+            then
+                echo "injected selected DB reset failure" >&2
+                exit 61
+            fi
+
+            printf '%s\n' reset >> "$TEST_DB_LOG"
+            exit 0
+        fi
+
+        if printf '%s\n' "$*" | grep -Fq 'exec psql'; then
+            input="$(cat)"
+
+            printf 'import|%s\n' "$input" >> "$TEST_DB_LOG"
+
+            if [[ "$input" == *selected-database* ]]; then
+                touch "$TEST_DB_MUTATION_MARKER"
+
+                if [[ "${FAIL_SELECTED_IMPORT:-0}" == "1" ]]; then
+                    echo "injected selected DB import failure" >&2
+                    exit 62
+                fi
+
+                printf '%s\n' selected > "$TEST_DB_STATE"
+                exit 0
+            fi
+
+            if [[ "$input" == *checkpoint-database* ]]; then
+                if [[ "${FAIL_ROLLBACK_IMPORT:-0}" == "1" ]]; then
+                    echo "injected rollback DB import failure" >&2
+                    exit 63
+                fi
+
+                printf '%s\n' original > "$TEST_DB_STATE"
+                exit 0
+            fi
+
+            exit 1
+        fi
+
+        exit 1
+        ;;
+
+    *)
+        exit 1
+        ;;
+esac
+EOF_DOCKER
+chmod +x "$BIN/docker"
+
+cat > "$BIN/mv" <<'EOF_MV'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'mv|%s\n' "$*" >> "$TEST_COMMAND_LOG"
+exec /usr/bin/mv "$@"
+EOF_MV
+chmod +x "$BIN/mv"
+
+run_execute() {
+    sudo env \
+        "PATH=$BIN:$PATH" \
+        "DOCKER_BACKUP_ENGINE_ROOT=$RUNTIME" \
+        "DOCKER_BACKUP_LOCK_ROOT=$LOCK_ROOT" \
+        "DOCKER_BACKUP_RESTORE_RECORD_ROOT=$RECORD_ROOT" \
+        "DOCKER_BACKUP_RESTORE_FALLBACK_ROOT=$FALLBACK_ROOT" \
+        "TEST_COMMAND_LOG=$LOG" \
+        "TEST_APP_STATE=$TMP/app-state" \
+        "TEST_DB_STATE=$TMP/db-state" \
+        "TEST_DB_LOG=$TMP/db.log" \
+        "TEST_DB_MUTATION_MARKER=$TMP/db-mutated" \
+        "TEST_FILES=$FILES" \
+        "TEST_DB=$DB" \
+        "TEST_CP_DB=$CP_DB" \
+        "TEST_BACKUP_PATH=$TMP/app/config" \
+        "INVALID_CHECKPOINT_DB=${INVALID_CHECKPOINT_DB:-0}" \
+        "FAIL_SELECTED_DB_STAGE=${FAIL_SELECTED_DB_STAGE:-0}" \
+        "FAIL_SELECTED_RESET=${FAIL_SELECTED_RESET:-0}" \
+        "FAIL_SELECTED_IMPORT=${FAIL_SELECTED_IMPORT:-0}" \
+        "FAIL_ROLLBACK_IMPORT=${FAIL_ROLLBACK_IMPORT:-0}" \
+        "$ENGINE" \
+        "$CONFIG/app.conf" \
+        "$CONFIG/repo.conf" \
+        "$CONFIG/portable.conf" \
+        --generation "$GEN" \
+        --files-snapshot "$FILES" \
+        --db-snapshot "$DB" \
+        --portable-set "$TMP/portable/original-set" \
+        --execute \
+        --confirm app-one
+}
+
+reset_fixture() {
+    sudo rm -rf \
+        "$TMP/app/config" \
+        "$FALLBACK_ROOT" \
+        "$RECORD_ROOT"
+
+    mkdir -p \
+        "$TMP/app/config" \
+        "$RECORD_ROOT"
+
+    printf '%s\n' original-filesystem > "$PRODUCTION_FILE"
+    printf '%s\n' original > "$TMP/db-state"
+    printf '%s\n' running > "$TMP/app-state"
+
+    rm -f \
+        "$TMP/db.log" \
+        "$TMP/db-mutated"
+
+    : > "$LOG"
+}
+
+echo "=== invalid checkpoint DB rejected before shutdown ==="
+reset_fixture
+
+if INVALID_CHECKPOINT_DB=1 \
+   run_execute > "$TMP/invalid-cp.log" 2>&1
+then
+    echo "ERROR: invalid checkpoint DB was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'repository checkpoint returned invalid database snapshot' \
+    "$TMP/invalid-cp.log"
+
+if grep -F 'docker|compose down' "$LOG"; then
+    echo "ERROR: application shutdown occurred after invalid DB checkpoint" >&2
+    exit 1
+fi
+
+echo "PASS: invalid rollback DB coordinate rejected before mutation"
+
+echo
+echo "=== DB staging failure occurs before filesystem preservation ==="
+reset_fixture
+
+if FAIL_SELECTED_DB_STAGE=1 \
+   run_execute > "$TMP/db-stage-fail.log" 2>&1
+then
+    echo "ERROR: selected DB staging failure was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'injected selected DB staging failure' \
+    "$TMP/db-stage-fail.log"
+
+sudo grep -Fx original-filesystem "$PRODUCTION_FILE" >/dev/null
+grep -Fx original "$TMP/db-state" >/dev/null
+
+if grep -F 'mv|-- '"$TMP/app/config"' ' "$LOG"; then
+    echo "ERROR: filesystem preservation began after DB staging failure" >&2
+    exit 1
+fi
+
+echo "PASS: both DB snapshots must stage before filesystem mutation"
+
+echo
+echo "=== successful PostgreSQL restore ==="
+reset_fixture
+
+run_execute > "$TMP/db-success.log"
+
+grep -F \
+    'PASS: production database restored from immutable snapshot' \
+    "$TMP/db-success.log"
+
+sudo grep -Fx restored-filesystem "$PRODUCTION_FILE" >/dev/null
+grep -Fx selected "$TMP/db-state" >/dev/null
+
+grep -F "restic|restore $DB " "$LOG" >/dev/null
+grep -F "restic|restore $CP_DB " "$LOG" >/dev/null
+grep -F 'docker|compose up -d db' "$LOG" >/dev/null
+grep -F 'docker|compose up -d' "$LOG" >/dev/null
+
+RECORD="$(
+    find "$RECORD_ROOT/app-one" \
+        -type f \
+        -name '*.json' |
+    sort |
+    tail -1
+)"
+
+sudo cat "$RECORD" |
+python3 -c '
+import json
+import sys
+
+d = json.load(sys.stdin)
+
+assert d["result"] == "RESTORE_COMPLETED"
+assert d["pre_restore_checkpoint"]["db_snapshot"] == "d" * 64
+assert d["selected_recovery"]["db_snapshot"] == "b" * 64
+'
+
+echo "PASS: selected DB imported and rollback DB coordinate retained"
+
+echo
+echo "=== selected DB import failure rolls back DB and filesystem ==="
+reset_fixture
+
+if FAIL_SELECTED_IMPORT=1 \
+   run_execute > "$TMP/db-import-fail.log" 2>&1
+then
+    echo "ERROR: selected DB import failure was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'injected selected DB import failure' \
+    "$TMP/db-import-fail.log"
+
+grep -F \
+    'PASS: production database rolled back to pre-restore checkpoint' \
+    "$TMP/db-import-fail.log"
+
+sudo grep -Fx original-filesystem "$PRODUCTION_FILE" >/dev/null
+grep -Fx original "$TMP/db-state" >/dev/null
+grep -Fx running "$TMP/app-state" >/dev/null
+
+DB_ROLLBACK_LINE="$(
+    grep -nF \
+        'PASS: production database rolled back to pre-restore checkpoint' \
+        "$TMP/db-import-fail.log" |
+    tail -1 |
+    cut -d: -f1
+)"
+
+FS_ROLLBACK_LINE="$(
+    grep -nF \
+        "PASS: rolled back $TMP/app/config" \
+        "$TMP/db-import-fail.log" |
+    tail -1 |
+    cut -d: -f1
+)"
+
+APP_RESTART_LINE="$(
+    grep -nF \
+        'PASS: application stack restarted' \
+        "$TMP/db-import-fail.log" |
+    tail -1 |
+    cut -d: -f1
+)"
+
+[[ "$DB_ROLLBACK_LINE" -lt "$FS_ROLLBACK_LINE" ]]
+[[ "$FS_ROLLBACK_LINE" -lt "$APP_RESTART_LINE" ]]
+
+echo "PASS: DB rollback -> filesystem rollback -> application restart ordering"
+
+IMPORT_FAIL_RECORD="$(
+    find "$RECORD_ROOT/app-one" \
+        -type f \
+        -name '*.json' |
+    sort |
+    tail -1
+)"
+
+sudo cat "$IMPORT_FAIL_RECORD" |
+python3 -c '
+import json
+import sys
+
+d = json.load(sys.stdin)
+
+assert d["result"] == "FAIL"
+assert d["failure"]["stage"] == "database-restore"
+assert d["database_rollback"] == "PASS"
+assert d["filesystem_rollback"] == "PASS"
+assert d["application_state_restored"] == "PASS"
+assert d["timer_state_restored"] is True
+
+r = d["failure"]["recovery"]
+assert r["database_rollback"] == "PASS"
+assert r["filesystem_rollback"] == "PASS"
+assert r["application"] == "PASS"
+assert r["timers"] == "PASS"
+'
+
+echo "PASS: successful recovery from DB import failure recorded durably"
+
+echo
+echo "=== DB rollback failure suppresses application restart ==="
+reset_fixture
+
+if FAIL_SELECTED_IMPORT=1 \
+   FAIL_ROLLBACK_IMPORT=1 \
+   run_execute > "$TMP/db-rollback-fail.log" 2>&1
+then
+    echo "ERROR: failed DB rollback was accepted" >&2
+    exit 1
+fi
+
+grep -F \
+    'pre-restore database checkpoint import failed' \
+    "$TMP/db-rollback-fail.log"
+
+grep -F \
+    'application restart suppressed because rollback did not complete safely' \
+    "$TMP/db-rollback-fail.log"
+
+if grep -F \
+    'PASS: application stack restarted' \
+    "$TMP/db-rollback-fail.log"
+then
+    echo "ERROR: application restarted after DB rollback failure" >&2
+    exit 1
+fi
+
+grep -Fx stopped "$TMP/app-state" >/dev/null
+
+echo "PASS: failed DB rollback leaves application stopped"
+
+ROLLBACK_FAIL_RECORD="$(
+    find "$RECORD_ROOT/app-one" \
+        -type f \
+        -name '*.json' |
+    sort |
+    tail -1
+)"
+
+sudo cat "$ROLLBACK_FAIL_RECORD" |
+python3 -c '
+import json
+import sys
+
+d = json.load(sys.stdin)
+
+assert d["result"] == "RECOVERY_FAILED"
+assert d["failure"]["stage"] == "database-restore"
+assert d["database_rollback"] == "FAIL"
+assert d["filesystem_rollback"] == "PASS"
+assert d["application_state_restored"] == "SUPPRESSED"
+assert d["timer_state_restored"] is True
+
+r = d["failure"]["recovery"]
+assert r["database_rollback"] == "FAIL"
+assert r["filesystem_rollback"] == "PASS"
+assert r["application"] == "SUPPRESSED"
+assert r["timers"] == "PASS"
+'
+
+echo "PASS: failed DB rollback recorded as terminal recovery failure"
+
+echo
+echo "PASS: restore-application PostgreSQL execute regression suite"

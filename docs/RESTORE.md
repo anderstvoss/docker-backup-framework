@@ -272,6 +272,59 @@ Remove the disposable database after validation:
 
     docker rm -f docker-backup-restore-db
 
+### PostgreSQL logical restore validation
+
+For PostgreSQL applications, use a disposable container based on the same
+major PostgreSQL image family as the application database.
+
+Example:
+
+    docker run -d \
+      --name docker-backup-restore-postgresql \
+      --tmpfs /var/lib/postgresql \
+      -e POSTGRES_USER=restore_test \
+      -e POSTGRES_PASSWORD=restore-test \
+      -e POSTGRES_DB=restore_test \
+      postgres:18
+
+Wait for authenticated SQL readiness:
+
+    until docker exec docker-backup-restore-postgresql \
+      psql \
+      --username=restore_test \
+      --dbname=restore_test \
+      --no-align \
+      --tuples-only \
+      --command='SELECT 1;' \
+      2>/dev/null | grep -Fxq 1
+    do
+      sleep 1
+    done
+
+Import the Restic database dump:
+
+    sudo cat /tmp/docker-restore-db/database.sql \
+      | docker exec -i docker-backup-restore-postgresql \
+          psql \
+          --username=restore_test \
+          --dbname=restore_test \
+          --set=ON_ERROR_STOP=1
+
+Validation should compare at least:
+
+- base-table count
+- view count
+- trigger count
+- the configured semantic validation marker, when present
+
+PostgreSQL logical dumps are created without restored object ownership or ACLs,
+allowing isolated validation without recreating the production role ownership
+and grants.
+
+Remove the disposable database when validation is complete:
+
+    docker rm -f docker-backup-restore-postgresql
+
 ## 8. Portable recovery-set overview
 
 A completed database-backed portable recovery set contains:

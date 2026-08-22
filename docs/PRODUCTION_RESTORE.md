@@ -153,14 +153,28 @@ preserved.
 
 For `DB_TYPE=none`, no database mutation occurs.
 
-For `mariadb:logical`:
+For `mariadb:logical` and `postgresql:logical`:
 
-- raw MariaDB data directories must never be restored
+- raw database data directories must never be restored
 - only the database service should be started when practical
-- authenticated readiness must be verified
-- the target database must be recreated as required
+- authenticated SQL readiness must be verified
+- the target database must be recreated
 - the immutable validated SQL dump must be imported
-- import success must be verified before application startup
+- import failure must be treated as a restore failure
+- import success must be verified before complete application startup
+
+MariaDB restore uses the configured MariaDB application database and root
+credentials available inside the database container.
+
+PostgreSQL restore uses the configured `POSTGRES_USER` and `POSTGRES_DB`
+available inside the database container. Logical imports use
+`psql --set=ON_ERROR_STOP=1` so an SQL error fails the restore.
+
+For either engine, a fresh pre-restore logical database checkpoint must be
+staged before production filesystem mutation. If selected database import
+fails after database mutation begins, the framework attempts to restore this
+checkpoint before application restart. If database rollback fails, complete
+application restart is suppressed.
 
 The production restore must use the same database component represented by the
 selected recovery point.
@@ -241,21 +255,21 @@ A partially restored group must not be reported as a successful group recovery.
 
 ## 15. Initial implementation boundary
 
-The first production implementation will support:
+The production implementation supports:
 
 - `DB_TYPE=none`
 - `mariadb:logical`
+- `postgresql:logical`
 - Restic filesystem recovery
 - immutable Restic coordinates
 - validated portable set as an independent recovery reference
 - explicit fallback preservation
 - guarded execution
+- tested database and filesystem rollback after selected logical-import failure
 
-The first implementation will not provide:
+The implementation does not provide:
 
-- automatic rollback
 - emergency checkpoint bypass
-- PostgreSQL recovery
 - dependency graph recovery
 - parallel group recovery
 - automatic deletion of fallback data

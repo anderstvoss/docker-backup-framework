@@ -46,11 +46,30 @@ For database-backed applications, the live database data directory must not be
 included when `DB_BACKUP_MODE="logical"` is used. Database state is captured
 through the database dump mechanism instead.
 
+### Logical database modes
+
+Supported logical database configurations are:
+
+- `DB_TYPE="mariadb"` with `DB_BACKUP_MODE="logical"`
+- `DB_TYPE="postgresql"` with `DB_BACKUP_MODE="logical"`
+
+For both engines, `DB_CONTAINER` is the Docker Compose **service name** of the
+database container, not a generated container name.
+
+Logical database dumps are stored as plain SQL in the Restic database component
+and as gzip-compressed SQL in portable recovery sets.
+
+PostgreSQL dumps are created with ownership and ACL restoration disabled so an
+isolated validation database does not require the source application's role
+ownership or grants.
+
 ### Optional semantic database validation
 
-MariaDB logical recovery validation always compares generic restored structure:
+MariaDB and PostgreSQL logical recovery validation compare generic restored
+structure:
 
-- table count
+- base-table count
+- view count
 - trigger count
 
 Applications may additionally configure one semantic schema or migration

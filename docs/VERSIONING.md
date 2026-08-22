@@ -131,7 +131,8 @@ source-independence stage fails or the drill is interrupted.
 
 ## Post-change acceptance
 
-For a MariaDB logical-backup deployment, the installed acceptance harness is:
+For a supported logical-database deployment, the installed acceptance
+harness is:
 
     sudo /usr/local/lib/docker-backup/acceptance-test \
       /etc/docker-backup/repos/<repository>.conf \
@@ -152,10 +153,10 @@ It verifies:
 - filesystem restoration from both backup mechanisms
 - required path inclusion
 - configured exclusion absence
-- authenticated disposable MariaDB readiness
+- authenticated disposable database readiness using the configured engine
 - portable logical database restoration
 - Restic logical database restoration
-- restored table and trigger counts against the live database
+- restored base-table, view, and trigger counts against the live database
 - configured application-specific schema/migration identity when present
 - disposable local test-resource cleanup
 

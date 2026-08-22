@@ -255,6 +255,37 @@ if [ "$DB_TYPE" != "none" ]; then
             echo "PASS: database dump created and validated"
             ;;
 
+        postgresql:logical)
+            : "${DB_CONTAINER:?Missing DB_CONTAINER}"
+
+            if ! docker compose ps \
+                --status running \
+                --services \
+                | grep -Fxq "$DB_CONTAINER"; then
+                echo "ERROR: database service is not running: $DB_CONTAINER" >&2
+                exit 1
+            fi
+
+            docker compose exec -T "$DB_CONTAINER" \
+                sh -c 'exec pg_dump \
+                    --username="$POSTGRES_USER" \
+                    --dbname="$POSTGRES_DB" \
+                    --format=plain \
+                    --no-password' \
+                | gzip -1 > "$TEMP_DIR/database.sql.gz"
+
+            chmod 0600 "$TEMP_DIR/database.sql.gz"
+
+            if [ ! -s "$TEMP_DIR/database.sql.gz" ]; then
+                echo "ERROR: database dump is empty" >&2
+                exit 1
+            fi
+
+            gzip -t "$TEMP_DIR/database.sql.gz"
+
+            echo "PASS: database dump created and validated"
+            ;;
+
         *)
             echo "ERROR: unsupported database backup mode: ${DB_TYPE}:${DB_BACKUP_MODE}" >&2
             exit 1

@@ -229,7 +229,10 @@ snapshot_id_for_component() {
 
 complete_component() {
     component="$1"
-    building_snapshot_id="$(snapshot_id_for_component "$component")"
+
+    if ! building_snapshot_id="$(snapshot_id_for_component "$component")"; then
+        return 1
+    fi
 
     restic tag \
         --remove "state:building" \
@@ -314,6 +317,37 @@ if [ "$DB_TYPE" != "none" ]; then
                     --routines \
                     --triggers \
                     "$MARIADB_DATABASE"' \
+            | restic backup \
+                --stdin \
+                --stdin-filename database.sql \
+                --host "$HOST" \
+                --tag "app:${APP_NAME}" \
+                --tag "repo:${REPO_NAME#"${APP_NAME}"-}" \
+                --tag "component:db" \
+                --tag "generation:${GENERATION}" \
+                --tag "state:building"
+
+            echo "PASS: database snapshot created"
+
+            ;;
+
+        postgresql:logical)
+            : "${DB_CONTAINER:?Missing DB_CONTAINER}"
+
+            if ! docker compose ps \
+                --status running \
+                --services \
+                | grep -Fxq "$DB_CONTAINER"; then
+                echo "ERROR: database service is not running: $DB_CONTAINER" >&2
+                exit 1
+            fi
+
+            docker compose exec -T "$DB_CONTAINER" \
+                sh -c 'exec pg_dump \
+                    --username="$POSTGRES_USER" \
+                    --dbname="$POSTGRES_DB" \
+                    --format=plain \
+                    --no-password' \
             | restic backup \
                 --stdin \
                 --stdin-filename database.sql \

@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+BIN="$TMP/bin"
+ETC="$TMP/etc/docker-backup"
+COMPOSE_DIR="$TMP/compose"
+APP_STATE="$TMP/app-state"
+REPO_DIR="$TMP/restic-repo"
+PORTABLE_ROOT="$TMP/portable"
+
+mkdir -p \
+    "$BIN" \
+    "$ETC/apps" \
+    "$ETC/repos" \
+    "$ETC/portable" \
+    "$COMPOSE_DIR" \
+    "$APP_STATE" \
+    "$REPO_DIR" \
+    "$PORTABLE_ROOT"
+
+printf '%s\n' test > "$APP_STATE/file.txt"
+printf '%s\n' password > "$TMP/restic-password"
+
+cat > "$ETC/apps/postgres-app.conf" <<EOF_APP
+APP_NAME="postgres-app"
+COMPOSE_DIR="$COMPOSE_DIR"
+DB_TYPE="postgresql"
+DB_BACKUP_MODE="logical"
+DB_CONTAINER="postgres-db"
+BACKUP_PATHS=(
+    "$APP_STATE"
+)
+EXCLUDE_PATHS=()
+EOF_APP
+
+cat > "$ETC/repos/postgres-app-operational.conf" <<EOF_REPO
+REPO_NAME="postgres-app-operational"
+APP_NAME="postgres-app"
+REPOSITORY="$REPO_DIR"
+PASSWORD_FILE="$TMP/restic-password"
+STORAGE_TYPE="local"
+EOF_REPO
+
+cat > "$ETC/portable/postgres-app.conf" <<EOF_PORTABLE
+PORTABLE_NAME="postgres-app"
+APP_NAME="postgres-app"
+BACKUP_ROOT="$PORTABLE_ROOT"
+STORAGE_TYPE="local"
+EOF_PORTABLE
+
+cat > "$BIN/hostname" <<'EOF_HOSTNAME'
+#!/usr/bin/env bash
+printf '%s\n' test-host
+EOF_HOSTNAME
+
+cat > "$BIN/docker" <<'EOF_DOCKER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+LOG="${DOCKER_TEST_LOG:?}"
+
+printf '%q ' "$@" >> "$LOG"
+printf '\n' >> "$LOG"
+
+if [[ "$1" != "compose" ]]; then
+    echo "unexpected docker invocation" >&2
+    exit 1
+fi
+
+shift
+
+case "$1" in
+    ps)
+        # docker compose ps --status running --services
+        printf '%s\n' postgres-db
+        ;;
+
+    exec)
+        # Verify the framework is invoking the configured Compose service.
+        [[ "$2" == "-T" ]]
+        [[ "$3" == "postgres-db" ]]
+
+        # Emit a recognizable plain-format PostgreSQL dump.
+        cat <<'SQL'
+--
+-- PostgreSQL database dump
+--
+
+CREATE TABLE public.example (
+    id bigint NOT NULL,
+    value text
+);
+
+INSERT INTO public.example VALUES (1, 'postgresql-logical-test');
+SQL
+        ;;
+
+    *)
+        echo "unexpected docker compose command: $1" >&2
+        exit 1
+        ;;
+esac
+EOF_DOCKER
+
+cat > "$BIN/restic" <<'EOF_RESTIC'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+LOG="${RESTIC_TEST_LOG:?}"
+DB_CAPTURE="${RESTIC_DB_CAPTURE:?}"
+STATE="${RESTIC_TEST_STATE:?}"
+GEN_FILE="${RESTIC_TEST_GENERATION:?}"
+
+printf '%q ' "$@" >> "$LOG"
+printf '\n' >> "$LOG"
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+    snapshots)
+        if [[ "${1:-}" == "--json" ]]; then
+            state="$(cat "$STATE" 2>/dev/null || printf '%s' initial)"
+            generation="$(cat "$GEN_FILE" 2>/dev/null || true)"
+
+            case "$state" in
+                initial)
+                    printf '%s\n' '[]'
+                    ;;
+                db-building)
+                    cat <<JSON
+[
+  {
+    "id": "1111111111111111111111111111111111111111111111111111111111111111",
+    "tags": [
+      "app:postgres-app",
+      "repo:operational",
+      "component:db",
+      "generation:${generation}",
+      "state:building"
+    ]
+  }
+]
+JSON
+                    ;;
+                files-building)
+                    cat <<JSON
+[
+  {
+    "id": "1111111111111111111111111111111111111111111111111111111111111111",
+    "tags": [
+      "app:postgres-app",
+      "repo:operational",
+      "component:db",
+      "generation:${generation}",
+      "state:building"
+    ]
+  },
+  {
+    "id": "2222222222222222222222222222222222222222222222222222222222222222",
+    "tags": [
+      "app:postgres-app",
+      "repo:operational",
+      "component:files",
+      "generation:${generation}",
+      "state:building"
+    ]
+  }
+]
+JSON
+                    ;;
+                db-complete-files-building)
+                    cat <<JSON
+[
+  {
+    "id": "3333333333333333333333333333333333333333333333333333333333333333",
+    "tags": [
+      "app:postgres-app",
+      "repo:operational",
+      "component:db",
+      "generation:${generation}",
+      "state:complete"
+    ]
+  },
+  {
+    "id": "2222222222222222222222222222222222222222222222222222222222222222",
+    "tags": [
+      "app:postgres-app",
+      "repo:operational",
+      "component:files",
+      "generation:${generation}",
+      "state:building"
+    ]
+  }
+]
+JSON
+                    ;;
+                complete)
+                    cat <<JSON
+[
+  {
+    "id": "3333333333333333333333333333333333333333333333333333333333333333",
+    "tags": [
+      "app:postgres-app",
+      "repo:operational",
+      "component:db",
+      "generation:${generation}",
+      "state:complete"
+    ]
+  },
+  {
+    "id": "4444444444444444444444444444444444444444444444444444444444444444",
+    "tags": [
+      "app:postgres-app",
+      "repo:operational",
+      "component:files",
+      "generation:${generation}",
+      "state:complete"
+    ]
+  }
+]
+JSON
+                    ;;
+            esac
+        fi
+        ;;
+
+    backup)
+        is_db=false
+        for arg in "$@"; do
+            case "$arg" in
+                --stdin)
+                    is_db=true
+                    ;;
+                generation:*)
+                    printf '%s\n' "${arg#generation:}" > "$GEN_FILE"
+                    ;;
+            esac
+        done
+
+        if [[ "$is_db" == true ]]; then
+            cat > "$DB_CAPTURE"
+            printf '%s\n' db-building > "$STATE"
+        else
+            printf '%s\n' files-building > "$STATE"
+        fi
+
+        printf '%s\n' "snapshot saved"
+        ;;
+
+    tag)
+        target="${@: -1}"
+
+        case "$target" in
+            1111111111111111111111111111111111111111111111111111111111111111)
+                printf '%s\n' db-complete-files-building > "$STATE"
+                ;;
+            2222222222222222222222222222222222222222222222222222222222222222)
+                printf '%s\n' complete > "$STATE"
+                ;;
+            *)
+                echo "unexpected snapshot passed to restic tag: $target" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+
+    forget)
+        ;;
+
+    *)
+        echo "unexpected restic command: $cmd" >&2
+        exit 1
+        ;;
+esac
+EOF_RESTIC
+
+chmod +x "$BIN/hostname" "$BIN/docker" "$BIN/restic"
+
+cp "$ROOT/src/backup-repository" "$TMP/backup-repository"
+cp "$ROOT/src/portable-backup" "$TMP/portable-backup"
+
+python3 - "$TMP/backup-repository" "$TMP/portable-backup" "$ETC" <<'PY'
+from pathlib import Path
+import sys
+
+for name in sys.argv[1:3]:
+    p = Path(name)
+    s = p.read_text()
+    s = s.replace(
+        'APP_CONFIG="/etc/docker-backup/apps/${APP_NAME}.conf"',
+        f'APP_CONFIG="{sys.argv[3]}/apps/${{APP_NAME}}.conf"',
+    )
+    p.write_text(s)
+PY
+
+chmod +x "$TMP/backup-repository" "$TMP/portable-backup"
+
+export PATH="$BIN:$PATH"
+export DOCKER_TEST_LOG="$TMP/docker.log"
+export RESTIC_TEST_LOG="$TMP/restic.log"
+export RESTIC_DB_CAPTURE="$TMP/restic-database.sql"
+export RESTIC_TEST_STATE="$TMP/restic-state"
+export RESTIC_TEST_GENERATION="$TMP/restic-generation"
+
+echo "=== Restic PostgreSQL logical capture ==="
+
+"$TMP/backup-repository" \
+    "$ETC/repos/postgres-app-operational.conf"
+
+test -s "$RESTIC_DB_CAPTURE"
+
+grep -F 'PostgreSQL database dump' "$RESTIC_DB_CAPTURE"
+grep -F 'postgresql-logical-test' "$RESTIC_DB_CAPTURE"
+
+grep -F 'postgres-db' "$DOCKER_TEST_LOG"
+grep -F 'pg_dump' "$DOCKER_TEST_LOG"
+grep -F -- '--username="$POSTGRES_USER"' "$DOCKER_TEST_LOG"
+grep -F -- '--dbname="$POSTGRES_DB"' "$DOCKER_TEST_LOG"
+grep -F -- '--format=plain' "$DOCKER_TEST_LOG"
+grep -F -- '--no-password' "$DOCKER_TEST_LOG"
+
+grep -F -- '--stdin-filename database.sql' "$RESTIC_TEST_LOG"
+grep -F 'component:db' "$RESTIC_TEST_LOG"
+
+echo "PASS: Restic PostgreSQL logical capture"
+
+echo
+echo "=== Portable PostgreSQL logical capture ==="
+
+: > "$DOCKER_TEST_LOG"
+
+"$TMP/portable-backup" \
+    "$ETC/portable/postgres-app.conf"
+
+portable_set="$(
+    find "$PORTABLE_ROOT" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -type d \
+        ! -name '.incomplete-*' \
+        | head -n 1
+)"
+
+test -n "$portable_set"
+test -s "$portable_set/database.sql.gz"
+gzip -t "$portable_set/database.sql.gz"
+
+gzip -dc "$portable_set/database.sql.gz" > "$TMP/portable-database.sql"
+
+grep -F 'PostgreSQL database dump' "$TMP/portable-database.sql"
+grep -F 'postgresql-logical-test' "$TMP/portable-database.sql"
+
+grep -F 'postgres-db' "$DOCKER_TEST_LOG"
+grep -F 'pg_dump' "$DOCKER_TEST_LOG"
+
+echo "PASS: portable PostgreSQL logical capture"
+
+echo
+echo "PASS: PostgreSQL logical backup regression suite"

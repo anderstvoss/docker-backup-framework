@@ -15,12 +15,13 @@ post-change acceptance test:
 - resolves exact completed snapshots by full tag set
 - restores Restic and portable filesystem state to temporary locations
 - validates included and excluded paths
-- imports both logical database backups into a disposable MariaDB container
+- imports both logical database backups into a disposable database container
 - compares restored schema metrics with the live application database
 - removes all disposable local test resources
 
-Currently supported database mode:
+Supported database modes:
   mariadb:logical
+  postgresql:logical
 HELP
 }
 
@@ -44,8 +45,9 @@ for file in "$REPO_CONFIG" "$PORTABLE_CONFIG"; do
     fi
 done
 
-RUNTIME_ROOT="/usr/local/lib/docker-backup"
-VERSION_FILE="/etc/docker-backup/DEPLOYED_VERSION"
+RUNTIME_ROOT="${DOCKER_BACKUP_RUNTIME_ROOT:-/usr/local/lib/docker-backup}"
+VERSION_FILE="${DOCKER_BACKUP_VERSION_FILE:-/etc/docker-backup/DEPLOYED_VERSION}"
+APP_CONFIG_ROOT="${DOCKER_BACKUP_APP_CONFIG_ROOT:-/etc/docker-backup/apps}"
 
 for file in \
     "$RUNTIME_ROOT/backup-repository" \
@@ -86,7 +88,7 @@ if [ "$REPOSITORY_APP_NAME" != "$PORTABLE_APP_NAME" ]; then
 fi
 
 APP_NAME="$REPOSITORY_APP_NAME"
-APP_CONFIG="/etc/docker-backup/apps/${APP_NAME}.conf"
+APP_CONFIG="${APP_CONFIG_ROOT}/${APP_NAME}.conf"
 
 if [ ! -f "$APP_CONFIG" ]; then
     echo "ERROR: application config not found: $APP_CONFIG" >&2
@@ -101,12 +103,16 @@ source "$APP_CONFIG"
 : "${DB_TYPE:?Missing DB_TYPE}"
 : "${DB_BACKUP_MODE:?Missing DB_BACKUP_MODE}"
 
-if [ "$DB_TYPE:$DB_BACKUP_MODE" != "mariadb:logical" ]; then
-    echo \
-        "ERROR: unsupported database mode: $DB_TYPE:$DB_BACKUP_MODE" \
-        >&2
-    exit 1
-fi
+case "$DB_TYPE:$DB_BACKUP_MODE" in
+    mariadb:logical|postgresql:logical)
+        ;;
+    *)
+        echo \
+            "ERROR: unsupported database mode: $DB_TYPE:$DB_BACKUP_MODE" \
+            >&2
+        exit 1
+        ;;
+esac
 
 : "${DB_CONTAINER:?Missing DB_CONTAINER}"
 
@@ -123,7 +129,7 @@ BACKUP_LOG="$TMP_ROOT/restic-backup.log"
 PORTABLE_LOG="$TMP_ROOT/portable-backup.log"
 
 TEST_CONTAINER="docker-backup-acceptance-${APP_NAME}-$$"
-TEST_ROOT_PASSWORD="acceptance-${RANDOM}-${RANDOM}"
+TEST_DB_PASSWORD="acceptance-${RANDOM}-${RANDOM}"
 
 cleanup() {
     rc=$?
@@ -184,65 +190,165 @@ fi
 
 DB_IMAGE="$(docker inspect "$DB_CID" --format '{{.Config.Image}}')"
 
-DB_NAME="$(
-    docker inspect "$DB_CID" \
-        --format '{{range .Config.Env}}{{println .}}{{end}}' |
-    sed -n \
-        -e 's/^MARIADB_DATABASE=//p' \
-        -e 's/^MYSQL_DATABASE=//p' |
-    head -n1
-)"
+case "$DB_TYPE" in
+    mariadb)
+        DB_NAME="$(
+            docker inspect "$DB_CID" \
+                --format '{{range .Config.Env}}{{println .}}{{end}}' |
+            sed -n \
+                -e 's/^MARIADB_DATABASE=//p' \
+                -e 's/^MYSQL_DATABASE=//p' |
+            head -n1
+        )"
+        ;;
+
+    postgresql)
+        DB_NAME="$(
+            docker inspect "$DB_CID" \
+                --format '{{range .Config.Env}}{{println .}}{{end}}' |
+            sed -n 's/^POSTGRES_DB=//p' |
+            head -n1
+        )"
+        ;;
+
+    *)
+        echo "ERROR: unsupported database discovery engine: $DB_TYPE" >&2
+        exit 1
+        ;;
+esac
 
 if [ -z "$DB_NAME" ]; then
-    echo "ERROR: unable to determine MariaDB database name" >&2
+    echo "ERROR: unable to determine $DB_TYPE database name" >&2
     exit 1
 fi
 
 echo "PASS: Compose DB service is running"
-echo "Database image: $DB_IMAGE"
-echo "Database name:  $DB_NAME"
+echo "Database engine: $DB_TYPE"
+echo "Database image:  $DB_IMAGE"
+echo "Database name:   $DB_NAME"
 
 db_query_live() {
     query="$1"
 
-    docker compose exec -T "$DB_CONTAINER" sh -c '
-        exec mariadb \
-            --batch \
-            --skip-column-names \
-            --user="$MARIADB_USER" \
-            --password="$MARIADB_PASSWORD" \
-            "$MARIADB_DATABASE" \
-            -e "$1"
-    ' sh "$query"
+    case "$DB_TYPE" in
+        mariadb)
+            docker compose exec -T "$DB_CONTAINER" sh -c '
+                exec mariadb \
+                    --batch \
+                    --skip-column-names \
+                    --user="$MARIADB_USER" \
+                    --password="$MARIADB_PASSWORD" \
+                    "$MARIADB_DATABASE" \
+                    -e "$1"
+            ' sh "$query"
+            ;;
+
+        postgresql)
+            docker compose exec -T "$DB_CONTAINER" sh -c '
+                user="${POSTGRES_USER:-}"
+                database="${POSTGRES_DB:-}"
+
+                [ -n "$user" ] || exit 2
+                [ -n "$database" ] || exit 2
+
+                exec psql \
+                    --username="$user" \
+                    --dbname="$database" \
+                    --no-align \
+                    --tuples-only \
+                    --command="$1"
+            ' sh "$query"
+            ;;
+
+        *)
+            echo "ERROR: unsupported live query engine: $DB_TYPE" >&2
+            return 1
+            ;;
+    esac
 }
 
 db_query_test() {
     query="$1"
 
-    docker exec "$TEST_CONTAINER" \
-        mariadb \
-        --batch \
-        --skip-column-names \
-        -uroot \
-        -p"$TEST_ROOT_PASSWORD" \
-        "$DB_NAME" \
-        -e "$query"
+    case "$DB_TYPE" in
+        mariadb)
+            docker exec "$TEST_CONTAINER" \
+                mariadb \
+                --batch \
+                --skip-column-names \
+                -uroot \
+                -p"$TEST_DB_PASSWORD" \
+                "$DB_NAME" \
+                -e "$query"
+            ;;
+
+        postgresql)
+            docker exec "$TEST_CONTAINER" \
+                psql \
+                --username="$TEST_DB_USER" \
+                --dbname="$DB_NAME" \
+                --no-align \
+                --tuples-only \
+                --command="$query"
+            ;;
+
+        *)
+            echo "ERROR: unsupported test query engine: $DB_TYPE" >&2
+            return 1
+            ;;
+    esac
 }
 
 schema_metrics_live() {
-    echo "tables=$(db_query_live \
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$DB_NAME';")"
+    case "$DB_TYPE" in
+        mariadb)
+            echo "tables=$(db_query_live \
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$DB_NAME' AND table_type='BASE TABLE';")"
 
-    echo "triggers=$(db_query_live \
-        "SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema='$DB_NAME';")"
+            echo "views=$(db_query_live \
+                "SELECT COUNT(*) FROM information_schema.views WHERE table_schema='$DB_NAME';")"
+
+            echo "triggers=$(db_query_live \
+                "SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema='$DB_NAME';")"
+            ;;
+
+        postgresql)
+            echo "tables=$(db_query_live \
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';")"
+
+            echo "views=$(db_query_live \
+                "SELECT COUNT(*) FROM information_schema.views WHERE table_schema='public';")"
+
+            echo "triggers=$(db_query_live \
+                "SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema='public';")"
+            ;;
+    esac
 }
 
 schema_metrics_test() {
-    echo "tables=$(db_query_test \
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$DB_NAME';")"
+    case "$DB_TYPE" in
+        mariadb)
+            echo "tables=$(db_query_test \
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$DB_NAME' AND table_type='BASE TABLE';")"
 
-    echo "triggers=$(db_query_test \
-        "SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema='$DB_NAME';")"
+            echo "views=$(db_query_test \
+                "SELECT COUNT(*) FROM information_schema.views WHERE table_schema='$DB_NAME';")"
+
+            echo "triggers=$(db_query_test \
+                "SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema='$DB_NAME';")"
+            ;;
+
+        postgresql)
+            echo "tables=$(db_query_test \
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';")"
+
+            echo "views=$(db_query_test \
+                "SELECT COUNT(*) FROM information_schema.views WHERE table_schema='public';")"
+
+            echo "triggers=$(db_query_test \
+                "SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema='public';")"
+            ;;
+    esac
 }
 
 echo
@@ -429,53 +535,144 @@ echo "===== VALIDATE PORTABLE FILESYSTEM ====="
 validate_paths "$PORTABLE_FILES" "Portable"
 
 echo
-echo "===== START DISPOSABLE MARIADB ====="
+echo "===== START DISPOSABLE DATABASE ====="
+echo "Database engine: $DB_TYPE"
 
-docker run -d \
-    --name "$TEST_CONTAINER" \
-    --tmpfs /var/lib/mysql \
-    -e MARIADB_ROOT_PASSWORD="$TEST_ROOT_PASSWORD" \
-    -e MARIADB_DATABASE="$DB_NAME" \
-    "$DB_IMAGE" \
-    >/dev/null
+TEST_DB_USER=""
 
-READY=false
+case "$DB_TYPE" in
+    mariadb)
+        docker run -d \
+            --name "$TEST_CONTAINER" \
+            --tmpfs /var/lib/mysql \
+            -e MARIADB_ROOT_PASSWORD="$TEST_DB_PASSWORD" \
+            -e MARIADB_DATABASE="$DB_NAME" \
+            "$DB_IMAGE" \
+            >/dev/null
 
-for _ in $(seq 1 60); do
-    if docker exec "$TEST_CONTAINER" \
-        mariadb \
-        --batch \
-        --skip-column-names \
-        -uroot \
-        -p"$TEST_ROOT_PASSWORD" \
-        -e 'SELECT 1;' \
-        2>/dev/null |
-       grep -Fxq 1
-    then
-        READY=true
-        break
-    fi
+        READY=false
 
-    sleep 1
-done
+        for _ in $(seq 1 60); do
+            if docker exec "$TEST_CONTAINER" \
+                mariadb \
+                --batch \
+                --skip-column-names \
+                -uroot \
+                -p"$TEST_DB_PASSWORD" \
+                -e 'SELECT 1;' \
+                2>/dev/null |
+               grep -Fxq 1
+            then
+                READY=true
+                break
+            fi
 
-if [ "$READY" != true ]; then
-    echo "ERROR: disposable MariaDB did not become authenticated-ready" >&2
-    docker logs "$TEST_CONTAINER" >&2
-    exit 1
-fi
+            sleep 1
+        done
 
-echo "PASS: disposable MariaDB authenticated readiness"
+        if [ "$READY" != true ]; then
+            echo "ERROR: disposable MariaDB did not become authenticated-ready" >&2
+            docker logs "$TEST_CONTAINER" >&2
+            exit 1
+        fi
+
+        echo "PASS: disposable MariaDB authenticated readiness"
+        ;;
+
+    postgresql)
+        TEST_DB_USER="validation"
+
+        docker run -d \
+            --name "$TEST_CONTAINER" \
+            --tmpfs /var/lib/postgresql \
+            -e POSTGRES_USER="$TEST_DB_USER" \
+            -e POSTGRES_PASSWORD="$TEST_DB_PASSWORD" \
+            -e POSTGRES_DB="$DB_NAME" \
+            "$DB_IMAGE" \
+            >/dev/null
+
+        READY=false
+
+        for _ in $(seq 1 60); do
+            if docker exec "$TEST_CONTAINER" \
+                psql \
+                --username="$TEST_DB_USER" \
+                --dbname="$DB_NAME" \
+                --no-align \
+                --tuples-only \
+                --command='SELECT 1;' \
+                2>/dev/null |
+               grep -Fxq 1
+            then
+                READY=true
+                break
+            fi
+
+            sleep 1
+        done
+
+        if [ "$READY" != true ]; then
+            echo "ERROR: disposable PostgreSQL did not become authenticated-ready" >&2
+            docker logs "$TEST_CONTAINER" >&2
+            exit 1
+        fi
+
+        echo "PASS: disposable PostgreSQL authenticated readiness"
+        ;;
+esac
 
 reset_test_database() {
-    docker exec "$TEST_CONTAINER" \
-        mariadb \
-        -uroot \
-        -p"$TEST_ROOT_PASSWORD" \
-        -e "
-          DROP DATABASE IF EXISTS \`$DB_NAME\`;
-          CREATE DATABASE \`$DB_NAME\`;
-        "
+    case "$DB_TYPE" in
+        mariadb)
+            docker exec "$TEST_CONTAINER" \
+                mariadb \
+                -uroot \
+                -p"$TEST_DB_PASSWORD" \
+                -e "
+                  DROP DATABASE IF EXISTS \`$DB_NAME\`;
+                  CREATE DATABASE \`$DB_NAME\`;
+                "
+            ;;
+
+        postgresql)
+            docker exec "$TEST_CONTAINER" \
+                dropdb \
+                --username="$TEST_DB_USER" \
+                --if-exists \
+                --force \
+                "$DB_NAME"
+
+            docker exec "$TEST_CONTAINER" \
+                createdb \
+                --username="$TEST_DB_USER" \
+                "$DB_NAME"
+            ;;
+    esac
+}
+
+import_test_database() {
+    case "$DB_TYPE" in
+        mariadb)
+            docker exec -i "$TEST_CONTAINER" \
+                mariadb \
+                -uroot \
+                -p"$TEST_DB_PASSWORD" \
+                "$DB_NAME"
+            ;;
+
+        postgresql)
+            docker exec -i "$TEST_CONTAINER" \
+                psql \
+                --username="$TEST_DB_USER" \
+                --dbname="$DB_NAME" \
+                --set=ON_ERROR_STOP=1
+            ;;
+
+        *)
+            echo "ERROR: unsupported test import engine: $DB_TYPE" >&2
+            return 1
+            ;;
+    esac
 }
 
 validate_restored_database() {
@@ -517,11 +714,7 @@ echo
 echo "===== IMPORT PORTABLE DATABASE ====="
 
 gzip -dc "$RECOVERY_SET/database.sql.gz" |
-    docker exec -i "$TEST_CONTAINER" \
-        mariadb \
-        -uroot \
-        -p"$TEST_ROOT_PASSWORD" \
-        "$DB_NAME"
+    import_test_database
 
 validate_restored_database "Portable"
 
@@ -547,12 +740,7 @@ echo "===== IMPORT RESTIC DATABASE ====="
 
 reset_test_database
 
-docker exec -i "$TEST_CONTAINER" \
-        mariadb \
-        -uroot \
-        -p"$TEST_ROOT_PASSWORD" \
-        "$DB_NAME" \
-        < "$RESTIC_DB/database.sql"
+import_test_database < "$RESTIC_DB/database.sql"
 
 validate_restored_database "Restic"
 

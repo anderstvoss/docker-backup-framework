@@ -232,6 +232,11 @@ case "${DB_TYPE}:${DB_BACKUP_MODE}" in
             die "--db-snapshot is required for mariadb:logical"
         : "${DB_CONTAINER:?Missing DB_CONTAINER}"
         ;;
+    postgresql:logical)
+        [[ -n "$DB_SNAPSHOT" ]] ||
+            die "--db-snapshot is required for postgresql:logical"
+        : "${DB_CONTAINER:?Missing DB_CONTAINER}"
+        ;;
     *)
         die "unsupported database mode: ${DB_TYPE}:${DB_BACKUP_MODE}"
         ;;
@@ -536,9 +541,6 @@ echo "===== VALIDATE PORTABLE FILESYSTEM ====="
 validate_paths "$PORTABLE_FILES" "Portable"
 
 if [[ "$DB_TYPE" != "none" ]]; then
-    echo
-    echo "===== PREPARE DISPOSABLE MARIADB ====="
-
     cd "$COMPOSE_DIR"
 
     DB_CID="$(docker compose ps -q "$DB_CONTAINER")"
@@ -551,94 +553,83 @@ if [[ "$DB_TYPE" != "none" ]]; then
             --format '{{.Config.Image}}'
     )"
 
-    DB_NAME="$(
-        docker inspect "$DB_CID" \
-            --format '{{range .Config.Env}}{{println .}}{{end}}' |
-        sed -n \
-            -e 's/^MARIADB_DATABASE=//p' \
-            -e 's/^MYSQL_DATABASE=//p' |
-        head -n1
-    )"
-
     [[ -n "$DB_IMAGE" ]] ||
-        die "unable to determine MariaDB image"
-
-    [[ -n "$DB_NAME" ]] ||
-        die "unable to determine MariaDB database name"
+        die "unable to determine database image"
 
     TEST_CONTAINER="docker-recovery-validation-${APP_ID}-$$"
-    TEST_ROOT_PASSWORD="validation-${RANDOM}-${RANDOM}"
 
-    docker run -d \
-        --name "$TEST_CONTAINER" \
-        --tmpfs /var/lib/mysql \
-        -e MARIADB_ROOT_PASSWORD="$TEST_ROOT_PASSWORD" \
-        -e MARIADB_DATABASE="$DB_NAME" \
-        "$DB_IMAGE" \
-        >/dev/null
+    case "$DB_TYPE" in
+        mariadb)
+            echo
+            echo "===== PREPARE DISPOSABLE MARIADB ====="
 
-    READY=false
+            DB_NAME="$(
+                docker inspect "$DB_CID" \
+                    --format '{{range .Config.Env}}{{println .}}{{end}}' |
+                sed -n \
+                    -e 's/^MARIADB_DATABASE=//p' \
+                    -e 's/^MYSQL_DATABASE=//p' |
+                head -n1
+            )"
 
-    for _ in $(seq 1 60); do
-        if docker exec "$TEST_CONTAINER" \
-            mariadb \
-            --batch \
-            --skip-column-names \
-            -uroot \
-            -p"$TEST_ROOT_PASSWORD" \
-            -e 'SELECT 1;' \
-            2>/dev/null |
-            grep -Fxq 1
-        then
-            READY=true
-            break
-        fi
+            [[ -n "$DB_NAME" ]] ||
+                die "unable to determine MariaDB database name"
 
-        sleep 1
-    done
+            TEST_ROOT_PASSWORD="validation-${RANDOM}-${RANDOM}"
 
-    [[ "$READY" == true ]] ||
-        die "disposable MariaDB did not become authenticated-ready"
+            docker run -d \
+                --name "$TEST_CONTAINER" \
+                --tmpfs /var/lib/mysql \
+                -e MARIADB_ROOT_PASSWORD="$TEST_ROOT_PASSWORD" \
+                -e MARIADB_DATABASE="$DB_NAME" \
+                "$DB_IMAGE" \
+                >/dev/null
 
-    echo "PASS: disposable MariaDB ready"
+            READY=false
 
-    reset_database() {
-        docker exec "$TEST_CONTAINER" \
-            mariadb \
-            -uroot \
-            -p"$TEST_ROOT_PASSWORD" \
-            -e "
-              DROP DATABASE IF EXISTS \`$DB_NAME\`;
-              CREATE DATABASE \`$DB_NAME\`;
-            "
-    }
+            for _ in $(seq 1 60); do
+                if docker exec "$TEST_CONTAINER" \
+                    mariadb \
+                    --batch \
+                    --skip-column-names \
+                    -uroot \
+                    -p"$TEST_ROOT_PASSWORD" \
+                    -e 'SELECT 1;' \
+                    2>/dev/null |
+                    grep -Fxq 1
+                then
+                    READY=true
+                    break
+                fi
 
-    database_metrics() {
-        docker exec "$TEST_CONTAINER" \
-            mariadb \
-            --batch \
-            --skip-column-names \
-            -uroot \
-            -p"$TEST_ROOT_PASSWORD" \
-            "$DB_NAME" \
-            -e "
-              SELECT CONCAT(
-                'tables=',
-                COUNT(*)
-              )
-              FROM information_schema.tables
-              WHERE table_schema='$DB_NAME';
+                sleep 1
+            done
 
-              SELECT CONCAT(
-                'triggers=',
-                COUNT(*)
-              )
-              FROM information_schema.triggers
-              WHERE trigger_schema='$DB_NAME';
-            "
+            [[ "$READY" == true ]] ||
+                die "disposable MariaDB did not become authenticated-ready"
 
-        if [[ -n "$DB_VALIDATION_QUERY" ]]; then
-            marker="$(
+            echo "PASS: disposable MariaDB ready"
+
+            reset_database() {
+                docker exec "$TEST_CONTAINER" \
+                    mariadb \
+                    -uroot \
+                    -p"$TEST_ROOT_PASSWORD" \
+                    -e "
+                      DROP DATABASE IF EXISTS \`$DB_NAME\`;
+                      CREATE DATABASE \`$DB_NAME\`;
+                    "
+            }
+
+            import_database() {
+                docker exec -i "$TEST_CONTAINER" \
+                    mariadb \
+                    -uroot \
+                    -p"$TEST_ROOT_PASSWORD" \
+                    "$DB_NAME"
+            }
+
+            database_metrics() {
                 docker exec "$TEST_CONTAINER" \
                     mariadb \
                     --batch \
@@ -646,18 +637,174 @@ if [[ "$DB_TYPE" != "none" ]]; then
                     -uroot \
                     -p"$TEST_ROOT_PASSWORD" \
                     "$DB_NAME" \
-                    -e "$DB_VALIDATION_QUERY"
+                    -e "
+                      SELECT CONCAT(
+                        'tables=',
+                        COUNT(*)
+                      )
+                      FROM information_schema.tables
+                      WHERE table_schema='$DB_NAME'
+                        AND table_type='BASE TABLE';
+
+                      SELECT CONCAT(
+                        'views=',
+                        COUNT(*)
+                      )
+                      FROM information_schema.views
+                      WHERE table_schema='$DB_NAME';
+
+                      SELECT CONCAT(
+                        'triggers=',
+                        COUNT(*)
+                      )
+                      FROM information_schema.triggers
+                      WHERE trigger_schema='$DB_NAME';
+                    "
+
+                if [[ -n "$DB_VALIDATION_QUERY" ]]; then
+                    marker="$(
+                        docker exec "$TEST_CONTAINER" \
+                            mariadb \
+                            --batch \
+                            --skip-column-names \
+                            -uroot \
+                            -p"$TEST_ROOT_PASSWORD" \
+                            "$DB_NAME" \
+                            -e "$DB_VALIDATION_QUERY"
+                    )"
+
+                    [[ -n "$marker" ]] ||
+                        die "application-specific database validation returned no value"
+
+                    [[ "$marker" != *$'\n'* ]] ||
+                        die "application-specific database validation must return one row and one column"
+
+                    printf '%s=%s\n' "$DB_VALIDATION_LABEL" "$marker"
+                fi
+            }
+            ;;
+
+        postgresql)
+            echo
+            echo "===== PREPARE DISPOSABLE POSTGRESQL ====="
+
+            DB_NAME="$(
+                docker inspect "$DB_CID" \
+                    --format '{{range .Config.Env}}{{println .}}{{end}}' |
+                sed -n 's/^POSTGRES_DB=//p' |
+                head -n1
             )"
 
-            [[ -n "$marker" ]] ||
-                die "application-specific database validation returned no value"
+            [[ -n "$DB_NAME" ]] ||
+                die "unable to determine PostgreSQL database name"
 
-            [[ "$marker" != *$'\n'* ]] ||
-                die "application-specific database validation must return one row and one column"
+            TEST_DB_USER="validation"
+            TEST_DB_PASSWORD="validation-${RANDOM}-${RANDOM}"
 
-            printf '%s=%s\n' "$DB_VALIDATION_LABEL" "$marker"
-        fi
-    }
+            docker run -d \
+                --name "$TEST_CONTAINER" \
+                --tmpfs /var/lib/postgresql \
+                -e POSTGRES_USER="$TEST_DB_USER" \
+                -e POSTGRES_PASSWORD="$TEST_DB_PASSWORD" \
+                -e POSTGRES_DB="$DB_NAME" \
+                "$DB_IMAGE" \
+                >/dev/null
+
+            READY=false
+
+            for _ in $(seq 1 60); do
+                if docker exec "$TEST_CONTAINER" \
+                    psql \
+                    --username="$TEST_DB_USER" \
+                    --dbname="$DB_NAME" \
+                    --no-align \
+                    --tuples-only \
+                    --command='SELECT 1;' \
+                    2>/dev/null |
+                    grep -Fxq 1
+                then
+                    READY=true
+                    break
+                fi
+
+                sleep 1
+            done
+
+            [[ "$READY" == true ]] ||
+                die "disposable PostgreSQL did not become authenticated-ready"
+
+            echo "PASS: disposable PostgreSQL ready"
+
+            reset_database() {
+                docker exec "$TEST_CONTAINER" \
+                    dropdb \
+                    --username="$TEST_DB_USER" \
+                    --if-exists \
+                    --force \
+                    "$DB_NAME"
+
+                docker exec "$TEST_CONTAINER" \
+                    createdb \
+                    --username="$TEST_DB_USER" \
+                    "$DB_NAME"
+            }
+
+            import_database() {
+                docker exec -i "$TEST_CONTAINER" \
+                    psql \
+                    --username="$TEST_DB_USER" \
+                    --dbname="$DB_NAME" \
+                    --set=ON_ERROR_STOP=1
+            }
+
+            database_metrics() {
+                docker exec "$TEST_CONTAINER" \
+                    psql \
+                    --username="$TEST_DB_USER" \
+                    --dbname="$DB_NAME" \
+                    --no-align \
+                    --tuples-only \
+                    --command="
+                      SELECT 'tables=' || COUNT(*)
+                      FROM information_schema.tables
+                      WHERE table_schema='public'
+                        AND table_type='BASE TABLE';
+
+                      SELECT 'views=' || COUNT(*)
+                      FROM information_schema.views
+                      WHERE table_schema='public';
+
+                      SELECT 'triggers=' || COUNT(*)
+                      FROM information_schema.triggers
+                      WHERE trigger_schema='public';
+                    "
+
+                if [[ -n "$DB_VALIDATION_QUERY" ]]; then
+                    marker="$(
+                        docker exec "$TEST_CONTAINER" \
+                            psql \
+                            --username="$TEST_DB_USER" \
+                            --dbname="$DB_NAME" \
+                            --no-align \
+                            --tuples-only \
+                            --command="$DB_VALIDATION_QUERY"
+                    )"
+
+                    [[ -n "$marker" ]] ||
+                        die "application-specific database validation returned no value"
+
+                    [[ "$marker" != *$'\n'* ]] ||
+                        die "application-specific database validation must return one row and one column"
+
+                    printf '%s=%s\n' "$DB_VALIDATION_LABEL" "$marker"
+                fi
+            }
+            ;;
+
+        *)
+            die "unsupported database validation engine: $DB_TYPE"
+            ;;
+    esac
 
     echo
     echo "===== IMPORT PORTABLE DATABASE ====="
@@ -665,11 +812,7 @@ if [[ "$DB_TYPE" != "none" ]]; then
     reset_database
 
     gzip -dc "$PORTABLE_SET_REAL/database.sql.gz" |
-        docker exec -i "$TEST_CONTAINER" \
-            mariadb \
-            -uroot \
-            -p"$TEST_ROOT_PASSWORD" \
-            "$DB_NAME"
+        import_database
 
     PORTABLE_DB_METRICS="$(database_metrics)"
 
@@ -689,12 +832,7 @@ if [[ "$DB_TYPE" != "none" ]]; then
 
     reset_database
 
-    docker exec -i "$TEST_CONTAINER" \
-        mariadb \
-        -uroot \
-        -p"$TEST_ROOT_PASSWORD" \
-        "$DB_NAME" \
-        < "$RESTIC_DB/database.sql"
+    import_database < "$RESTIC_DB/database.sql"
 
     RESTIC_DB_METRICS="$(database_metrics)"
 

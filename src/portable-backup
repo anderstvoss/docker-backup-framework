@@ -271,6 +271,8 @@ if [ "$DB_TYPE" != "none" ]; then
                     --username="$POSTGRES_USER" \
                     --dbname="$POSTGRES_DB" \
                     --format=plain \
+                    --no-owner \
+                    --no-acl \
                     --no-password' \
                 | gzip -1 > "$TEMP_DIR/database.sql.gz"
 
